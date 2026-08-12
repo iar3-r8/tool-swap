@@ -1,0 +1,16 @@
+[importlinter]
+root_packages =
+    tool_swap
+    tool_swap_runtime
+
+[importlinter:contract:1]
+name = Router and runtime are strictly separate
+type = forbidden
+source_modules = tool_swap
+forbidden_modules = tool_swap_runtime
+
+[importlinter:contract:2]
+name = Router and runtime are strictly separate (reverse)
+type = forbidden
+source_modules = tool_swap_runtime
+forbidden_modules = tool_swap
