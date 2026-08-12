@@ -5,6 +5,19 @@ Fakes (FakeBackend, FakeProbe, ManualClock) land here once M2 provides them.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure the repo root and src/ are on sys.path so that tests can import
+# ``tool_swap`` (from src/) and ``tests.conftest`` (from repo root).
+# This guard makes ``pytest tests/unit/test_clock.py`` and IDE runners work
+# even when pyproject.toml's ``pythonpath`` is not picked up.
+_ROOT = Path(__file__).resolve().parent.parent  # repo root
+for _p in (str(_ROOT / "src"), str(_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+del _ROOT, _p
+
 import asyncio
 import time
 from typing import runtime_checkable, TYPE_CHECKING

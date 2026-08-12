@@ -25,7 +25,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Local imports
 # ---------------------------------------------------------------------------
-from src.tool_swap.utils.clock import Clock, RealClock
+from tool_swap.utils.clock import Clock, RealClock
 
 
 # ---------------------------------------------------------------------------
