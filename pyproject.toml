@@ -21,7 +21,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-dependencies = []
+dependencies = [
+    "typer>=0.12",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -30,6 +32,7 @@ dev = [
     "ruff",
     "mypy",
     "import-linter",
+    "typer",
 ]
 
 [project.scripts]
