@@ -124,9 +124,7 @@ class ManualClock:
             ValueError: If *seconds* is negative or is negative zero.
         """
         if math.copysign(1, seconds) < 0:
-            raise ValueError(
-                f"advance seconds must be non-negative (got {seconds})"
-            )
+            raise ValueError(f"advance seconds must be non-negative (got {seconds})")
         self._elapsed += seconds
 
     async def sleep(self, seconds: float) -> None:

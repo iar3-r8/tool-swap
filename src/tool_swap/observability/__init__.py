@@ -1,1 +1,1 @@
-"""Observability stack including metrics, tracing, and structured logging for tool-swap."""
+"""Observability stack for tool-swap: metrics, tracing, and structured logging."""
