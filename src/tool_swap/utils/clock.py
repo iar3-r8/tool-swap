@@ -130,14 +130,28 @@ class ManualClock:
         self._elapsed += seconds
 
     async def sleep(self, seconds: float) -> None:
-        """Protocol method — no-op on ``ManualClock``.
+        """Advance simulated time by *seconds* and yield to the event loop.
 
-        The ``ManualClock`` is a test double; real time passage is
-        controlled via :meth:`advance`.  This method exists only to
-        satisfy the ``Clock`` protocol so that
-        ``isinstance(ManualClock(), Clock)`` is ``True``.
+        This method implements the ``Clock`` protocol by advancing the
+        internal time by the given duration and then yielding control
+        back to the asyncio event loop via ``await asyncio.sleep(0)``.
 
         Args:
-            seconds: Ignored.
+            seconds: Duration in seconds to advance. Must be non-negative
+                (positive zero allowed; negative values and negative zero
+                raise ``ValueError``).
+
+        Raises:
+            ValueError: If *seconds* is negative or is negative zero.
+
+        Example:
+            >>> import asyncio
+            >>> clock = ManualClock(start=100.0)
+            >>> asyncio.run(clock.sleep(30))
+            >>> clock.now()
+            130.0
         """
-        pass
+        if math.copysign(1, seconds) < 0:
+            raise ValueError("sleep duration must be non-negative (got negative)")
+        self._elapsed += seconds
+        await asyncio.sleep(0)

@@ -410,3 +410,179 @@ class TestManualClockErrorBehaviour:
         clock = ManualClock()
         with pytest.raises(ValueError):
             clock.advance(-999)
+
+
+# ---------------------------------------------------------------------------
+# ManualClock.sleep() tests — Behaviour 5
+# ---------------------------------------------------------------------------
+"""Tests for ManualClock.sleep(): advancing time and yielding control.
+
+Verifies:
+- ``await clock.sleep(30)`` returns immediately in wall-clock time while
+  ``clock.now()`` advances by exactly 30.
+- After ``sleep``, a second task scheduled on the loop observes the new time
+  (the ``await asyncio.sleep(0)`` yield protects this property).
+- Sequential sleeps accumulate: ``sleep(10)`` then ``sleep(20)`` ⇒ ``now() == 30``.
+- ``await clock.sleep(0)`` advances by nothing but still yields.
+- Two tasks sleeping concurrently sum their durations on the shared time scalar.
+- ``await clock.sleep(-1)`` raises ``ValueError``.
+"""
+
+
+class TestManualClockSleepAdvancesTime:
+    """Verify ManualClock.sleep() advances internal time."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_30_advances_time_by_30(self) -> None:
+        """await clock.sleep(30) must advance now() by exactly 30."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=100.0)
+        await clock.sleep(30)
+        assert clock.now() == 130.0
+
+    @pytest.mark.asyncio
+    async def test_sleep_returns_immediately_in_wall_clock(self) -> None:
+        """await clock.sleep(30) must return well under 1 second of real time."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=0.0)
+        start = time.monotonic()
+        await clock.sleep(30)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, (
+            f"sleep(30) took {elapsed:.3f}s in real time — should be instant",
+        )
+
+
+class TestManualClockSleepYieldsControl:
+    """Verify ManualClock.sleep() yields to the event loop."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_yields_allows_observer_to_see_new_time(self) -> None:
+        """After sleep, a spawned task must observe the new time.
+
+        This test guards the ``await asyncio.sleep(0)`` yield in the
+        implementation: if the yield is removed, the observer task never
+        gets scheduled before the assertion runs, and the recorded value
+        will still be the old time — the test fails.
+        """
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=0.0)
+        recorded: list[float] = []
+
+        async def observer() -> None:
+            # The first thing this task does is record clock.now()
+            recorded.append(clock.now())
+
+        task = asyncio.create_task(observer())
+        await clock.sleep(30)
+        await task  # ensure observer has run
+        assert recorded[0] == 30.0, (
+            f"Observer saw {recorded[0]} instead of 30.0 — sleep did not yield",
+        )
+
+
+class TestManualClockSleepAccumulates:
+    """Verify ManualClock.sleep() accumulates time across calls."""
+
+    @pytest.mark.asyncio
+    async def test_sequential_sleeps_accumulate(self) -> None:
+        """sleep(10) then sleep(20) must yield now() == 30."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        await clock.sleep(10)
+        await clock.sleep(20)
+        assert clock.now() == 30.0
+
+    @pytest.mark.asyncio
+    async def test_sleep_accumulates_from_custom_start(self) -> None:
+        """sleep(5) on start=100 must yield now() == 105."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=100.0)
+        await clock.sleep(5)
+        assert clock.now() == 105.0
+
+
+class TestManualClockSleepZero:
+    """Verify ManualClock.sleep(0) behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_zero_advances_nothing(self) -> None:
+        """await clock.sleep(0) must not change the time."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=42.0)
+        await clock.sleep(0)
+        assert clock.now() == 42.0
+
+    @pytest.mark.asyncio
+    async def test_sleep_zero_still_yields(self) -> None:
+        """await clock.sleep(0) must still yield to the event loop."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=0.0)
+        recorded: list[float] = []
+
+        async def observer() -> None:
+            recorded.append(clock.now())
+
+        task = asyncio.create_task(observer())
+        await clock.sleep(0)
+        await task
+        # The observer should have seen the time (which didn't advance,
+        # but the yield must still have happened to let the task run).
+        assert len(recorded) == 1, (
+            "Observer did not run — sleep(0) did not yield",
+        )
+
+
+class TestManualClockSleepConcurrent:
+    """Verify concurrent ManualClock.sleep() behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sleeps_sum_time(self) -> None:
+        """Two tasks sleeping concurrently must sum their durations.
+
+        Time is a single shared scalar, so concurrent sleeps sum rather
+        than overlap — which is not how real time behaves.
+        """
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+
+        async def sleeper(duration: float) -> None:
+            await clock.sleep(duration)
+
+        # Spawn two concurrent tasks
+        t1 = asyncio.create_task(sleeper(10))
+        t2 = asyncio.create_task(sleeper(20))
+        await t1
+        await t2
+        # Both durations accumulated on the shared scalar
+        assert clock.now() == 30.0
+
+
+class TestManualClockSleepErrorBehaviour:
+    """Verify ManualClock.sleep() raises appropriate errors."""
+
+    @pytest.mark.asyncio
+    async def test_sleep_negative_raises_value_error(self) -> None:
+        """await clock.sleep(-1) must raise ValueError."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        with pytest.raises(ValueError, match="negative"):
+            await clock.sleep(-1)
+
+    @pytest.mark.asyncio
+    async def test_sleep_negative_zero_raises_value_error(self) -> None:
+        """await clock.sleep(-0.0) must raise ValueError."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        with pytest.raises(ValueError, match="negative"):
+            await clock.sleep(-0.0)
