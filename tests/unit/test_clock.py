@@ -181,3 +181,232 @@ class TestRealClockSleep:
         """sleep(-0.0) must raise ValueError."""
         with pytest.raises(ValueError, match="negative"):
             await clock.sleep(-0.0)
+
+
+# ---------------------------------------------------------------------------
+# ManualClock tests — Behaviour 4
+# ---------------------------------------------------------------------------
+"""Tests for ManualClock: a deterministic, time-manipulatable clock for testing.
+
+Verifies:
+- ManualClock().now() == 0.0 (default start=0.0).
+- ManualClock(start=100.0).now() == 100.0.
+- advance(seconds) accumulates across calls.
+- advance() returns None (command, not query).
+- now() is pure: repeated calls never change the time.
+- Edge cases: advance(0) is a no-op, fractional accumulation, large advances,
+  independent instances, negative advance raises ValueError.
+"""
+
+
+class TestManualClockDefaultStart:
+    """Verify ManualClock default start time."""
+
+    def test_default_now_is_zero(self) -> None:
+        """ManualClock() with no args must start at 0.0."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        assert clock.now() == 0.0
+
+    def test_default_start_is_zero(self) -> None:
+        """ManualClock() must use start=0.0 by default."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        # Calling now() multiple times must always return 0.0 (pure)
+        assert clock.now() == 0.0
+        assert clock.now() == 0.0
+        assert clock.now() == 0.0
+
+
+class TestManualClockCustomStart:
+    """Verify ManualClock with explicit start parameter."""
+
+    def test_custom_start_value(self) -> None:
+        """ManualClock(start=100.0).now() must return 100.0."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=100.0)
+        assert clock.now() == 100.0
+
+    def test_custom_start_pure(self) -> None:
+        """now() must be pure: repeated calls don't change the value."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=42.5)
+        assert clock.now() == 42.5
+        assert clock.now() == 42.5
+        assert clock.now() == 42.5
+
+
+class TestManualClockAdvance:
+    """Verify ManualClock.advance() accumulates time."""
+
+    def test_advance_single_call(self) -> None:
+        """advance(5) then now() must return 5.0."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        clock.advance(5)
+        assert clock.now() == 5.0
+
+    def test_advance_accumulates(self) -> None:
+        """Two advance(5) calls must yield now() == 10.0."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        clock.advance(5)
+        assert clock.now() == 5.0
+        clock.advance(5)
+        assert clock.now() == 10.0
+
+    def test_advance_returns_none(self) -> None:
+        """advance() is a command: must return None."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        result = clock.advance(5)
+        assert result is None
+
+    def test_advance_with_custom_start(self) -> None:
+        """advance(3) on ManualClock(start=10) must yield now() == 13.0."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=10)
+        clock.advance(3)
+        assert clock.now() == 13.0
+
+    def test_advance_does_not_affect_now_without_advance(self) -> None:
+        """Before advance(), now() returns start unchanged."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=50.0)
+        assert clock.now() == 50.0
+
+
+class TestManualClockNowPurity:
+    """Verify now() is pure: calling it never changes the time."""
+
+    def test_now_is_idempotent(self) -> None:
+        """Repeated now() calls return the same value."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=7.5)
+        clock.advance(2.5)  # now should be 10.0
+        first = clock.now()
+        second = clock.now()
+        third = clock.now()
+        assert first == 10.0
+        assert second == 10.0
+        assert third == 10.0
+
+    def test_now_pure_after_multiple_advances(self) -> None:
+        """now() remains stable even after multiple advances."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        clock.advance(1)
+        clock.advance(2)
+        clock.advance(3)
+        expected = 6.0
+        for _ in range(100):
+            assert clock.now() == expected
+
+
+class TestManualClockEdgeCases:
+    """Edge case tests for ManualClock."""
+
+    def test_advance_zero_is_noop(self) -> None:
+        """advance(0) must not raise and must not change time."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock(start=42.0)
+        clock.advance(0)
+        assert clock.now() == 42.0
+        clock.advance(0)
+        assert clock.now() == 42.0
+
+    def test_fractional_accumulation(self) -> None:
+        """advance(0.1) x 10 must land within 1e-9 of 1.0.
+
+        Using pytest.approx instead of == because floating-point
+        arithmetic on fractional values can produce tiny rounding
+        errors (e.g., 0.1 + 0.1 + ... != 1.0 exactly in IEEE 754).
+        """
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        for _ in range(10):
+            clock.advance(0.1)
+        assert clock.now() == pytest.approx(1.0, abs=1e-9)
+
+    def test_large_advance_30_minutes(self) -> None:
+        """advance(1800) for the 30-minute idle scenario must be exact."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        clock.advance(1800)
+        assert clock.now() == 1800.0
+
+    def test_instances_are_independent(self) -> None:
+        """Two ManualClock instances must not share mutable state."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock_a = ManualClock()
+        clock_b = ManualClock()
+
+        clock_a.advance(5)
+        assert clock_a.now() == 5.0
+        assert clock_b.now() == 0.0
+
+        clock_b.advance(10)
+        assert clock_a.now() == 5.0
+        assert clock_b.now() == 10.0
+
+    def test_independence_with_custom_start(self) -> None:
+        """Instances with different starts must remain independent."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock_a = ManualClock(start=100.0)
+        clock_b = ManualClock(start=200.0)
+
+        assert clock_a.now() == 100.0
+        assert clock_b.now() == 200.0
+
+        clock_a.advance(10)
+        assert clock_a.now() == 110.0
+        assert clock_b.now() == 200.0
+
+
+class TestManualClockErrorBehaviour:
+    """Verify ManualClock raises appropriate errors."""
+
+    def test_negative_advance_raises_value_error(self) -> None:
+        """advance(-1) must raise ValueError naming the argument and value."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        with pytest.raises(ValueError) as exc_info:
+            clock.advance(-1)
+        # The error must name the argument and the received value
+        assert "seconds" in str(exc_info.value).lower() or "advance" in str(
+            exc_info.value
+        ).lower()
+        assert "-1" in str(exc_info.value)
+
+    def test_negative_zero_advance_raises(self) -> None:
+        """advance(-0.0) must raise ValueError."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        with pytest.raises(ValueError):
+            clock.advance(-0.0)
+
+    def test_large_negative_advance_raises(self) -> None:
+        """advance(-999) must raise ValueError."""
+        from src.tool_swap.utils.clock import ManualClock
+
+        clock = ManualClock()
+        with pytest.raises(ValueError):
+            clock.advance(-999)
