@@ -2,6 +2,11 @@
 
 A tool swapping router for managing AI agent tool contexts.
 
+## Architecture
+
+See the full architecture overview in [plan/01_ARCHITECTURE.md](plan/01_ARCHITECTURE.md).
+The complete implementation plan is at [plan/README.md](plan/README.md).
+
 ## Distributions
 
 - **tool-swap** — The router package. Requires Python 3.12+.
@@ -18,6 +23,32 @@ pip install -e ".[dev]"
 ```bash
 tswap --help
 ```
+
+## Get started
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/iar3-r8/tool-swap.git
+   cd tool-swap
+   ```
+2. **Install dependencies**
+   ```bash
+   pip install -e ".[dev]"
+   ```
+3. **Run lint and type-check**
+   ```bash
+   make lint
+   ```
+4. **Run the test suite**
+   ```bash
+   .venv/bin/pytest          # when .venv is not on PATH
+   make test                 # or use the Makefile target
+   ```
+5. **Verify the CLI**
+   ```bash
+   tswap --help
+   ```
+The full implementation plan is at [plan/README.md](plan/README.md).
 
 ## Repository Structure
 
@@ -50,8 +81,7 @@ tool-swap/
 │           └── NATIVE.md       # Native backend specification (spec only, no code)
 │
 ├── docker/                     # Dockerfiles (router base images)
-│   ├── base/                   # CPU and CUDA base images
-│   └── router.Dockerfile
+│   └── base/                   # CPU and CUDA base images
 ├── templates/                  # tswap new templates (cpu, cuda, tensorflow, function)
 ├── models/                     # Model zoo (gitignored, examples included)
 ├── tests/                      # pytest suite (unit, integration, e2e)
