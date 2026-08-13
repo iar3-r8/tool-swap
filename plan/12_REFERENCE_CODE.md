@@ -715,6 +715,8 @@ Note that per-item failure isolation and the batch-length check are **not** on t
 
 ## 8. `RayBatcher` — a cautionary tale
 
+> **Scope of the lesson.** This is a cautionary tale about **a calling pattern**, not about Ray. The defect below is a synchronous caller force-flushing its own batch, and it would be equally fatal in FastAPI, BentoML or anything else. Do **not** cite this section as evidence against Ray Serve — that question is answered on its own merits in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md), and [ADR-0003](adr/0003-ray-serve-not-adopted.md) explicitly withdraws this citation.
+
 *`src/core/service_engine/ray_engine/ray_batcher.py`* (abridged; note the author's own hedging in the docstrings)
 
 ```python
@@ -1243,7 +1245,7 @@ def is_batchable(annotation: Any) -> Any:
     return None
 ```
 
-**Verdict:** keep the *concept*, move the *declaration* into `tool.yaml` as `batchable: true` ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.3). Reason: the router must know which inputs are batchable **without importing the model's code**, which is impossible across a container boundary by design. Optionally keep `Batchable[T]` as sugar that the `@tool` decorator translates into the declaration, so authors migrating from R8 recognise it.
+**Verdict — simplified further by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md):** the concept is **not needed at all**. There is no per-input `batchable` flag, because **every** input is a field of the batched item and the handler always receives a list. The original reason for moving the declaration into YAML still holds — the router must not import the model's code — but with one uniform convention there is nothing left to declare. `Batchable[T]` is not ported in any form.
 
 ---
 
@@ -1666,7 +1668,7 @@ Note the `gpu_id` arithmetic in `__init__`, repeated near-verbatim across tools.
 | `RunEngineOutput` | Adapt as the response envelope | `tool_swap/api/errors.py`, runtime |
 | Config `defaults` + overrides | Adapt, add `extra="forbid"` | `tool_swap/config/schema.py` |
 | `Port` (name/type/description/default) | Adapt as the authoring surface; compile to JSON Schema (**D13**) | `tool_swap/config/schema.py`, `tool_swap/schema/compile.py` |
-| `Batchable` concept | Re-express as `batchable: true` in YAML. Note **D15**: on a batched tool, *every* input must be batchable, and per-request knobs become `params:` | `tool.yaml` |
+| `Batchable` concept | **Not ported.** [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md): the handler always takes a list, so there is no flag to express. Per-request knobs are **fields of the item**; `params:` is only for values that change the batched computation | — |
 | `class_tool` lifecycle contract | Simplify to `load`/`predict`/`unload` | `tool_swap_runtime/decorator.py` |
 | `tools/README.md` prose | Reuse near-verbatim | `docs/adding-a-model.md` |
 | Compose/HF-cache/device-pinning patterns | Reuse | `docker-compose.yml`, backend |

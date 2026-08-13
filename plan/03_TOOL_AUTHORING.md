@@ -109,10 +109,9 @@ handler: handler.py:CXRToEmbedding
 runtime:
   accelerator: cuda
   requirements: requirements.txt
-inputs:
-  - name: paths
+inputs:                         # fields of ONE item; the handler always receives a list
+  - name: path
     type: string
-    batchable: true
     required: true
     description: Path to a DICOM chest X-ray image to embed.
     semantic: dicom_path        # optional free-form hint, never interpreted by the router
@@ -212,8 +211,8 @@ def __init__(self, device: str = "cpu", threshold: float = 0.5) -> None:
 | Heavy work goes in `load()`, **never** `__init__` | R8's own tool guide says exactly this. `__init__` runs during import/introspection; `load()` runs when the model is meant to become ready. Conflating them makes cold starts unmeasurable and soft-TTL impossible. |
 | `unload()` must actually release, and for a GPU tool it is **mandatory** | Set references to `None`, call `torch.cuda.empty_cache()` / `tf.keras.backend.clear_session()`. Because we are process-isolated, these are now *safe* — R8's code had to warn that Keras session clearing was "process-wide, not scoped to this model alone". Here the process **is** the model. We run on a **shared DGX**, so soft unload is how VRAM goes back to the node and its neighbours ([ADR-0002](adr/0002-shared-node-soft-unload.md)); a handler that only *appears* to release makes us hold memory we have told the scheduler is free. Preflight stage 8 measures it and **fails** if it does not. |
 | `predict()` receives **keyword arguments** named after the declared inputs | Positional coupling is what forced R8's HTTP layer to map an ordered `input_modalities` list onto port names by index — fragile and silently wrong if the caller reorders. Names only. |
-| `predict()` receives **batches** when `batching.enabled` | Each declared `batchable` input arrives as a list; return a list of the same length **in the same order**. Non-batchable models get lists of length 1 (or set `enabled: false`). The runtime checks the returned length and fails loudly on a mismatch — a silent misalignment would return one patient's result for another ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.4). |
-| A batched tool declares **only batchable inputs** | **D15.** Per-request knobs cannot be batched safely, so they become static params (§3.1). `tswap validate` hard-errors otherwise. |
+| `predict()` **always receives a list of items** | Return a list of the same length, positionally aligned. **Always** — a tool with `max_batch_size: 1` gets lists of one, so there is one code path and no opt-out ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). The runtime checks the returned length and fails loudly on a mismatch — a silent misalignment would return one patient's result for another ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.4). **Do not assume arrival order**: the dispatcher does not guarantee it. |
+| **Per-request knobs are fields of the item** | A `threshold` declared in `inputs:` travels with its own item and is applied to that item, so two callers sending `0.5` and `0.9` each get their own answer (§3.1). |
 | Every input needs a `description` | R8 *raised an error* on a missing parameter description. Keep that strictness: it is what makes `/tools` genuinely self-documenting for humans and LLM agents. `tswap validate` fails without it. |
 | Type annotations required on inputs and the return | Enables schema generation and request validation. |
 | Never import `tool_swap_runtime` internals beyond the public API | Keeps the runtime upgradable underneath handlers. |
@@ -225,35 +224,40 @@ It records metadata (name, docstring, declared fields) on the class so the runti
 
 ---
 
-## 3.1 Static parameters — the third input class
+## 3.1 `inputs:` versus `params:` — one question decides it
 
-> **D15.** A tool with `batching.enabled: true` may declare **only batchable inputs**. Anything that would differ between requests in the same batch is declared as a **static param** instead.
-
-The reason is specific to how batching works ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.3): the dispatcher batches whatever arrives concurrently and cannot separate requests by a differing `threshold`. Two callers sending `0.5` and `0.9` would share a batch, and one would receive a result computed with the other's value — no error, no log line, a plausible wrong number about a patient. So the situation is made unrepresentable rather than detected.
+> **[ADR-0005](adr/0005-one-uniform-batched-calling-convention.md).** Every handler takes a **list of items** and returns a list of the same length. Per-request values are **fields of the item**; `params:` is for values fixed at load time.
+>
+> **The question that decides which:** *does this value change what the batched forward pass computes?*
+> **If yes → `params:`.** Input resolution, dtype, a different model head, a weights path.
+> **If no → `inputs:`.** Threshold, top-k, NMS IoU, output format — anything that shapes one item's own result.
 
 ```yaml
 params:                                    # fixed at load time, part of the tool's identity
+  - name: input_resolution
+    type: integer
+    default: 512
+    description: Resolution every series is resampled to before the forward pass.
+inputs:                                    # fields of ONE item, supplied per request
+  - name: path
+    type: string
+    required: true
+    description: Path to the DICOM series to segment.
   - name: threshold
     type: number
     default: 0.5
-    description: Confidence threshold applied to detections.
-inputs:                                    # per request; on a batched tool, all batchable
-  - name: paths
-    type: string
-    batchable: true
-    required: true
-    description: Path to the DICOM series to segment.
+    description: Confidence threshold applied to this series' detections.
 ```
 
 | | `inputs:` | `params:` |
 |---|---|---|
 | Supplied by | the caller, per request | config, at deployment |
-| Reaches the handler via | `predict(**inputs)` | `__init__(**params)`, before `load()` |
-| Batchable | required to be, on a batched tool | n/a — constant across the batch |
+| Reaches the handler via | a field of each item in the list | `__init__(**params)`, before `load()` |
+| Varies within one batch | **yes** — each item carries its own | no — constant across the batch |
 | Appears in `?format=tools` | yes | no (it is not a caller-visible argument) |
 | Changing it | free | restarts the tool |
 
-Two different thresholds in production means **two config entries over the same image**, which the scheduler, TTL and status surfaces already handle as two tools — at the cost of two resident models. If a value genuinely must vary per request, set `batching.enabled: false` (free for CPU tools and single-request workloads), or use the `native` backend, which is the one place compatibility-key batching is specified ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §2). Note that `native` is **architecture only in v1** — in practice, today, the answer is a static param or no batching.
+**Why `threshold` moved.** This section used to make `threshold` the archetypal static param, because the old **D15** banned per-request knobs on batched tools: the dispatcher could not separate a batch by differing arguments, so two callers sending `0.5` and `0.9` would share a batch and one would get the other's number — silently. **That hazard is now unrepresentable rather than forbidden**: a knob carried on the item is applied to that item. Two *input resolutions* in production still means **two config entries over the same image**, which the scheduler, TTL and status surfaces already handle as two tools.
 
 ---
 
@@ -281,7 +285,7 @@ handler: handler.py:text_cleanup
 description: Strip control characters and collapse whitespace in clinical text.
 runtime: { accelerator: cpu }
 inputs:
-  - { name: text, type: string, batchable: true, required: true, description: Raw clinical text to normalise. }
+  - { name: text, type: string, required: true, description: Raw clinical text to normalise. }
 outputs:
   - { name: value, type: string, description: The normalised text. }
 ```
@@ -332,11 +336,31 @@ Provide our own maintained bases, and pin them:
 | `tool-swap/base-cuda:12.4-py312` | torch/CUDA models |
 | `tool-swap/base-cuda:12.1-py310` | older stacks |
 
-Each base contains: Python, pip, `tool_swap_runtime` and **BentoML at the pinned version** (**D14**), with its transitive set (pydantic, starlette, uvicorn, click). Pre-installing the serving framework makes model builds *faster* — a real benefit of the BentoML decision.
+Each base contains: Python, pip, `tool_swap_runtime` and **BentoML at the pinned version** (**D14**), with its transitive set. Pre-installing the serving framework makes model builds *faster* — a real benefit of the BentoML decision.
 
-Deliberately **no torch and no TensorFlow** — those come from the model's own requirements, so the base never dictates an ML framework version. That is where **D2**'s dependency freedom actually matters; a serving framework's pins are a bounded, tested set, whereas a pre-installed torch would dictate the CUDA stack of every model.
+Deliberately **no torch and no TensorFlow** — those come from the model's own requirements, so the base never dictates an ML framework version. That is where **D2**'s dependency freedom actually matters; a serving framework's constraints are a bounded, tested set, whereas a pre-installed torch would dictate the CUDA stack of every model.
 
-The pins BentoML brings are accepted on the stated terms ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1): *acceptable until a concrete model demonstrates an unresolvable conflict*. CI resolves every template and example against the base to catch that early, and `tswap doctor` reports the resolved versions inside built images. **If your model pins a conflicting pydantic or starlette, that is a bug report we want** — it is the evidence that would reopen **D14**.
+BentoML's constraints are accepted on the stated terms ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1): *acceptable until a concrete model demonstrates an unresolvable conflict*. CI resolves every template and example against the base to catch that early, and `tswap doctor` reports the resolved versions inside built images. ⚠️ **The constraints that can actually bite are `cattrs` (a two-sided pin), a beta-pinned OpenTelemetry family, and `fsspec`** — not pydantic/starlette/click, two of which are lower bounds ([`third-party-docs/bentoml/dependency-constraints.md`](third-party-docs/bentoml/dependency-constraints.md)). **If your model cannot resolve against one of those, that is a bug report we want** — it is the evidence that would reopen **D14**.
+
+### 6.1 Tool containers run as a non-root user
+
+**Every generated base image sets a non-root `USER`.** This is not boilerplate hardening; it closes the sharpest edge in the whole design, and it is nearly free before M5 and awkward afterwards — changing `USER` later invalidates every author's assumptions about file ownership.
+
+**Why it is sharper for us than for llama-swap**, which ships root by default *"for convenience"*:
+
+- **D11** grants the host network access **precisely so tools can download weights**, and the ordinary authoring path calls `from_pretrained()` and `torch.load()` against arbitrary Hugging Face repositories.
+- **`.bin` checkpoints are pickles, and unpickling executes code.** llama-swap loads GGUF, a format with no code-execution path; we do not have that luxury.
+- We run on a **shared DGX where other people's work is on the same host** — the same fact that produced **D28**.
+
+A root container mounting the shared weights cache and deserialising a pickle from the internet, on a shared node, is a combination worth one line of Dockerfile to avoid. **The plan already makes the *stability* half of the blast-radius argument for D2; this is the *security* half.**
+
+Three practical consequences:
+
+1. **The weights cache is mounted read-only** for tools that do not download at runtime; tools that do get a writable cache and should say so.
+2. **`USER` interacts with GPU device access and host mounts.** llama-swap's own caveat applies — *"additional configuration may be necessary to ensure that the container retains access to required host resources"* — so `tswap preflight` must exercise this, not just the build.
+3. **Prefer `safetensors`.** A one-line recommendation, not a mechanism: it is a format that cannot execute code on load. Where a tool must load a pickle, that is a fact worth knowing about that tool.
+
+> **Honest counterweight:** llama-swap ships non-root as a *separate tag*, not the default, and warns it needs *"proper planning and configuration"*. For GPU workloads with host mounts, unprivileged containers are not free. **Read that as evidence of cost, not as permission** — their default suits personal machines, and ours does not.
 
 ---
 
@@ -453,12 +477,12 @@ Templates shipped in the repo (`templates/`): `cpu`, `cuda`, `tensorflow`, `func
 3. Handler file exists; `file:Object` resolves; the object is a class with `predict` or a decorated function.
 4. Every `predict` parameter is declared in `inputs`, and vice versa (no drift between code and declaration).
 5. Every input has a `description` and a type; every output has a type.
-6. `batchable` inputs are annotated as lists when batching is enabled.
-7. `load`/`unload` are either both present or both absent (warn if only one — usually a leak). **A tool declaring `devices` must define `unload()`** — a hard error, since soft unload is the primary way VRAM returns to the shared node.
+6. The handler's `predict()` accepts a **list** and returns a list of the same length ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). There is no per-input `batchable` flag to check any more, and no batched/unbatched distinction to get wrong.
+7. `load`/`unload` are either both present or both absent (**warn** if only one — usually a leak). *(The former hard error requiring `unload()` on any tool declaring `devices` is removed — [ADR-0004](adr/0004-hard-stop-only-in-v1.md).)*
 8. Requirements file exists and parses; warn on unpinned versions (reproducibility).
 9. Warn if the handler imports heavy libraries at module scope (defeats fast validation and slows container start).
 10. If `example` is present, its inputs satisfy the declared schema.
-11. **D15**: a tool with `batching.enabled: true` declaring any non-batchable input is a **hard error**, naming the input and both remedies (§3.1).
+11. *(Removed by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md).)* There is no rule to check: a batched tool cannot declare a non-batchable input, because every input is a field of the batched item.
 
 Steps 1–11 must run **without Docker and without GPUs** so they can run in CI on every pull request. Everything that needs a running container belongs to tier 2 below.
 
@@ -585,8 +609,9 @@ class TextEmbedding:
 
     def predict(
         self,
-        text: list[str] = Field(description="Text to embed.", batchable=True),
+        text: list[str] = Field(description="Text to embed."),
     ) -> list[list[float]]:
+        # Always a list, always the same length back (ADR-0005).
         return self.model.encode(text).tolist()
 
     def unload(self) -> None:

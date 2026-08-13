@@ -197,7 +197,13 @@ Labels are load-bearing: reconciliation, `tswap ps`, `prune` and staleness detec
 **Two distributions, one repo.** The runtime is installed into every model image, so its dependency closure must stay deliberate; the router's deps (docker SDK, typer, rich) must never leak into a model image.
 
 - Router: `fastapi`, `uvicorn[standard]`, `pydantic>=2`, `httpx`, `docker` (or the compose/CLI shell-out), `typer`, `rich`, `pyyaml`, `python-dotenv`, `prometheus-client`.
-- Runtime: **`bentoml==X.Y.Z` (pinned) plus its transitive set** — which already provides starlette, uvicorn, pydantic and click (**D14**, [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1). **Nothing else of our own choosing**: a direct dependency we add still needs written justification, but BentoML's own tree is accepted wholesale.
+- Runtime: **`bentoml==X.Y.Z` (pinned, and with no extras) plus its transitive set** — which already provides starlette, uvicorn, pydantic and click (**D14**, [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1). **Nothing else of our own choosing**: a direct dependency we add still needs written justification, but BentoML's own tree is accepted wholesale.
+
+**Pin policy, three rules:**
+
+1. **Pin `bentoml==X.Y.Z` with no extras.** Extras are not installed by default, and adding one silently enlarges every tool image.
+2. **Check yank status before pinning and before upgrading.** A yanked release is installable when pinned exactly, which is precisely the situation an exact pin creates.
+3. **Watch the constraints that actually bind.** ⚠️ Not pydantic/starlette/click — `starlette>=0.24.0` and `click>=7.0` are **lower bounds and cannot conflict**. The two-sided constraints are **`cattrs>=22.1.0,<23.2.0`**, a **seven-package OpenTelemetry family pinned to a beta series**, and `fsspec>=2025.7.0` ([`third-party-docs/bentoml/dependency-constraints.md`](third-party-docs/bentoml/dependency-constraints.md)). `resolve.yml` must report *these* when it fails.
 
 The pin is the point. An unpinned serving framework in every model image is the version of **D14** that would actually hurt, because a background upgrade could break a model stack with no code change on our side. Upgrading BentoML is a deliberate change, gated on the backend contract suite passing, and it bumps `runtime_version` so `tswap doctor` can flag images built against the old one.
 
@@ -229,7 +235,7 @@ Adopt the parent project's conventions so contributors move between repos withou
 | Workflow | Runs | Contains |
 |---|---|---|
 | `ci.yml` | every PR | ruff, mypy, **both import-linter rules** (router ⊥ runtime, and bentoml ⊥ everything outside `backends/`), unit tests, runtime contract tests, `tswap validate --all` on the examples, the preflight check-registry tests (pure, with a fake backend), docs link check. **No Docker, no GPU — must finish in ~2 minutes.** |
-| `resolve.yml` | PRs touching the runtime pins or any template; weekly | Dependency resolution of every template and example against the pinned runtime (`uv pip compile`). **This is the early-warning system for D14** — a failure here is the evidence that would reopen it, so its output must name the conflicting packages, not just fail. |
+| `resolve.yml` | PRs touching the runtime pins or any template; weekly | Dependency resolution of every template and example against the pinned runtime (`uv pip compile`). **This is the early-warning system for D14** — a failure here is the evidence that would reopen it, so its output must name the conflicting packages, not just fail. **Report the resolved `cattrs`, OpenTelemetry and `fsspec` versions explicitly**, since those are the constraints that can actually conflict. |
 | `integration.yml` | PRs touching `backend/`, `lifecycle/`, or nightly | `@pytest.mark.docker` tests using the dependency-free `example_echo` model. Builds a real image, starts a real container, exercises swap/TTL/eviction. Also runs **`tswap preflight --strict` over the broken-tool corpus** ([`10_TESTING_STRATEGY.md`](10_TESTING_STRATEGY.md) §5.1), asserting each fixture fails exactly the check it was built to break — this is what keeps the gate's checks honest. |
 | `release.yml` | tags | Build and push base images (multi-arch where feasible), publish both packages, generate release notes. |
 

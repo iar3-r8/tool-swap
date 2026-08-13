@@ -15,12 +15,12 @@
 | **A** — llama-swap as router? | **No.** It is built for LLMs and OpenAI-compatible endpoints; our tools speak `/predict`. | The router returns to our scope: **M2, M3, M6, M7 and M8 are all in**. Its separate role serving our LLMs is unaffected ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §0). |
 | **B** — KServe on k3s? | **No**, answered on the record. Kubernetes *allocates* devices and leaves the second pod `Pending`; it does not evict an incumbent. Preemption is a hard requirement here. | We would have to operate a cluster **and still write the preemption logic**. Minikube separately rejected: host-built images are invisible to the cluster, and GPU support is the experimental path. |
 
-**A second gate outcome, equally load-bearing:** the deployment target is a **shared DGX**, which reverses **D9**. Soft unload is promoted into v1 as the *default* reclamation mechanism, with hard stop as the backstop. Recorded in [ADR-0002](adr/0002-shared-node-soft-unload.md); it changes M4, M6 and M5.5 below, and empties Phase 2 item 1.
+**A second gate outcome:** the deployment target is a **shared DGX**. [ADR-0002](adr/0002-shared-node-soft-unload.md) read this as requiring soft unload in v1; **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) reverses that** after the requester clarified that a timer suffices — *"we just don't want to block all the resources indefinitely"*. **v1 reclaims by stopping the container, and there is no soft unload.** This *shrinks* M4, M5.5 and M6 below, and restores Phase 2 item 1.
 
 **The two requirements that came out of the gate**, and which the milestones must satisfy:
 
-1. **Preemption.** A request for tool B displaces an idle incumbent A *immediately*, rather than waiting out A's TTL. Soft unload is what makes this cheap ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §3.2).
-2. **Reload under contention.** A neighbour on the shared node may take VRAM we released, so a reload can fail through nobody's fault. That case must never be recorded as a tool failure ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §3.3).
+1. **Preemption.** A request for tool B displaces an idle incumbent A *immediately*, rather than waiting out A's TTL. The mechanism is a container stop, so the displaced tool pays a cold start on its next request — the accepted cost of [ADR-0004](adr/0004-hard-stop-only-in-v1.md).
+2. **Start under contention.** A neighbour on the shared node may hold the VRAM, so a cold start can fail through nobody's fault. That case must never be recorded as a tool failure (**D28**).
 
 **A constraint that still holds, and is now insurance rather than a branch condition:** a tool is an OCI image exposing an HTTP server, runnable standalone with plain `docker run`, whose port and readiness path come from the environment and whose wire protocol lives in the runtime adapter rather than in any handler. That keeps tools portable (compose, llama-swap, tool-swap, KServe) and makes the router replaceable ([`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md) §8). Test it — and note that **no exporter, no second wire protocol and no Kubernetes backend is built in v1**; the portability is an invariant we maintain, not tooling we write.
 
@@ -89,6 +89,8 @@ graph LR
 - `FakeBackend`: in-memory, scriptable failures (fail to start, never ready, die while running).
 - `DockerBackend`: create/start/stop/inspect/list-by-label/logs, with our labels, network, device requests, env, mounts, `shm_size`.
 - `LifecycleManager`: the state machine from [`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §4, coalesced `ensure_ready`, in-flight counting, graceful drain-then-stop.
+- **Declare the queue-policy seam now, with one implementation** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.2). FIFO is the only policy in v1 and priority is deliberately refused, but the *enum-and-interface shape* means a second policy is later a new implementation rather than a rewrite. **Cheapest before any code exists; an awkward retrofit after.**
+- **Shutdown ordering** ([`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §7.1): stop accepting, fail queued requests fast with a shutting-down reason, drain in-flight, *then* stop containers. Getting this backwards 502s in-flight work and produces flaky integration tests.
 - `HealthProbe` + `FakeProbe`; the `STARTING` → `LOADING` → `READY` progression.
 - Reconciliation on boot: adopt or stop labelled containers.
 
@@ -124,13 +126,16 @@ graph LR
 
 **Goal:** turn **D14**'s accepted risk into evidence. Timeboxed, throwaway code, one written outcome.
 
-The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1) rests on one assumption: *its pins do not conflict with real model stacks.* That assumption is cheap to test now and expensive to discover false in M6. **Run it before M4, not during.**
+The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1) rests on one assumption: *its constraints do not conflict with real model stacks.* That assumption is cheap to test now and expensive to discover false in M6. **Run it before M4, not during.**
 
-1. **Resolution, torch stack.** Build an image with the pinned BentoML plus `torch==2.8.0+cu129`, `transformers`, `monai`, `pydicom` — the R8 CXR/CT stack. Record the resolved versions of pydantic, starlette and click.
+1. **Resolution, torch stack.** Build an image with the pinned BentoML plus `torch==2.8.0+cu129`, `transformers`, `monai`, `pydicom` — the R8 CXR/CT stack. ⚠️ **Record `cattrs`, the seven OpenTelemetry packages, `fsspec` and `numpy` — not pydantic, starlette and click.** The latter three were what this step used to ask for, and **two of them are lower bounds that cannot conflict**; the real two-sided constraints are the former ([`third-party-docs/bentoml/dependency-constraints.md`](third-party-docs/bentoml/dependency-constraints.md)).
 2. **Resolution, TensorFlow stack.** The same with `tensorflow` / `tf-keras` on a vendor base image — the R8 `organ_donor` case, and the one most likely to fight.
-3. **Vendor base image.** Confirm the pinned BentoML installs on an `nvcr.io` base ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6), which Level 3 authoring assumes.
-4. **Batching sanity.** A trivial sleep-handler service with `batchable=True`: fire 32 concurrent requests, confirm the handler is invoked far fewer than 32 times, that every caller gets its own correct result, and that added latency is bounded near `max_latency_ms`. This measures the thing we chose BentoML *for*.
-5. **Contract feasibility.** Mount a custom ASGI route beside the generated API and serve our own `/ready` (§3.2), confirming the adapter shape in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3 is actually buildable.
+3. **Vendor base image.** Confirm the pinned BentoML installs on an `nvcr.io` base ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6), which Level 3 authoring assumes. **Also confirm it installs and runs under a non-root `USER`** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6.1) — this is the cheapest possible moment to find out that it does not.
+4. **Batching sanity.** A trivial sleep-handler service with `batchable=True`: fire 32 concurrent requests, confirm the handler is invoked far fewer than 32 times, that every caller gets its own correct result, and that added latency is bounded near `max_latency_ms`. This measures the thing we chose BentoML *for*. **Report the `threads` setting alongside the numbers** — BentoML limits sync handler calls to `threads` (default 1), and a batching result without it is uninterpretable. Also **observe the actual `worker_index`** (the docs give it as both 0- and 1-based on one page) and **submit a poisoned item** to confirm `retry_singly` isolates it.
+5. **Contract feasibility.** Mount a custom ASGI route beside the generated API and serve our own `/ready` (§3.2), confirming the adapter shape in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3 is actually buildable. **Three additions, each cheap and each load-bearing for M4:**
+   - **Probe the blocking startup.** `sleep(30)` in `__init__`, then check whether the port refuses connections throughout. If it does — and the source says it will — **M4 must load on a background task**, or `LOADING` is unobservable and two contract tests cannot be written ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §6.1).
+   - **Confirm the mount is at the root path** and that we are not obliged to set `path_prefix` (which would move our contract routes with it).
+   - **Settle the per-item question [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) leaves open:** does a batched API taking `list[PydanticModel]` need a wrapper Service via `bentoml.depends`, or does posting a list of one suffice? **M4's whole shape depends on the answer.**
 
 **Outcomes and what each means:**
 
@@ -149,20 +154,21 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 
 **Goal:** managed models: a handler becomes a batching server, with BentoML underneath and our contract on top.
 
-- `tool_swap_runtime` **above the seam**: `@tool` decorator (metadata only), handler loader with static params, background load with **failure recorded and exposed**, schema compilation, and the predict wrapper (validation, batch-length check, `retry_singly`, error envelope).
+- `tool_swap_runtime` **above the seam**: `@tool` decorator (metadata only), handler loader with static params, **background load — which is mandatory, not stylistic** ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §6.1) — with **failure recorded and exposed**, schema compilation, and the predict wrapper (validation, batch-length check, `retry_singly`, error envelope).
+- **One uniform calling convention** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)): the handler always receives a list of items and returns a list of the same length. No `scalar_inputs`, no per-input `batchable` flag, and `batching.enabled: false` compiles to `max_batch_size: 1` rather than to a different signature.
 - `backends/base.py`: the `RuntimeBackend` protocol ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §2.3). `backends/NATIVE.md`: the specification of the unbuilt alternative. **No native code.**
-- `backends/bentoml_backend.py`: build the service, declare the batched API from config, mount our contract routes (`/health` `/ready` `/schema` `/info`), map `worker_index` → device through `TSWAP_DEVICE_LIST` and log the mapping.
-- Truthful `/ready`: weights-loaded, not server-up (§3.2) — the correction of the R8 behaviour this milestone most depends on. **This now covers `IDLE_SOFT` too:** after `POST /unload`, `/ready` must answer 503 with a reason until the next `load()` completes. A runtime that keeps saying "ready" with no weights in memory is the same lie in a new place.
-- **`POST /unload` and the reload path** ([ADR-0002](adr/0002-shared-node-soft-unload.md)). Moved here from phase 2, because soft unload is the default reclamation mechanism on the shared DGX. `unload()` releases weights, the process stays alive, and the next request triggers `load()` without a container start. A reload that fails for lack of VRAM must report a **distinct, non-fatal** outcome — the runtime's half of [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §3.3.
+- `backends/bentoml_backend.py`: build the service, declare the batched API from config **always passing `max_batch_size` and `max_latency_ms` explicitly** (BentoML's default is `60000` ms and batching is off by default), mount our contract routes (`/health` `/ready` `/schema` `/info`), map `worker_index` → device through `TSWAP_DEVICE_LIST` and log the mapping. **Enable metrics explicitly** (`/metrics` is only registered when they are on) and **set `metrics={"namespace": "tswap"}`**, which renames the whole default set and supplies most of [`05 §9`](05_RUNTIME_AND_BATCHING.md) free. **Never set `path_prefix`.** Set `threads` explicitly rather than relying on the default of 1.
+- **Wire `__is_ready__` / `__is_alive__`** to the same state our `/ready` reads, so `/readyz` is truthful for anyone bypassing our contract ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3.3). Undocumented hooks: a bonus, never the mechanism we rely on.
+- **Catch `ServiceUnavailable("process is overloaded")`** and re-emit it with a distinct saturation reason. BentoML strips the body of any ≥500 response, so left alone a saturated tool is indistinguishable from a starting one — and **D28** is about not misattributing failures.
+- Truthful `/ready`: weights-loaded, not server-up (§3.2) — the correction of the R8 behaviour this milestone most depends on.
+- **No `POST /unload` and no reload path** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). `unload()` remains in the handler protocol as an **optional** hygiene hook, called on `SIGTERM`; nothing calls it on the reclamation path. This is where the soft-unload machinery would re-attach if [ADR-0004](adr/0004-hard-stop-only-in-v1.md)'s triggers ever fire.
 - Env-var contract ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §7) translated into BentoML config; **effective config logged at startup**, including backend and BentoML versions.
 - BentoML's logger folded into our format; structured errors; graceful `SIGTERM`.
-- `tswap validate` enforces **D15**: a batched tool declaring a non-batchable input is a hard error.
+- *(The former D15 validation rule is gone — [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) makes the state unrepresentable rather than checked. `tswap validate` instead **warns when `workers > 1` with `devices:` set**, since VRAM multiplies invisibly to the scheduler.)*
 
 **Tests — above the seam, fast and pure:** a length-mismatched return fails loudly (**safety-critical**: a silent misalignment returns one patient's result for another); `retry_singly` isolates the offending item and attributes the failure; validation rejects unknown, missing and mistyped inputs; static params reach `__init__` and never appear in the request schema; `validate` rejects a batched tool with a non-batchable input, naming both remedies.
 
 **Tests — the backend contract suite** (`tests/runtime/contract/`, parameterised over backends, one backend in v1): `/health` answers before load completes **and during a 5 s inference**; `/ready` is 503 with a reason while loading; `load()` raising leaves `/ready` at 503 with the traceback and exits non-zero; `/schema` matches the compiled schema; `/info` reports backend and version; N concurrent requests produce **fewer than N** handler invocations and every caller receives its own correct result under interleaved arrival; `batching.enabled: false` still calls with lists of length 1.
-
-**Tests — the unload/reload cycle:** `POST /unload` returns 202 and `/ready` then answers 503; a request after unload triggers `load()` and succeeds; **`/health` stays up throughout** (the process never died); unload → reload → unload is stable over several cycles with no handle leak; a reload failing for lack of memory reports the distinct non-fatal outcome rather than the fatal one.
 
 **Note on batching tests:** exact flush timing is no longer assertable, because the dispatcher adapts its own window ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.2). Assert observable properties — invocation counts, result correctness, bounded latency — never exact timings. This is the main testing cost of **D14**, and the reason correctness assertions must be stronger to compensate.
 
@@ -175,7 +181,7 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 **Goal:** three files become a running image (**R2**).
 
 - Dockerfile generation from `runtime:` (levels 0–3), correct layer order, BuildKit pip/uv cache mounts.
-- Base images: `base-cpu:py312`, `base-cuda:12.4-py312`.
+- Base images: `base-cpu:py312`, `base-cuda:12.4-py312`. **Each sets a non-root `USER`** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6.1) — our tools unpickle checkpoints downloaded from the internet on a shared DGX, and this is the milestone where that costs one line instead of a migration. Mount the weights cache read-only where the tool does not download.
 - Deterministic tagging by config hash; `:latest` alias; rebuild-needed detection.
 - `tswap build [model|--all]`; generated Dockerfiles kept in `.tswap/build/<model>/` for inspection and graduation.
 - `tswap new` templates, each of which actually runs.
@@ -184,7 +190,7 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 
 **Tests:** generated Dockerfile snapshot tests per level; **editing `handler.py` does not invalidate the pip layer** (assert on the generated file ordering); the hash changes when requirements change and not when only a comment changes; every template validates.
 
-**Integration:** build and serve `example_echo` end-to-end; build a torch-CUDA template if a GPU runner exists.
+**Integration:** build and serve `example_echo` end-to-end; build a torch-CUDA template if a GPU runner exists. **Assert the effective UID inside a built image is not 0**, and that the tool still reaches its GPU devices and reads its weights mount — the second half is what breaks in practice.
 
 **Done when:** `tswap new` → `tswap build` → `tswap test` succeeds for every template, and rebuilds after a code-only edit are fast.
 
@@ -198,15 +204,14 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 - `preflight/check.py`: the `Check` protocol — `id`, `stage`, `severity`, `needs_docker`, `needs_gpu`, and a **mandatory remedy string**. A check that cannot say how to fix its own failure does not get merged.
 - `preflight/registry.py`: the single registry. **Refactor `tswap validate` (M1) to consume its static subset** — this milestone must *move* those rules, not copy them (guardrail 13).
-- Stage implementations 1–7 and 9 ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §10.1): static, build, standalone boot, truthful readiness, contract, example, batching/attribution, teardown.
+- Stage implementations 1–7 ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §10.1): static, build, standalone boot, truthful readiness, contract, example, batching/attribution. **Stage 8 (resource release) does not exist** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)), and **stage 9 (teardown) becomes an invariant of the runner's `finally` rather than a reported stage** ([`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §4.1) — still asserted, no longer a report line the author cannot act on.
+- **Preflight therefore needs no GPU at any stage**, which satisfies guardrail 12 by construction instead of by exception.
 - `preflight/runner.py`: sequencing, continue-after-failure where safe, and **teardown in a `finally`** so a failed run never leaks a container.
 - `preflight/report.py`: verdict, the four exit codes, human and `--json` renderers.
 - `preflight/recommend.py`: measurements → suggested `tools.yaml` snippet, marking values it cannot know (`group`) rather than inventing them.
 - Flags `--fast`, `--strict`, `--json`, `--keep`, `--stage N`.
 
-**Explicitly out of scope here**, to keep the milestone landable: stage 8 (VRAM release) needs a GPU and lands with M6; cold-start *statistics* across runs need the stats layer from M7; a CI admission gate and a `/admin/.../preflight` endpoint are phase 2.
-
-**One severity change from [ADR-0002](adr/0002-shared-node-soft-unload.md):** stage 8 becomes a hard **`FAIL`** for any tool declaring `devices`, not the advisory `WARN` originally specified. Soft unload is now the primary way VRAM returns to a node we share with other tenants, so a handler that only appears to release is no longer a private inefficiency — it silently degrades the whole box. The static half lands here (a GPU tool must define `unload()`); the measured half lands with M6.
+**Explicitly out of scope here**, to keep the milestone landable: cold-start *statistics* across runs need the stats layer from M7; a CI admission gate and a `/admin/.../preflight` endpoint are phase 2.
 
 **Tests:** one deliberately-broken fixture tool per check, asserting that check fails and that its remedy string appears ([`10_TESTING_STRATEGY.md`](10_TESTING_STRATEGY.md) §5.1) — a check with no failing fixture is unproven and must not be merged. Plus: `validate` and `preflight` agree on every static check over the whole fixture corpus (the anti-drift test); teardown leaves nothing behind **even when a stage raises**; `--keep` does leave the container; exit code 2 is returned when Docker is unreachable and is never confused with a tool failure; `--strict` promotes warnings; the `--json` report round-trips.
 
@@ -222,29 +227,26 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 - `scheduler/policy.py`: **pure** `request_slot`, `find_expired`, `rank` ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5, §9).
 - Group occupancy accounting over holding states.
-- Hard TTL watchdog; `keep_warm`; `autostart: false`.
-- LRU / LIFO / none eviction; `min_residency`; in-flight immunity.
+- TTL watchdog (**one timer**, [ADR-0004](adr/0004-hard-stop-only-in-v1.md)); `keep_warm`; `autostart: false`.
+- LRU / LIFO / none eviction; `min_residency`; in-flight immunity. **Victim selection orders by `(evict_cost, last_used)`** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.1) — one optional integer, so a 90-second segmenter is not evicted to save a one-second CPU function. **The solver and its DSL are explicitly refused.**
+- `keep_warm` is implemented as a **synthetic request through the ordinary request path**, not a separate warm-up routine — slot acquisition, readiness polling, state transitions and failure accounting then come free and cannot drift.
+- **Preemption** (**D25**): a request displaces an idle incumbent via `EVICT_THEN_GRANT` rather than waiting out its TTL. This is the existing eviction path with a request as its trigger, not new machinery.
 - Failure backoff and `max_consecutive_failures`.
 - Thrash detection with a warning that names the competing models and suggests a fix.
+- **Start under contention** (**D28**): a neighbour on the shared node may hold the VRAM. Return to `STOPPED` **not** `FAILED`, do **not** increment `consecutive_failures`, return 503 `vram_unavailable` with `Retry-After`, and log it under its own reason. Optionally read live free VRAM first to fail fast — **measurement only**; it never enters `request_slot` (**D27**, guardrail 2).
 - Liveness and readiness re-checks; periodic reconciliation.
 
-**Soft unload — promoted from phase 2 by [ADR-0002](adr/0002-shared-node-soft-unload.md), and the reason this milestone grew:**
+**What this milestone does *not* contain** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)): no soft sweep, no `IDLE_SOFT`, no `SOFT_UNLOAD_THEN_GRANT`, no `can_soft_unload`, no slot-versus-VRAM split in the snapshot, and no preflight stage 8. **One residency question, one idle timer, one eviction mechanism.**
 
-- The **soft sweep**: `READY` → `IDLE_SOFT` past `soft_ttl`, calling the runtime's `POST /unload`, plus `POST /admin/tools/{tool}/unload` on the router and `tswap unload` on the CLI.
-- **`SOFT_UNLOAD_THEN_GRANT`** in the policy — the scheduler prefers releasing an incumbent's weights over stopping its container ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1). This is what makes the required preemption cheap.
-- **The slot/VRAM distinction**: an `IDLE_SOFT` tool holds its group slot but no VRAM. The snapshot carries both facts and the scheduler never conflates them (§5.1.1).
-- **Eviction ranking** prefers `IDLE_SOFT` victims (nothing loaded, so stopping them reclaims nothing anyway), and hard-stops them rather than soft-unloading them.
-- **Reload under contention** (§3.3): a neighbour on the shared node may hold the VRAM. Return to `IDLE_SOFT` **not** `FAILED`, do **not** increment `consecutive_failures`, return 503 `vram_unavailable` with `Retry-After`, and log it under its own reason. Optionally read live free VRAM first to fail fast — **measurement only**; it never enters `request_slot`.
-- **`can_soft_unload`** honoured: tools classified hard-stop-only by preflight stage 8 are never soft-unloaded.
-- **Preflight stage 8** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §10.1): `unload()` genuinely releases VRAM, measured with `nvidia-smi` before/after. Needs a GPU and shares this machinery. Now a hard **`FAIL`** for GPU tools; a tool that cannot release is marked hard-stop-only rather than rejected. Feeds the measured `resources.vram_gb` into preflight's suggested config snippet.
+**`min_residency` and thrash detection are load-bearing here, not garnish.** Displacement now costs the victim a full cold start, so the alternating-request pathology ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.3) is more expensive than it would have been with soft unload. Thrash detection is also the instrumentation that tells us whether [ADR-0004](adr/0004-hard-stop-only-in-v1.md) was the wrong call.
 
-**Tests:** every scenario in [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §8 as a fast unit test with `ManualClock` + `FakeBackend` — simple swap, **soft swap (§8.1b)**, **hard-stop-only tools never soft-unloaded (§8.1c)**, TTL expiry, in-flight protection, thundering herd, failure/backoff, **reload under contention (§8.5b)**, router restart, group isolation. Plus: `min_residency` prevents immediate re-eviction; `eviction: none` waits instead of evicting; an `IDLE_SOFT` member is preferred as a victim; ranking is deterministic on ties.
+**Tests:** every scenario in [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §8 as a fast unit test with `ManualClock` + `FakeBackend` — simple swap, TTL expiry, in-flight protection, thundering herd, failure/backoff, **start under contention**, router restart, group isolation. Plus: `min_residency` prevents immediate re-eviction; `eviction: none` waits instead of evicting; ranking is deterministic on ties; **a high-`evict_cost` tool survives while a cheaper, less-recently-used one is displaced** (§8.1d). **Scenarios §8.1b and §8.1c are removed** with soft unload.
 
-**The test that matters most here** is §8.5b: a reload that fails for lack of VRAM must leave the tool `IDLE_SOFT` with its failure counter untouched. Get it wrong and every tool slowly marks itself broken whenever the DGX is busy — a failure that looks like our bug, reports as our bug, and is not.
+**The test that matters most here:** a start that fails for lack of VRAM must leave the tool `STOPPED` with its failure counter untouched (**D28**, guardrail 5b). Get it wrong and every tool slowly marks itself broken whenever the DGX is busy — a failure that looks like our bug, reports as our bug, and is not.
 
-**Integration:** two real containers in a `max_resident: 1` group genuinely alternate; VRAM is observably released on **soft unload** as well as on stop, confirmed with `nvidia-smi` (skip without a GPU); a soft-displaced tool's container is still running afterwards.
+**Integration:** two real containers in a `max_resident: 1` group genuinely alternate; VRAM is observably released on stop, confirmed with `nvidia-smi` (skip without a GPU); a request for the evicted tool restarts it correctly.
 
-**Done when:** the entire policy surface is covered by tests that run in milliseconds and never sleep, and a soft swap is demonstrably faster than a hard one on real hardware.
+**Done when:** the entire policy surface is covered by tests that run in milliseconds and never sleep.
 
 ---
 
@@ -252,13 +254,14 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 **Goal:** answer "why is it slow/failing?" without reading source (**R1**).
 
-- Log collector: container streams → per-model rotating files, **retained after the container stops**.
+- Log collector: container streams → per-tool rotating files, **retained after the container stops**.
+- **`router.log_output`** (`router` / `tool` / `both` / `none`) controlling what reaches stdout, borrowed from llama-swap ([`07_CLI_AND_OPS.md`](07_CLI_AND_OPS.md) §2.1). Files are always written regardless. **Test that each value changes the behaviour** — theirs shipped as a no-op past a completed review, and nothing 500s when logging silently breaks.
 - Router logging: console + rotating file + `.jsonl`; effective config dumped at boot; explicit INFO lines for transitions, cold starts with durations, evictions with victim and reason, TTL stops, and failures with traceback.
 - `/status` with everything in [`04_API_CONTRACT.md`](04_API_CONTRACT.md) §5, including per-tool latency percentiles and cold-start stats. This is the **only** metrics surface in v1; Prometheus `/metrics` is deferred ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §8).
 - Reuse the stats layer to enrich the preflight report with **cold-start and latency statistics across runs** rather than the single measurement M5.5 produces, so `ready_timeout` suggestions stop being derived from one sample.
 - `/ui` status page (single HTML file, polls `/status`, start/stop buttons, log tail).
 
-**Tests:** logs survive a container stop (the key requirement); rotation caps disk use; a `request_id` appears in the response header, the body `meta`, the router log and the container log; `/status` shape is snapshot-tested; TTL countdown maths is correct.
+**Tests:** logs survive a container stop (the key requirement); **`tswap logs <tool>` on a `STOPPED` tool returns its history rather than an error**; rotation caps disk use; a `request_id` appears in the response header, the body `meta`, the router log and the container log; **each `log_output` value demonstrably changes what reaches stdout**; `/status` shape is snapshot-tested; TTL countdown maths is correct.
 
 **Done when:** a deliberately-broken model can be diagnosed from `/status` plus `tswap logs` alone.
 
@@ -294,7 +297,7 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 There is **no OpenAI compatibility layer and no `mapping:`** — both were deleted with `kind: external` ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §7). This milestone is correspondingly smaller than it once was.
 
-**Tests:** input validation rejects unknown/missing/mistyped inputs with 422; a list on a batchable port returns parallel outputs in order and isolates a single bad item; a list on a non-batchable port is a 422; auth is enforced on admin; `start` on a `FAILED` tool clears the failure counter. Projections: `?format=tools` output is snapshot-tested and **validated against the standard tool-definition shape**; `x-*` keys are stripped from it; `?names=a,b` subsets correctly; every tool in the zoo appears, since there is no second class of tool that could be missing one.
+**Tests:** input validation rejects unknown/missing/mistyped inputs with 422; **a list of items returns parallel outputs in order and isolates a single bad item, and a single item is accepted as a list of one** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) — there is no non-batchable port left to reject a list on, so that test is deleted rather than rewritten); auth is enforced on admin; `start` on a `FAILED` tool clears the failure counter. Projections: `?format=tools` output is snapshot-tested and **validated against the standard tool-definition shape**; `x-*` keys are stripped from it; `?names=a,b` subsets correctly; every tool in the zoo appears, since there is no second class of tool that could be missing one.
 
 **Integration (the milestone's real acceptance test):** feed `?format=tools` straight into an LLM SDK's `tools=[...]` against our llama-swap deployment, and confirm the model emits a well-formed call for a zoo tool, which then succeeds against `/run/{tool}`. That round trip — llama-swap for the LLM, tool-swap for the algorithm — is the entire product thesis in one test, and the end-to-end proof that **D13** delivers what it promises.
 
@@ -321,7 +324,7 @@ There is **no OpenAI compatibility layer and no `mapping:`** — both were delet
 
 Ordered by expected value. Items 1–8 are features; the API items deferred in [`04_API_CONTRACT.md`](04_API_CONTRACT.md) §8 are listed after them with the trigger that would justify building each.
 
-1. ~~**Soft TTL / `IDLE_SOFT`**~~ — **moved into v1** (M4 and M6) by [ADR-0002](adr/0002-shared-node-soft-unload.md). On a shared DGX it is the default reclamation mechanism, not an optimisation. Nothing remains here.
+1. **Soft unload / `IDLE_SOFT`** — moved into v1 by [ADR-0002](adr/0002-shared-node-soft-unload.md), then **returned here by [ADR-0004](adr/0004-hard-stop-only-in-v1.md)** once the requester clarified that a timer suffices. **It is fully designed** — the state, `POST /unload`, `SOFT_UNLOAD_THEN_GRANT`, the slot/VRAM split and preflight stage 8 are all specified in [ADR-0002](adr/0002-shared-node-soft-unload.md) and this file's history — so re-promotion is implementation, not rediscovery. **Build it when a measurement says so**, per [ADR-0004](adr/0004-hard-stop-only-in-v1.md)'s four triggers; the strongest is cold starts exceeding ~20% of total request time for a frequently-used tool. `soft_ttl` is already reserved in the config schema, so its return is additive.
 2. **The R8 client** — [`11_R8_CLIENT_PLAN.md`](11_R8_CLIENT_PLAN.md) (**D10**).
 3. **VRAM-aware scheduling** — a new `Policy` implementation using `vram_gb` + live free memory; groups declare total VRAM instead of a tool count (**D7**'s "room for improvement"). Note the boundary v1 already draws: measuring free VRAM before a reload is permitted, *deciding placement* from predicted consumption is not ([ADR-0002](adr/0002-shared-node-soft-unload.md) §6). This item is about crossing that line deliberately, with evidence.
 4. **Replicas / horizontal scaling** — `replicas: N` with round-robin, and load-based autoscaling within a group.

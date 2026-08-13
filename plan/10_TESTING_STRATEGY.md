@@ -109,15 +109,15 @@ The minimal five-line config; full config; precedence across all four levels; `e
 Pure functions, so exhaustive coverage is cheap:
 
 - Slot free → `GRANT`; already resident → `ALREADY_RESIDENT`; full + evictable → displacement of the expected victim; full + all busy → `WAIT`; `eviction: none` → `WAIT`.
-- **Displacement picks the cheap mechanism**: a `READY` victim that `can_soft_unload` → `SOFT_UNLOAD_THEN_GRANT`; a victim that cannot release, or one already `IDLE_SOFT`, → `EVICT_THEN_GRANT` ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1).
-- LRU picks the least-recently-used; `IDLE_SOFT` is preferred over `READY`; ties break deterministically.
+- **There is exactly one displacement decision**, `EVICT_THEN_GRANT` ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). *(The former soft-unload-preference tests are removed with the mechanism.)*
+- **Victim selection honours `evict_cost` before recency**: given a cheap-to-restart tool idle for 100 s and an expensive one idle for 120 s, the **cheap** one is evicted ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.1). With equal `evict_cost`, LRU decides; ties break deterministically.
 - `keep_warm` and `inflight > 0` are never victims.
-- `min_residency` blocks eviction of a just-started model.
-- `find_expired` respects `ttl`, `soft_ttl`, `keep_warm`, `inflight`, and `ttl: 0`.
+- `min_residency` blocks eviction of a just-started tool.
+- `find_expired` respects `ttl`, `keep_warm`, `inflight`, and the `-1` / `0` / `>0` sentinels.
+- **The scheduler never reads free VRAM and never consults `vram_gb`** — a purity test, since the shared node makes that temptation real (**D27**).
 - Group isolation: a full group never affects another.
-- **The scheduler never reads free VRAM and never consults `vram_gb`** — a purity test, since the shared node makes that temptation real ([ADR-0002](adr/0002-shared-node-soft-unload.md) §6).
 
-Property-based (hypothesis) is worth it here: for any random snapshot, assert the invariants — never evict a busy model; never exceed `max_resident`; a decision is always one of the five kinds; `GRANT` implies capacity existed; **a tool with `can_soft_unload: false` is never returned as a soft-unload victim**.
+Property-based (hypothesis) is worth it here: for any random snapshot, assert the invariants — never evict a busy tool; never exceed `max_resident`; a decision is always one of the four kinds; `GRANT` implies capacity existed.
 
 ### `lifecycle/`
 Coalescing (N concurrent ⇒ 1 start); readiness progression; `start_timeout` and `ready_timeout` → `FAILED` with the reason; drain waits then stops; force-stop skips the drain; the in-flight counter returns to zero **even when the client disconnects or the handler raises** (test the `finally`); a container dying while `READY` → `FAILED`; backoff sequence honoured; `max_consecutive_failures` halts auto-retry; an admin `start` clears the failure counter (there is no separate `reset`); reconciliation adopts, stops orphans, and never kills a serving container.
@@ -126,17 +126,17 @@ Coalescing (N concurrent ⇒ 1 start); readiness progression; `start_timeout` an
 Verbatim forwarding of method/path/query/body; hop-by-hop headers stripped; `X-Request-Id` injected and echoed; status and content-type preserved; SSE streams incrementally (assert chunks arrive before the response completes — the test that actually catches accidental buffering); `request_timeout` → 504; the swap-retry happens exactly once, and only for a pre-first-byte connection failure.
 
 ### `api/`
-Every error code maps to its documented HTTP status ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §6) — **especially unknown tool ⇒ 404, not 500**; each `TOOL_UNAVAILABLE` cause sets the right `reason` (`autostart_disabled`, `queue_timeout`, `failed`, `evicted`, `vram_unavailable`); **`vram_unavailable` leaves the tool `IDLE_SOFT` with its failure counter untouched** — a neighbour's memory usage is not our tool's fault, and treating it as one produces tools that disable themselves whenever the DGX is busy (**D28**); a success body has `outputs` and no `status` field, an error body has `error` and no `outputs` (the single-source-of-truth rule); `meta` fields present and plausible; input validation 422s, including a list on a non-batchable port; a list on a batchable port returns parallel outputs with per-item status; `options.timeout` can lower but never raise the configured timeout; auth enforced when a token is configured; `/status` snapshot; **`/health` returns the same result regardless of tool states** (the regression that would otherwise pull the router out of a load balancer when one tool fails).
+Every error code maps to its documented HTTP status ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §6) — **especially unknown tool ⇒ 404, not 500**; each `TOOL_UNAVAILABLE` cause sets the right `reason` (`autostart_disabled`, `queue_timeout`, `failed`, `evicted`, `vram_unavailable`); **a saturated `READY` tool is distinguishable from a starting one** rather than both answering a bare 503 ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.5); **`vram_unavailable` leaves the tool `STOPPED` with its failure counter untouched** — a neighbour's memory usage is not our tool's fault, and treating it as one produces tools that disable themselves whenever the DGX is busy (**D28**); a success body has `outputs` and no `status` field, an error body has `error` and no `outputs` (the single-source-of-truth rule); `meta` fields present and plausible; input validation 422s; **a list of items returns parallel outputs with per-item status, and a single item is accepted as a list of one** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) — there are no non-batchable ports to reject a list on); `options.timeout` can lower but never raise the configured timeout; auth enforced when a token is configured; `/status` snapshot; **`/health` returns the same result regardless of tool states** (the regression that would otherwise pull the router out of a load balancer when one tool fails).
 
 There is no OpenAI door to test — it was deleted along with `kind: external` ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §7). Add a guard test that **`/v1/...` returns 404**, so nobody reintroduces a compatibility layer by accident.
 
 ### `schema/` — the projections (**D13**)
 These are contract tests: a regression here silently breaks every agent consumer and nothing else would catch it.
 
-- `inputs:` compiles to the expected JSON Schema (snapshot per case: scalar, batchable, optional-with-default, array, object, raw pass-through).
+- `inputs:` compiles to the expected JSON Schema (snapshot per case: scalar, optional-with-default, array, object, raw pass-through). **There is one schema shape**, since every input is a field of the batched item ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)).
 - **The compiled schema validates against the JSON Schema 2020-12 meta-schema.** Emitting an invalid schema is worse than emitting none.
 - `?format=tools` matches the OpenAI tool-definition shape exactly, and **all `x-*` keys are stripped** (some providers reject unknown keys).
-- Only two `x-*` keywords exist (`x-batchable`, `x-semantic`); an unknown `x-` keyword in a raw `json_schema:` block passes through untouched rather than being invented by the compiler.
+- `x-semantic` is the only `x-*` keyword the compiler emits (`x-batchable` is gone with the per-input flag); an unknown `x-` keyword in a raw `json_schema:` block passes through untouched rather than being invented by the compiler.
 - `?names=a,b` subsets correctly; unknown names 404.
 - A missing `description` fails validation (the discipline that makes a tool usable by an LLM).
 - **Every registered tool appears in the projection** — with one kind of tool there is no second class that could silently go missing.
@@ -159,7 +159,7 @@ These test our own code ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.
 - **Result attribution**: given a batch and a positional result list, every request id receives exactly its own result. Property-based over random batch compositions.
 - `retry_singly` isolates one bad item and serves the other N−1, attributing the error to the offender.
 - Input validation rejects unknown, missing and mistyped inputs.
-- Static params reach `__init__`, never appear in the request schema, and are rejected if sent in a request body (**D15**).
+- Static params reach `__init__`, never appear in the request schema, and are rejected if sent in a request body (**D15**, as re-scoped by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) — `params:` now means *values that change what the batched forward pass computes*).
 
 ### 4.2 The backend contract suite — parameterised, real server
 
@@ -168,11 +168,13 @@ These test our own code ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.
 **Batching — assert observable properties, never timings:**
 - N concurrent requests result in **fewer than N** handler invocations (batching demonstrably happens).
 - **Every caller receives its own correct result** under interleaved arrivals — the safety-critical invariant, re-asserted end-to-end.
+- ⚠️ **Never assert submission order.** *"The order of the requests in a batch is not guaranteed"* is **documented vendor behaviour**, not a flake. Send N *distinguishable* requests, each recoverable from its own result, and assert attribution only. Anyone who sees reordering and files a bug should be sent here.
 - Added latency stays bounded near `max_latency_ms` (generous bound; the dispatcher adapts, so a tight bound would be flaky by construction).
-- `batching.enabled: false` still invokes the handler with lists of length 1.
+- **Record the `threads` setting alongside any batching result.** BentoML limits sync handler calls to `threads` (default **1**); a batching number reported without it is uninterpretable.
+- `max_batch_size: 1` still invokes the handler with lists of length 1 — the uniform convention holds at the boundary ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)).
 - Client disconnect does not corrupt the results of the remaining callers.
 
-Deleted, with the reason recorded so nobody re-adds them: *flush on size*, *flush on age via `ManualClock`* (the dispatcher's timing is not ours to drive), *different non-batchable args are never batched* (**D15** makes that state unconstructible — the corresponding test now lives in `tswap validate`), and *`max_batch_bytes` caps the batch* (the key no longer exists).
+Deleted, with the reason recorded so nobody re-adds them: *flush on size*, *flush on age via `ManualClock`* (the dispatcher's timing is not ours to drive), *different non-batchable args are never batched* ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) makes that state unconstructible — per-request values now travel with their own item), and *`max_batch_bytes` caps the batch* (the key no longer exists).
 
 **Lifecycle:** `/health` 200 before load completes; `/ready` 503 with a reason while loading — **and not merely "server up"**, the R8 behaviour this corrects; `load()` raising leaves the reason visible and exits non-zero; `/health` answers *during* a long inference (the event-loop-blocking regression test); `SIGTERM` drains then unloads; **`/unload` flips readiness back and `/health` stays up throughout**, and an unload → reload → unload cycle is stable with no handle leak.
 
@@ -180,7 +182,7 @@ Deleted, with the reason recorded so nobody re-adds them: *flush on size*, *flus
 
 ### 4.3 Config validation (L1, but belongs to this story)
 
-`tswap validate` **rejects a tool with `batching.enabled: true` and any non-batchable input** (**D15**), with a message naming the input and both remedies. This test is the entire safety mechanism for the one capability given up in D14 — if it is ever weakened, the silent wrong-answer bug returns.
+*(The former D15 validation test is removed by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md): a batched tool cannot declare a non-batchable input, because every input is a field of the batched item. **The safety property it protected is now structural rather than checked** — which is why the attribution tests in §4.1 matter more, not less.)*
 
 **Schema:** declaration → JSON Schema; a missing description fails validation (the R8 discipline, kept).
 
@@ -244,7 +246,18 @@ Requirements: unique network/label namespace per test run (so parallel CI runs d
 ## 6. L4 — E2E and GPU
 
 - `tests/e2e/test_quickstart.py` executes the README quickstart verbatim, so the documentation cannot silently rot. This is high value for very little code.
-- `@pytest.mark.gpu`: VRAM is genuinely released on stop **and on soft unload** (read `nvidia-smi` before/after) — the second is the one the shared-node design depends on; a soft-displaced tool's container is still running afterwards; a real torch model loads and serves; two real models alternate on one GPU without OOM; a TensorFlow model and a torch model coexist as separate containers — the case that was structurally broken in the shared-process design and therefore the most satisfying test in the suite.
+- `@pytest.mark.gpu`: VRAM is genuinely released on stop (read `nvidia-smi` before/after); a real torch model loads and serves; two real models alternate on one GPU without OOM; a TensorFlow model and a torch model coexist as separate containers — the case that was structurally broken in the shared-process design and therefore the most satisfying test in the suite. *(The soft-unload VRAM tests are removed with the mechanism — [ADR-0004](adr/0004-hard-stop-only-in-v1.md).)*
+- **Tool containers run as a non-root user** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6.1): assert the effective UID inside a built image is not 0, and that the tool can still reach its GPU devices and read its weights mount. The second half is the one that breaks in practice.
+
+### 6.1 Observability is a requirement, so test it like one
+
+**llama-swap's own router rewrite shipped seven defects past a completed review, and five of them were logging** — including a config key that silently did nothing and a `/logs` endpoint that was *"always empty"*. **Nothing 500s when logs go missing**, so functional tests never notice.
+
+**R1** is *"simple to launch the service and to check its logs and status"*, which makes a silent logging failure a **requirement failure, not a cosmetic one**. Three assertions, cheap and easy to forget:
+
+1. **`tswap logs {tool}` returns that tool's lines** — resolved against live container state, not a static file guess.
+2. **`tswap logs {tool}` on a `STOPPED` tool** returns its retained history rather than an error. Theirs returned 400 for the analogous case.
+3. **The `log_output` setting actually takes effect** (`router` / `tool` / `both` / `none`, [`07_CLI_AND_OPS.md`](07_CLI_AND_OPS.md)). Assert each value changes what appears on stdout — this is the exact defect they shipped.
 - Optional soak: a script hammering a small zoo for an hour, asserting no leak in the in-flight counter, no orphaned containers, no unbounded log growth, and stable memory in the router.
 
 ---
@@ -345,8 +358,8 @@ Each of these exists because the R8 implementation got it wrong. Write them as n
 | `test_model_logs_are_persisted_without_verbose_flag` | R8 read subprocess output and discarded it unless `verbose` was set. |
 | `test_load_failure_reason_is_exposed_not_swallowed` | R8's `_warmup_background` caught the exception and only set `_ready = False`, so a failed load left a service alive, never ready, and silent about why ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §5). |
 | `test_ready_means_weights_loaded_not_server_started` | BentoML's built-in `/readyz` reports server-up; R8 polled it as if it meant loaded. Our `/ready` must be 503 while weights are still loading ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3.2). |
-| `test_worker_device_mapping_is_explicit` | R8 derived `gpu_id = max(0, worker_index - 1)` from a 1-based worker index — fragile and off-by-one-prone. |
-| `test_validate_rejects_batched_tool_with_non_batchable_input` | **D15.** Guards the one capability given up by D14: without this rule, requests with differing parameters batch together and one is answered with the other's value, silently. |
+| `test_worker_device_mapping_is_explicit` | R8 derived `gpu_id = max(0, worker_index - 1)` from `worker_index` — **which is the vendor's own documented idiom**, and the vendor documents the index as both 0- and 1-based on one page. The lesson is *never build device identity on a framework's indexing convention*, so assert the mapping is explicit and logged. |
+| `test_per_item_parameters_are_applied_to_their_own_item` | **[ADR-0005](adr/0005-one-uniform-batched-calling-convention.md).** Two items in one batch with different `threshold` values each get their own. Replaces the old D15 validation test: the guarantee moved from a rule we enforce to a shape that cannot express the bug. |
 | `test_named_inputs_are_not_positionally_mapped` | R8's API mapped an ordered `input_modalities` list onto port names by index. |
 | `test_schema_projections_match_the_standard_shapes` | R8 invented a bespoke `to_node_text()` prompt format and a closed modality enum, so every consumer needed its own parser and adding a modality meant editing the orchestrator. |
 | `test_one_model_failure_does_not_affect_others` | R8 ran every model in the API process, so one crash or OOM took down everything. |

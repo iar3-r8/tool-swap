@@ -10,6 +10,70 @@ Everything else in this document is detail.
 
 ---
 
+### 1.1 The two boundaries
+
+Before the component map, the shape that explains every decision downstream. The system has exactly **two** boundaries, and confusing them is the most common way to misread this plan.
+
+```mermaid
+graph TB
+    AG[Agents / R8 backend / curl]
+
+    subgraph R["THE ROUTER — ours — one small always-on process, no torch, no CUDA"]
+        HTTP[FastAPI: routing, validation, error mapping]
+        REG[Registry: validated tool definitions from config]
+        SCHED[Scheduler: PURE policy — groups, devices, eviction choice]
+        LIFE[Lifecycle: per-tool state machine, readiness polling, TTL]
+        PROXY[Reverse proxy: httpx streaming both ways]
+    end
+
+    DOCK[ContainerBackend: docker SDK behind a Protocol — a dumb driver]
+
+    subgraph Z["THE ZOO — one OCI image per tool, mutually incompatible dependency trees"]
+        subgraph C1["cxr_to_embedding : torch + monai"]
+            RT1[tool_swap_runtime — OUR CONTRACT]
+            BM1[BentoML — HERE, and only here]
+            H1[handler.py — plain Python]
+        end
+        subgraph C2["organ_donor : tensorflow + tf-keras"]
+            RT2[tool_swap_runtime]
+            BM2[BentoML — HERE]
+            H2[handler.py]
+        end
+    end
+
+    AG --> HTTP
+    HTTP --> REG
+    HTTP --> SCHED
+    SCHED --> LIFE
+    LIFE --> DOCK
+    DOCK --> C1
+    DOCK --> C2
+    HTTP --> PROXY
+    PROXY -. "GET /health /ready /schema /info · POST /predict /unload" .-> RT1
+    PROXY -. identical contract .-> RT2
+    RT1 --> BM1
+    BM1 --> H1
+    RT2 --> BM2
+    BM2 --> H2
+```
+
+| Boundary | What it separates | Why it exists |
+|---|---|---|
+| **1 — the container** | Each tool's dependency tree from every other tool's, and from the router's | **D2**, the most load-bearing decision in the plan. It is why a torch tool and a TensorFlow tool stop fighting, and why a CUDA OOM in one tool cannot touch another |
+| **2 — the runtime contract** | The router from whatever serves inside the container | Eight endpoints, identical across the zoo (§6). The router never asks "what does this image expose?" |
+
+**Where BentoML sits, and what follows from it.** The serving framework (**D14**, [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1) lives strictly *between* boundary 2 and the handler, inside boundary 1. Three consequences, each enforced rather than hoped for:
+
+- **The router never imports it, configures it, or speaks its route names.** It sets `TSWAP_*` environment variables; our adapter translates them ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §7).
+- **The tool author never imports it.** `handler.py` is plain Python with `load()` / `predict()` / `unload()`.
+- **It competes with exactly one tool's pins**, never the zoo's — which is the whole difference from R8, where one environment held `torch`, `tensorflow`, `ray`, `bentoml` and every model at once ([`00_CONTEXT_AND_MOTIVATION.md`](00_CONTEXT_AND_MOTIVATION.md) §2.3).
+
+An import-linter rule plus an AST check keep `bentoml` out of every module except `tool_swap_runtime/backends/bentoml_backend.py` ([`08_REPO_LAYOUT.md`](08_REPO_LAYOUT.md) §5). That single file is the entire framework-aware surface of the project.
+
+**What we build, in one line each:** the scheduler and the lifecycle manager (the product), the uniform contract, the authoring layer, the catalogue, and the operator tooling. **What we buy:** Docker, FastAPI, and one serving framework per container. Only the scheduler is genuinely novel ([`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §6).
+
+---
+
 ## 2. Component map
 
 ```mermaid
@@ -38,15 +102,18 @@ graph TB
 
     subgraph Containers["Tool containers - one per tool, own image, own env"]
         subgraph MC1["cxr_to_embedding"]
-            RT1[tool_swap_runtime server]
+            RT1[tool_swap_runtime contract]
+            BE1[BentoML backend]
             H1[handler.py: load / predict / unload]
         end
         subgraph MC2["eeg_to_embedding"]
-            RT2[tool_swap_runtime server]
+            RT2[tool_swap_runtime contract]
+            BE2[BentoML backend]
             H2[handler.py]
         end
         subgraph MC3["ct_segmenter"]
-            RT3[tool_swap_runtime server]
+            RT3[tool_swap_runtime contract]
+            BE3[BentoML backend]
             H3[handler.py]
         end
     end
@@ -65,12 +132,22 @@ graph TB
     DOCKER --> LOGS
     PROXY -.HTTP.-> RT1
     PROXY -.HTTP.-> RT2
-    PROXY -.HTTP.-> V1
-    RT1 --> H1
-    RT2 --> H2
+    PROXY -.HTTP.-> RT3
+    RT1 --> BE1
+    RT2 --> BE2
+    RT3 --> BE3
+    BE1 --> H1
+    BE2 --> H2
+    BE3 --> H3
 ```
 
 ### 2.1 Responsibilities, strictly separated
+
+> **Convergent evidence, worth knowing about.** llama-swap is rewriting its own router after four years and 249 releases, and the decomposition it settled on is this one: *"The legacy `ProxyManager` collapses three concerns into one struct: the HTTP mux, the model→process router, and the cross-cutting services… The new layout keeps the `router.Router` implementations focused on model dispatch and lets `internal/server.Server` own the mux and all cross-cutting middleware."*
+>
+> Their standing warning is the one to internalise: **"preserve that abstraction rather than reintroducing the branch in every handler."** That is precisely what happens when scheduling policy leaks into request handlers — the failure [`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §5 names as never-trim item 2. **We have the warning before writing the code; they got it after writing it twice.**
+>
+> A second borrowing from the same source: their `Router` interface has three implementations (static groups, a solver, and a remote peer) behind one abstraction, and a `LocalRouter` sub-interface that a remote peer opts out of. **We have one policy and need no second implementation — but the interface shape is worth copying anyway**, because it is what makes federation ([`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md) §8.6) addable later without touching a single handler. Same reasoning as `ContainerBackend` and `RuntimeBackend`.
 
 | Component | Owns | Must NOT |
 |---|---|---|
@@ -82,6 +159,14 @@ graph TB
 | **Reverse proxy** | Forwarding a request to `http://{host}:{port}{path}`, streaming both ways, header hygiene, timeouts. | Retry business logic beyond the documented swap-retry. |
 | **Idle watchdog** | Firing TTL expiry events on a clock tick. | Decide policy — it asks the lifecycle manager. |
 | **Log collector** | Streaming container stdout/stderr into per-model rotating files. | Parse or interpret model output. |
+
+And inside each container, below the router entirely:
+
+| Component | Owns | Must NOT |
+|---|---|---|
+| **`tool_swap_runtime`** (ours) | The HTTP contract, schema compilation, validation, the batch-length check, `retry_singly`, truthful readiness, handler lifecycle. | Import a serving framework outside `backends/`. |
+| **Runtime backend** (BentoML, **D14**) | Serving the port, forming batches, worker processes and device assignment — three things, and no more ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §2.2). | Appear in any signature above the seam, or be known to the router. |
+| **`handler.py`** (the author) | `load()` / `predict()` / `unload()`. | Import anything of ours beyond a metadata decorator, or any framework. |
 
 The critical testability rule, learned from the R8 code: **the scheduler must be a pure function of state, and the clock must be injectable.** Everything about TTL and eviction can then be tested in milliseconds with no Docker and no `sleep`. See [`10_TESTING_STRATEGY.md`](10_TESTING_STRATEGY.md).
 
@@ -103,11 +188,7 @@ stateDiagram-v2
     STOPPED --> STARTING: request arrives / manual start
     STARTING --> LOADING: container is up, /health OK
     LOADING --> READY: /ready OK
-    READY --> IDLE_SOFT: soft TTL expires
-    IDLE_SOFT --> READY: request arrives, weights reloaded
-    IDLE_SOFT --> IDLE_SOFT: reload failed, no free VRAM
-    READY --> STOPPING: hard TTL expires / evicted / manual stop
-    IDLE_SOFT --> STOPPING: hard TTL expires / evicted
+    READY --> STOPPING: TTL expires / evicted / manual stop
     STOPPING --> STOPPED
     STARTING --> FAILED: start error / timeout
     LOADING --> FAILED: readiness timeout / crash
@@ -122,7 +203,6 @@ stateDiagram-v2
 | `STARTING` | Container created/started; not yet answering `/health`. | No — requests queue |
 | `LOADING` | Process is up but weights are still loading (`/health` yes, `/ready` no). | No — requests queue |
 | `READY` | Fully warm. | **Yes** |
-| `IDLE_SOFT` | Container alive, weights released. Group slot still held, **VRAM freed** — which is the point on a shared node. The normal resting state of an idle tool ([ADR-0002](adr/0002-shared-node-soft-unload.md)). | No — a request triggers a fast reload |
 | `STOPPING` | Graceful shutdown in progress. | No |
 | `FAILED` | Start or readiness failed, or the container died. Holds an error message and a failure count. | No — returns 503 with the reason |
 
@@ -169,6 +249,62 @@ sequenceDiagram
     Note over L: idle watchdog will stop it after ttl
 ```
 
+### 5.0 The same path, end to end — where every component acts
+
+The diagram above stops at the container door. This one goes through it, and it is the single most useful picture of the system: it shows what the router owns, what Docker owns, what the bought serving framework owns, and what the scientist owns — in the order they execute.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as Caller
+    participant RT as Router (ours)
+    participant DK as Docker
+    participant BM as BentoML server (bought)
+    participant AD as Runtime adapter (ours)
+    participant H as handler.py (author)
+
+    CL->>RT: POST /run/cxr_to_embedding
+    RT->>RT: registry lookup, then scheduler: free slot? evict LRU?
+    RT->>DK: start container (image, TSWAP_* env, device list, mounts)
+    DK->>BM: python -m tool_swap_runtime.server
+    BM->>AD: construct service, mount our routes
+    AD->>AD: import handler, compile JSON Schema, bind :8000
+    AD->>AD: background thread starts load() — the server binds first
+    RT->>BM: GET /health
+    BM-->>RT: 200 alive — answered before weights exist
+    AD->>H: load() then optional warmup()
+    RT->>BM: GET /ready
+    Note over AD: OUR /ready means weights loaded,<br/>not server up — see 05 §3.2
+    BM-->>RT: 200 ready
+    RT->>BM: proxy POST /predict (streamed)
+    Note over BM: ADAPTIVE DISPATCHER — the reason we bought it.<br/>Groups concurrent calls into one batch of N
+    BM->>AD: batch_fn(list of N inputs)
+    AD->>AD: validate · LENGTH CHECK · retry_singly
+    AD->>H: predict(paths=[...N...])
+    H-->>AD: N outputs, in order
+    AD->>AD: verify length is N, fan out positionally
+    BM-->>RT: outputs
+    RT-->>CL: response
+    Note over RT: idle: soft TTL then hard TTL
+    RT->>BM: POST /unload — releases weights, process stays alive
+    RT->>DK: SIGTERM on hard TTL
+```
+
+Read the participants as an ownership map:
+
+| Participant | Owned by | Scope |
+|---|---|---|
+| Router | **Us** | Registry, scheduling, eviction, lifecycle, proxying. Never imports model code, never imports the serving framework |
+| Docker | **Bought** | Starting and stopping containers, device requests, mounts |
+| BentoML server | **Bought** | Three jobs only: serve the port, **form the batch**, run the workers ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §2.2) |
+| Runtime adapter | **Us** | The contract endpoints, schema compilation, validation, the batch-length check, `retry_singly`, truthful readiness, lifecycle hooks |
+| `handler.py` | **The author** | `load()` / `predict()` / `unload()`. Plain Python, imports no framework |
+
+Two steps in that sequence are load-bearing and easy to miss:
+
+- **Bind before load.** The server answers `/health` while weights are still loading. R8 did this too — but its warm-up thread *swallowed the exception*, leaving a service alive, never ready, and silent about why ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §5). Ours records the traceback, serves it in the `/ready` body, and exits non-zero after a grace period.
+- **`batch_fn` is the seam.** The framework decides *when* a batch forms; it hands our code an already-formed list of N and never touches validation, error shaping or the length check. That is exactly why replacing it later is bounded work.
+
 ### 5.1 Concurrency rules on this path
 
 These are the details that make or break correctness. Specify them now, test them explicitly.
@@ -176,7 +312,7 @@ These are the details that make or break correctness. Specify them now, test the
 1. **One in-flight transition per model.** `ensure_ready` must be idempotent and coalescing: if ten requests arrive simultaneously for a `STOPPED` model, exactly **one** container start occurs and all ten requests await the same future. Implement with a per-model `asyncio.Lock` + a stored "pending readiness" awaitable.
 2. **Global scheduling lock.** Slot granting and eviction must be serialised across models, or two concurrent starts can both believe the same group slot is free. One global `asyncio.Lock` around the scheduler decision is entirely sufficient at our scale — do not get clever.
 3. **In-flight requests block eviction.** A model with `inflight > 0` is never evicted and never TTL-stopped. Maintain an in-flight counter incremented before proxying and decremented in a `finally`. TTL is measured from `last_used`, which is updated on request *completion*.
-4. **Graceful drain on stop.** On eviction/TTL, stop accepting new proxied requests for that model, wait up to `drain_timeout` for in-flight ones, then `SIGTERM` the container, then `SIGKILL` after `stop_timeout`. R8's process engine used `killpg(SIGTERM)` then `kill()` after a 5 s wait — same idea, now delegated to Docker's own stop semantics.
+4. **Graceful drain on stop.** On eviction/TTL, stop accepting new proxied requests for that tool, wait up to `drain_timeout` for in-flight ones, then `SIGTERM` the container, then `SIGKILL` after `stop_timeout`. R8's process engine used `killpg(SIGTERM)` then `kill()` after a 5 s wait — same idea, now delegated to Docker's own stop semantics. **This survives [ADR-0004](adr/0004-hard-stop-only-in-v1.md) unchanged**, and is more careful than llama-swap's flat 10 s `unloadTimeout`, because rule 3 means we never force-kill mid-inference at all. **Check `drain_timeout` against your slowest single inference** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §2.1).
 5. **Queue bounds.** Waiting for a cold start must be bounded: `queue_timeout` (return 503 with a `Retry-After` if exceeded) and `max_queue_depth` per model (return 429 when exceeded). Never allow unbounded pile-up during a slow load.
 6. **Swap-retry.** If a proxied request fails with a connection error *because the model was concurrently stopped*, retry `ensure_ready` + proxy **once**. Beyond that, fail. This handles the benign race between the watchdog and a late request.
 
@@ -235,25 +371,44 @@ Rules:
 - There is **no port allocation to reconcile**: tools are reached by container name on the shared network (**D21**, §9), so a restarted router rediscovers a container by its label and name rather than by remembering which port it was given. This is the structural fix for the originating system's `BASE_PORT + i` flaw, where reordering the registry silently reassigned every port — the state that could be wrong no longer exists.
 - Reconciliation must be safe to run repeatedly and must never kill a container that is currently serving.
 
+### 7.1 Shutdown ordering on `tswap down`
+
+**Drain the HTTP server before tearing down containers.** llama-swap's own router-rewrite notes state the failure directly: *"`httpServer.Shutdown` must drain inflight requests before `Server.Shutdown` tears down processes, otherwise inflight requests 502."*
+
+**Ours is harder than theirs, because "drain" has two meanings here** (**D22**): a request may be *in flight against a container*, or *queued behind a cold start* for a container we are about to stop. The order is therefore:
+
+1. **Stop accepting new requests** at the router.
+2. **Fail queued requests fast** with 503 + `Retry-After` and a shutting-down reason. They are waiting for a container that is about to stop; making them wait out `queue_timeout` first is pointless and looks like a hang.
+3. **Drain in-flight requests**, bounded by `drain_timeout`.
+4. **Then** stop containers, in the ordinary drain-then-`SIGTERM`-then-`SIGKILL` sequence (§5.1 rule 4).
+
+Cheap to specify now; a source of flaky integration tests if left to implementation.
+
 ---
 
 ## 8. Where the batching lives
 
 ```
-Client ──1 request──> Router ──1 request──> Model container
-                                              └── tool_swap_runtime batcher
-                                                  ├── queue
-                                                  ├── flush on max_batch_size OR max_wait_ms
-                                                  └── handler.predict(batched inputs)
+Client ──1 request──> Router ──1 request──> Tool container
+                                               ├── BentoML adaptive dispatcher   (bought — forms the batch)
+                                               └── tool_swap_runtime wrapper     (ours — above the seam)
+                                                   ├── validation
+                                                   ├── batch-length check
+                                                   ├── retry_singly
+                                                   └── handler.predict(batched inputs)
 ```
 
-**Batching happens inside the model container, never in the router.** Reasons:
+**Batching happens inside the tool container, never in the router.** Reasons:
 
 - The router is model-agnostic; it cannot know whether two payloads are combinable.
-- It keeps the router stateless w.r.t. inference and lets `external` upstreams (vLLM, TEI) use their own, better batchers.
-- It mirrors what R8's BentoML engine did (`@bentoml.api(batchable=True, max_batch_size, max_latency_ms)`) and what the R8 `CoreBatcher` was written for. The flush policy is exactly theirs: **flush when queue length ≥ `max_batch_size` OR when the oldest item has waited ≥ `max_wait_ms`.** That `CoreBatcher` is clean, pure and reusable — see [`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §7.
+- It keeps the router stateless with respect to inference, and it means batching travels with the image — a tool remains a fully functional server under plain `docker run`.
+- It mirrors what R8's BentoML engine did (`@bentoml.api(batchable=True, max_batch_size, max_latency_ms)`), which is the configuration our adapter now generates from the tool's declaration.
 
-The handler declares whether it is batchable. A non-batchable handler simply gets batches of size 1. Details in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md).
+**We do not write the batcher (D14).** The engine is BentoML's **adaptive** dispatcher: rather than a fixed "flush at size N or after W ms", it estimates the arrival rate and the model's latency curve and adapts its wait window to hold p99 under `max_latency_ms` ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.1). The fixed size-or-age policy is R8's `CoreBatcher` ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §7); it is **not** ported into v1, and survives as two useful things: the written specification for a future `native` backend, and the mental model operators should use when tuning the two knobs.
+
+What stays ours regardless of the engine, because it sits above the seam: input validation, the **batch-length check** (a mismatch would return one patient's result for another), `retry_singly` per-item failure isolation, and the structured error envelope.
+
+The tool declares whether it is batchable. A non-batchable tool simply gets batches of size 1, so authors write one code path. One restriction follows from the dispatcher and is enforced at authoring time (**D15**): **a batched tool may declare only batchable inputs**, with per-deployment knobs becoming static params fixed at `load()`. Details in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.
 
 ---
 

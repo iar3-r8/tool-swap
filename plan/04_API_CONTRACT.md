@@ -353,7 +353,7 @@ Separate top-level codes would have forced every client to write a five-branch s
 
 **`vram_unavailable` is not a tool failure, and the distinction is load-bearing.** We run on a shared DGX, so memory we released while idle can be taken by another tenant before we reload it. Three rules follow, all of them things it would be easy and wrong to do otherwise ([ADR-0002](adr/0002-shared-node-soft-unload.md) §4):
 
-- the tool stays in `IDLE_SOFT` and **must not** be marked `FAILED`;
+- the tool returns to `STOPPED` and **must not** be marked `FAILED` ([ADR-0004](adr/0004-hard-stop-only-in-v1.md) replaced `IDLE_SOFT` here with `STOPPED`; the exposure is identical and only the trigger moved, from a failed reload to a failed cold start);
 - the occurrence **must not** count toward `max_consecutive_failures`, or a busy neighbour would eventually disable our tool permanently;
 - the message must say *the GPU is full*, never anything implying the tool is broken — otherwise every operator's first move during a busy period is to debug a tool that is working perfectly.
 
@@ -404,7 +404,7 @@ Each line states the reason, so none of these is silently re-added by someone wh
 | `GET /metrics` (Prometheus) | `/status` already exposes counters, latencies and cold-start stats as JSON. A registry and an exposition format are real code for no v1 requirement. | Someone actually stands up Prometheus and needs alerting. |
 | `?format=openapi` and per-tool operations injected into `/openapi.json` | Serves client codegen and API-gateway import — neither is a stated requirement. The descriptor and `?format=tools` already cover humans, our SDK and every agent framework. | A consumer needs generated clients or gateway import. |
 | **MCP server** (**D16**) | Now the *natural* next integration after `?format=tools`, since MCP is how an agent framework consumes a tool provider that is not an LLM endpoint. Same compiled JSON Schema, no new schema work. | The core router is stable — planned as the v1.1 addition. |
-| ~~`POST /admin/tools/{tool}/unload`~~ | **No longer deferred.** [ADR-0002](adr/0002-shared-node-soft-unload.md) promotes soft unload into v1 as the default reclamation mechanism on the shared node, so this endpoint ships with M6 alongside the runtime's `POST /unload`. | **Now in v1.** |
+| ~~`POST /admin/tools/{tool}/unload`~~ | **Out of v1 again.** [ADR-0002](adr/0002-shared-node-soft-unload.md) had promoted it alongside soft unload; **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed both.** Note llama-swap's endpoint of the same name is a *different feature* — it **stops** the upstream, where ours would have asked a live container to release weights. A stop-this-tool-now endpoint already exists as `POST /admin/tools/{tool}/stop`. | **Not in v1**; returns with soft unload if [ADR-0004](adr/0004-hard-stop-only-in-v1.md)'s triggers fire. |
 | `POST /admin/tools/{tool}/reset` | Folded into `start`, which clears `FAILED` and the failure counter. | A need arises to clear the state *without* starting. |
 | `POST /admin/stop-all` | `tswap stop-all` loops over `/stop`. A convenience endpoint is not worth a route. | A non-CLI client needs one atomic call. |
 | `POST /admin/reload` | Config diffing is genuinely complex (which changes are hot, which are dirty). Boot-time reconciliation already adopts running containers, so restarting the router is cheap and non-disruptive. | Restart proves disruptive in practice. |
@@ -457,10 +457,9 @@ Two keywords, not four. `x-modality` was a coarser duplicate of `x-semantic` jus
 The **simple `inputs:` list in `tool.yaml` remains the authoring surface** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §2), compiled into JSON Schema. **R4** must not be sacrificed to a standard:
 
 ```yaml
-inputs:
-  - name: paths
+inputs:                       # fields of ONE item (ADR-0005)
+  - name: path
     type: string
-    batchable: true
     required: true
     description: Path to a DICOM chest X-ray image to embed.
     semantic: dicom_path
@@ -472,10 +471,9 @@ compiles to:
 {
   "type": "object",
   "properties": {
-    "paths": {
+    "path": {
       "type": "string",
       "description": "Path to a DICOM chest X-ray image to embed.",
-      "x-batchable": true,
       "x-semantic": "dicom_path"
     }
   },

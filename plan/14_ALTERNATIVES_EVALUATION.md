@@ -63,12 +63,13 @@ On a **single research GPU box**, that stack is heavier than everything it is se
 
 - **Scale-to-zero is per-pod, and cold start includes pod scheduling and image pull.** For a 20 GB image on a research box this can be far worse than starting a local container. Our cold-start mitigations (a warm local image cache, a shared weights mount, `tswap warm`) are things you would have to reproduce anyway with node-local caching and pre-pull DaemonSets.
 - **Knative's concurrency-based autoscaling is not a GPU-slot scheduler.** Our central primitive — "at most N models resident in this group, evict LRU to make room" ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md)) — has no direct KServe equivalent. Kubernetes GPU scheduling is *allocation* (a pod requests `nvidia.com/gpu: 1` and waits for a free device), not *eviction to make room for a more urgent model*. With `max_resident: 1` on a single GPU, a second model's pod simply stays `Pending` forever; nothing evicts the incumbent. You would need a custom controller or priority/preemption classes plus a graceful-shutdown path — which is, again, writing the interesting part ourselves.
+  **Note the exact scope of the "no equivalent" claim:** it is true of KServe and it is *not* true of the ecosystem generally. Ray Serve's `@serve.multiplexed` **is** this primitive — bounded LRU model residency — which §3.3 originally under-credited ([`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §1). What no tool offers is that primitive *across a container boundary*, and the container boundary is what this zoo requires (**D2**).
 
 **The honest counterpoint, now settled.** This section originally noted: *"if `Pending`-until-free is acceptable behaviour (requests queue rather than swap), a lot of that complexity evaporates. Whether 'swap' or 'wait' is the required semantic is worth confirming — it is the crux of whether Kubernetes fits."*
 
 **It was confirmed, and the answer is "swap":** *"We don't want to wait for TTL as it could take quite some time, if another process is not being used right now we want to stop it and warm up any process that has a request"* (**D25**). The crux resolved against Kubernetes.
 
-**A second mismatch appeared later and is arguably worse.** On our shared DGX the default reclamation mechanism is soft unload — keep the container, release the weights ([ADR-0002](adr/0002-shared-node-soft-unload.md)). Knative has no representation for that state: a pod is up or it is down. This is a disagreement at the level of primitives rather than configuration, and no amount of tuning reconciles it.
+**A second mismatch was recorded here and has since been withdrawn.** This section argued that Knative cannot represent soft unload — keep the container, release the weights — and that the disagreement was at the level of primitives. **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed soft unload from v1**, so the argument no longer applies and must not be cited. **The rejection stands entirely on preemption** (§2.2 above, **D25**): Kubernetes allocates devices and leaves the second pod `Pending`, and never evicts an incumbent to make room.
 
 ---
 
@@ -103,9 +104,19 @@ Risks to test: whether groups/TTL semantics work correctly when the managed proc
 
 `--model-control-mode=explicit` plus the load/unload API *is* our TTL feature, with excellent dynamic batching and a mature protocol. **Rejected as the core for one reason:** Python-backend models share the Triton process and its environment, so per-model dependency isolation (**D2** — the requirement that torch and TensorFlow models stop fighting) requires custom conda-pack stub environments per model. That is a real feature of Triton, but it is a harder authoring story than three files, and it is precisely the complexity we are trying to remove. Triton remains an excellent `external` backend for models that suit it.
 
-### 3.3 Ray Serve
+### 3.3 Ray Serve — ⚠ **this paragraph was too thin; see [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md)**
+
+> **The dismissal below was challenged and the challenge was fair.** Ray Serve is the closest match to our semantics of any candidate — closer than KServe, because it has an analogue of *both* preemption and soft unload — and unlike llama-swap, KServe and do-nothing it was **never spiked**. It has since been evaluated properly in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) and decided, **provisionally**, in [ADR-0003](adr/0003-ray-serve-not-adopted.md). Read those rather than this paragraph.
+>
+> **The claim below about isolation is FALSE and is withdrawn.** [`runtime_env.image_uri`](https://docs.ray.io/en/latest/serve/advanced-guides/multi-app-container.html) runs each Serve *application* in its own container image, so **Ray can satisfy D2**. Anyone repeating "Ray only isolates at the pip layer" is repeating an error of ours.
+>
+> **What the refusal actually rests on now**, and it is narrower: displacement lives *inside* a replica (`@serve.multiplexed`) while isolation lives *around* it (`image_uri`), so Ray cannot cheaply displace a *containerised* tool — which is **D25**, and our whole contended set needs separate images. Plus **D9** has no alive-but-unloaded state, and the container feature is experimental, already once-deprecated, needs Podman on a node we do not administer, and **locks every tool image to the cluster's exact Ray and Python patch version**.
+>
+> **Two further withdrawals.** *"R8's own Ray attempt stalled"* is not evidence about Ray Serve — [`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §8 shows the defect was a caller force-flushing its own batch, and calls the underlying policy *"clean and well-tested"*. And *"Ray is heavy"* is unquantified; treat it as a hypothesis.
 
 Multi-model, `@serve.batch`, per-deployment resources, model multiplexing with LRU eviction — genuinely close to our semantics. Rejected because per-deployment environment isolation via `runtime_env` is fragile for native/CUDA stacks (it is a pip/conda layer, not a container boundary), Ray is heavy, and R8's own Ray attempt stalled ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §8). Worth a second look if the container boundary is ever relaxed.
+
+**The triggers that would overturn it** are now specific rather than vague, and the first one has *already partly fired*: the per-application OCI image boundary exists, so what remains is `image_uri` leaving experimental status and relaxing the Ray/Python lockstep, or Ray gaining cross-application displacement or an alive-but-unloaded replica state ([`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §12). **Spike D is now recommended rather than optional** (§10).
 
 ---
 
@@ -155,8 +166,8 @@ The intellectually honest framing of the project: **tool-swap's value is the aut
 | Spike | Result | Basis |
 |---|---|---|
 | **C** | ❌ Failed | The tools do not all fit on the GPUs simultaneously. |
-| **A** | ❌ Failed | llama-swap is built for LLM/OpenAI-compatible endpoints; our tools are custom models speaking `/predict`. |
-| **B** | ❌ Failed, answered without standing up a cluster | Preemption is required (**D25**) and Kubernetes does not provide it; soft unload (**D9**) has no Knative representation. Minikube separately unsuitable. |
+| **A** | ❌ Failed | ⚠️ **Recorded reason corrected.** Not *"built for LLMs only"* — about a third of llama-swap's schema is LLM-specific and **the swap machinery is not**, and it drives containers perfectly well. The precise reason: **llama-swap dispatches by extracting `model` from a chat-completion body; our tools are addressed by URL path with JSON-Schema-validated bodies, and no configuration of theirs expresses that.** Two independent blockers behind it: no batching contract to give a tool (**D5**), and no schema surface to project into tool definitions (**D13**). |
+| **B** | ❌ Failed, answered without standing up a cluster | Preemption is required (**D25**) and Kubernetes does not provide it. Minikube separately unsuitable. *(The soft-unload half of this reason is withdrawn — see §2.2.)* |
 
 ### Spike A — llama-swap driving containers ❌
 1. Install llama-swap. Configure two models whose commands are `docker run --rm -p ...` of two trivially different images (`example_echo` at two ports).
@@ -262,6 +273,14 @@ Re-evaluate deliberately, rather than drifting, when one of these becomes true:
 - **multi-tenant isolation** becomes a requirement, meaning more than about two parties who must be kept apart;
 - an **infrastructure team already operating Kubernetes** takes on the deployment, which changes the operational cost calculation entirely.
 
+#### ⚠️ Price static federation before reaching for Kubernetes
+
+**The "second GPU host" trigger has a third answer nobody has considered, and it is much cheaper than a cluster.** llama-swap ships `peers`: *"a dictionary of remote peers and models they provide"* — a second host runs its own instance, and the first forwards requests for tools it does not own, over the proxy we have already built.
+
+No cluster, no control plane, no scheduler rewrite. **And no cross-host scheduling either** — which is precisely the expensive feature, and precisely what makes Kubernetes worth its cost when you genuinely need it.
+
+**Recorded so the trigger has options rather than a reflex.** If a second host appears, price federation first; adopt Kubernetes when the answer is *"we need one scheduler across both hosts"*, which is a much narrower claim than *"we have two hosts"*.
+
 Absent one of those, adopting Kubernetes to serve twenty models on one box inverts the complexity budget (section 5). **The models are the durable asset; the router is replaceable.** Protecting that property is the whole of the strategy, and today it costs nothing.
 
 ---
@@ -275,5 +294,7 @@ Absent one of those, adopting Kubernetes to serve twenty models on one box inver
 **Less risky: partly yes** — on longevity and bus factor, KServe clearly wins, and that matters more than it feels like it does today. It is the right destination if this becomes multi-host or multi-tenant.
 
 *Are we reinventing the wheel?* **For the router, quite possibly — and that is worth two days to find out.** For the **batching runtime, we were about to** — and **D14** stopped it: BentoML's dispatcher is the wheel, and we now turn it instead of carving one ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1). What remains genuinely ours is the **authoring ladder** and the **uniform contract**: nothing off the shelf takes a scientist's `requirements.txt` and a heterogeneous zoo and produces an agent-callable tool. Run Spike C, then Spike A, then decide with evidence rather than with either of our instincts.
+
+**The most precise answer available, added after the Ray Serve challenge:** we reimplement roughly a third of Ray Serve *knowingly*, and the reason is the isolation boundary — Ray's eviction works because its models share a process, and ours cannot ([`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §13). Say that out loud rather than claiming novelty. **And do not dismiss the next candidate in a paragraph**: §3.3's thinness, not its conclusion, is what made the challenge land.
 
 The pattern worth naming, since it now applies twice: **reuse the engine, own the contract.** BentoML serves inside the container, Docker runs the containers, llama-swap may yet route them — and in each case what we keep is the thin layer that makes the zoo uniform, discoverable and safe. Every time we caught ourselves about to write infrastructure, the better answer was a seam plus somebody else's implementation.

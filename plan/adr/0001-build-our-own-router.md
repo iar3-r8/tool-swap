@@ -40,11 +40,20 @@ This was the cheapest possible result and it is gone. The swapping premise holds
 
 Reported outcome: **llama-swap is built for LLMs and OpenAI-compatible endpoints only; we need custom models.**
 
-This confirms the exact risk §3.1 identified in advance:
+> ⚠️ **The verdict stands; this stated reason is too broad, and the imprecision is load-bearing.** Verified against [`third-party-docs/llama-swap/`](../third-party-docs/llama-swap/INDEX.md) (v249, captured 2026-08-13):
+>
+> - **It is not LLM-only.** `/upstream/:model_id`, `/running`, `/health`, `/metrics`, `/ui`, `/logs/stream/{model_id}`, `checkEndpoint`, `env`, `metadata`, `concurrencyLimit`, `groups`, `ttl` and `hooks` are all protocol-agnostic. Roughly a third of the schema is LLM-specific; **the swap machinery is not.**
+> - **It does manage containers.** `cmd` + `cmdStop` with `docker run` is a headline feature, and upstream *recommends* it for Python inference servers to get *"clean environment isolation"* — **the same reason as D2**.
+>
+> **Stated broadly, the rejection invites a reasonable-sounding rebuttal** — *"but they support any server, and `/upstream/` proxies anything"* — which is why the precise form matters.
+
+**The precise reason, and it is sufficient on its own:** llama-swap dispatches by **extracting `model` from a chat-completion request body**; our tools are addressed by **URL path** with JSON-Schema-validated bodies (**D4**, **D13**), and **no configuration of theirs expresses that**. Two further blockers, each independent: it has **no batching contract to give a tool** (**D5**), and **no schema surface to project into tool definitions** (**D13**) — a `cmd:` string cannot be introspected by an LLM.
+
+This still confirms the risk §3.1 identified in advance:
 
 > *"its request path is shaped around OpenAI endpoints, whereas our tools speak `/predict` with an arbitrary JSON body. If its proxy is protocol-agnostic — routing on the model name and forwarding the body untouched — it works for us. If it parses `body.model` or assumes chat semantics, it does not. Establish this early in the spike; it is the single fact the decision turns on."*
 
-It parses OpenAI-shaped requests. The fact the decision turned on came back negative.
+It parses `body.model`. The fact the decision turned on came back negative — **for the dispatch path specifically**, which is the part we needed.
 
 **This does not affect llama-swap's other role.** It continues to serve our LLMs in a separate deployment, which is why tool-swap has no OpenAI-compatible API ([`04_API_CONTRACT.md`](../04_API_CONTRACT.md) §0). §3.1 anticipated this distinction: *"A 'no' here does not affect its LLM role."* The two roles were always independent, and only the router role is refused.
 
@@ -64,7 +73,7 @@ That is **preemption** — displacing an idle-but-not-yet-expired incumbent on d
 
 So the KServe path is: stand up k3s + Knative + a networking layer + a registry, **and then still write the preemption logic**, because the single semantic we most need is the one the platform lacks. That is a cluster to operate *in addition to* the interesting code, rather than instead of it.
 
-A second consideration reinforces it. ADR-0002 promotes **soft unload** — keep the container, release the weights — to the default reclamation mechanism. Knative has no representation for that state at all: a pod is up or it is down. The deployment target's shape and the platform's model disagree at the level of primitives, not configuration.
+> **A second consideration was recorded here and has since been withdrawn.** It argued that Knative cannot represent soft unload. **[ADR-0004](0004-hard-stop-only-in-v1.md) removed soft unload from v1**, so that reinforcement no longer applies and must not be cited. **The preemption argument above is unaffected and is sufficient on its own.**
 
 ### Minikube — separately unsuitable
 

@@ -74,10 +74,9 @@ backend:
 # ---------------------------------------------------------------------------
 defaults:
   # --- lifecycle / TTL ---
-  ttl: 900                          # HARD idle seconds -> stop container. 0 = never stop
-  soft_ttl: 300                     # SOFT idle seconds -> release weights, keep container.
-                                    # The default reclamation path on a shared node.
-                                    # 0 = disabled (forced for hard-stop-only tools)
+  ttl: 900                          # idle seconds -> stop container. THE ONLY IDLE TIMER (ADR-0004)
+                                    # sentinels: -1 inherit defaults.ttl | 0 never stop | >0 seconds
+                                    # NOTE: soft_ttl is RESERVED AND REJECTED, not supported (ADR-0004)
   keep_warm: false                  # start at boot and never TTL-stop
   autostart: true                   # start on first request; if false, must be started manually
 
@@ -209,7 +208,6 @@ runtime:
 inputs:
   - name: paths
     type: string         # JSON Schema type: string|number|integer|boolean|array|object
-    batchable: true      # a list may be supplied where a scalar is expected -> x-batchable
     required: true
     description: Path to a DICOM chest X-ray image to embed.   # MANDATORY: an LLM reads this
     semantic: dicom_path # free-form domain hint -> x-semantic; never interpreted by the router
@@ -255,7 +253,6 @@ resources:
 
 lifecycle:
   ttl: 600
-  soft_ttl: 0
   ready_timeout: 600
 
 # Smoke test used by `tswap test <model>` AND by `tswap preflight` stage 6.
@@ -318,9 +315,11 @@ There is no `kind` key. Every tool is built from a handler on our runtime, so th
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `ttl` | int s | `900` | Hard idle → stop, freeing the container and host RAM. `0` = never. The backstop, not the usual path. |
-| `soft_ttl` | int s | `300` | Soft idle → release weights, keep the container. **The default way VRAM returns to the shared node** ([ADR-0002](adr/0002-shared-node-soft-unload.md)). Must be `< ttl` if both set — validate this. Forced to `0` for tools whose `unload()` cannot release. |
-| `keep_warm` | bool | `false` | Start at boot, exempt from TTL. Still evictable unless `eviction: none` on its group. |
+| `ttl` | int s | `900` | Idle → stop, freeing VRAM, the container, host RAM and the group slot. **The only idle timer** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). Sentinels: **`-1` inherit**, **`0` never**, **`>0` seconds**. |
+| ~~`soft_ttl`~~ | — | — | **Reserved and rejected** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). Accepted by the schema, rejected at load with a message pointing at that ADR — so re-promotion stays additive and nobody sets a key that does nothing. |
+| `evict_cost` | int | `1` | Relative cost of evicting this tool; higher means prefer to keep it resident. Breaks ties in an otherwise-LRU policy ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.1). Set it above 1 for tools with long cold starts. |
+| `max_concurrent` | int | unset | Optional cap on in-flight requests to a `READY` tool; **429** beyond it. Unset means uncapped, and the runtime's own back-pressure applies ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §10). |
+| `keep_warm` | bool | `false` | Start at boot, exempt from TTL. Still evictable unless `eviction: none` on its group. **Implemented as a synthetic request through the ordinary request path**, never a separate warm-up code path. |
 | `autostart` | bool | `true` | If `false`, a request to a stopped model returns 503 instead of starting it. |
 | `restart_backoff` | list[int] | `[1,5,15,60]` | Backoff after `FAILED` before an automatic retry. |
 | `max_consecutive_failures` | int | `3` | After this, stop auto-retrying until manually reset. |
@@ -340,21 +339,25 @@ There is no `kind` key. Every tool is built from a handler on our runtime, so th
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `batching.enabled` | bool | `true` | `false` → the handler is still called with lists of length 1, so authors write one code path. |
-| `max_batch_size` | int | `8` | Upper bound on a batch. **Also the mitigation for the absent `max_batch_bytes`** ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.2): for large payloads such as CT volumes, set this low per model. |
-| `max_wait_ms` | int | `20` | Maps to BentoML's `max_latency_ms`: a **latency target the adaptive dispatcher aims to keep**, not a fixed wait. R8 defaulted to a nonsensical `60000` ms (a full minute of added latency); use a small, sane default. |
-| `workers` | int | `1` | In-container worker processes. `>1` needs an explicit worker→device mapping and multiplies VRAM; see [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §5. |
+| `batching.enabled` | bool | `true` | `false` means **`max_batch_size: 1`, and nothing else** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). It is a performance setting, **not** a switch between calling conventions — the handler takes a list either way. |
+| `max_batch_size` | int | `8` | Upper bound on a batch. **Also the mitigation for the absent `max_batch_bytes`** ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.2): for large payloads such as CT volumes, set this low per tool. |
+| `max_wait_ms` | int | `20` | Maps to BentoML's `max_latency_ms`: a **latency target the adaptive dispatcher aims to keep**, not a fixed wait. ⚠️ **`60000` is BentoML's own default**, inherited by any tool that does not override it — not, as this document previously said, a value R8 invented. **The adapter must always pass this and `max_batch_size` explicitly.** |
+| `workers` | int | `1` | In-container worker processes. `>1` needs an explicit worker→device mapping and multiplies VRAM; see [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §5. **`tswap validate` warns when `workers > 1` with `devices:` set** — VRAM multiplies invisibly to the scheduler. |
 | `runtime.server` | enum | `bentoml` | **D14.** The in-container serving backend. `native` is a reserved value: accepted by the schema, rejected at load with *"not implemented in this version"*. Reserved now so adding it later is not a config migration. |
 
 There is no `max_batch_bytes` key. BentoML's dispatcher batches by count, and inventing a key we cannot honour would be worse than not having it ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.2).
+
+**There is also no per-input `batchable:` flag** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). Batching is a property of the tool, and every input is a field of the batched item.
 
 ### 5.5.1 Static parameters
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `params` | list | `[]` | **D15.** Load-time values passed to the handler's `__init__`. Each needs `name`, `type`, `description`; `default` optional. Overridable per config entry — **changing one restarts the tool**, since it is part of the tool's identity. |
+| `params` | list | `[]` | **D15**, as re-scoped by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md). Load-time values passed to the handler's `__init__`. Each needs `name`, `type`, `description`; `default` optional. Overridable per config entry — **changing one restarts the tool**, since it is part of the tool's identity. |
 
-Static params are the answer to "my model has a `threshold`". They are not caller-visible and do not appear in `?format=tools`. Two thresholds in production = two `tools:` entries over one image.
+**`params:` is for values that change what the batched forward pass computes** — input resolution, dtype, a different model head, a weights path. They are not caller-visible and do not appear in `?format=tools`.
+
+⚠️ **`threshold` is no longer the example here.** A confidence threshold shapes one item's own result, so it belongs in `inputs:` and travels per item ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). The question to ask is: *does this value change what the batched forward pass computes?* If yes → `params:`, and two values in production means two `tools:` entries over one image. If no → `inputs:`.
 
 ### 5.6 Environment and mounts
 
@@ -376,8 +379,9 @@ Merge semantics for maps vs lists are a classic source of confusion — state th
 1d. No `name` collision between an entry in `inputs:` and one in `params:`.
 2. `name` matches `^[a-z0-9][a-z0-9_-]*$`; no duplicate names.
 3. Every `group` referenced exists; every `groups.*.max_resident >= 1`.
-4. `soft_ttl < ttl` when both are non-zero.
-4b. A tool declaring `devices` must define `unload()` in its handler — hard error, since soft unload is how VRAM returns to the shared node ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §10.1 stage 8).
+4. `soft_ttl` is **rejected** with a message pointing at [ADR-0004](adr/0004-hard-stop-only-in-v1.md) — not silently ignored.
+4b. *(Removed.)* A tool declaring `devices` no longer has to define `unload()`. Nothing calls it on the reclamation path, so a handler that fails to release has no victim ([ADR-0004](adr/0004-hard-stop-only-in-v1.md) §4).
+4c. **Warn when `workers > 1` and `devices:` is set** — VRAM multiplies by the worker count, invisibly to the scheduler ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §5).
 5. Exactly one image source: `image` XOR `build` XOR (managed → we build it).
 6. For managed: handler file exists; `requirements` file exists if named; `description` non-empty; `inputs`/`outputs` well-formed if present.
 6b. **A missing `description` on the tool or on any input → hard error; a missing description on an output → warning** (**D19**). `--allow-missing-descriptions` downgrades the errors for local prototyping and is never permitted in CI.
