@@ -33,8 +33,9 @@ jobs:
         run: make lint
 
       - name: Run import-linter
-        # lint-imports is installed in .venv; use the venv python to invoke it.
-        run: .venv/bin/lint-imports
+        # Use python -c to invoke lint_imports_command directly since
+        # the entry point script may not be on PATH in GitHub Actions.
+        run: python -c "from importlinter.cli import lint_imports_command; lint_imports_command()"
 
       - name: Run tests
         run: make test
