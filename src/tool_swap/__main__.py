@@ -2,16 +2,10 @@
 
 import typer
 
-# Disable rich formatting / pretty exceptions to prevent ANSI escape
-# sequences in help output (test_cli.py:TestHelpFlag.test_help_no_color_codes).
-# Typer uses rich for rendering; disabling pretty_exceptions also removes
-# colored formatting from help text rendering.
 app = typer.Typer(
     name="tswap",
     help="tswap — router CLI for managing AI agent tool contexts.\n\n"
     "Commands: version   Print the tool-swap version.",
-    pretty_exceptions_enable=False,
-    pretty_exceptions_short=False,
 )
 
 

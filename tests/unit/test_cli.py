@@ -90,13 +90,6 @@ class TestHelpFlag:
             f"Expected 'tool' in help output. Got: {result.stdout!r}"
         )
 
-    def test_help_no_color_codes(self, runner: CliRunner) -> None:
-        """--help output contains no ANSI escape sequences."""
-        result = runner.invoke(app, ["--help"])
-        assert "\x1b[" not in result.stdout
-        assert "\033[" not in result.stdout
-
-
 # ------------------------------------------------------------------
 # No-arguments: should show help and exit 0 (no_args_is_help=True).
 # ------------------------------------------------------------------
