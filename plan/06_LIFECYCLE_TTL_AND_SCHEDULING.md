@@ -1,7 +1,9 @@
 # 06 — Lifecycle, TTL and Scheduling
 
-> Decision **D9**, as amended by [ADR-0002](adr/0002-shared-node-soft-unload.md): both soft and hard idle ship in **v1**. Build hard TTL first in TDD order, then soft — but both are v1 scope, and **soft unload is the default reclamation mechanism**.
-> Decision **D7**, as amended by [ADR-0002](adr/0002-shared-node-soft-unload.md) §6: pinned devices and groups remain the scheduling primitive. Free VRAM may be **measured** before a reload; a model's consumption is still never **predicted**.
+> **⚠ This document has not yet been rewritten for [ADR-0004](adr/0004-hard-stop-only-in-v1.md), and §3, §5.1, §5.1.1, §5.2, §7 and §8.1b–8.1c currently describe a design we are not building. The ADR is authoritative; where they disagree, follow the ADR.** A rewrite is pending.
+>
+> **Decision D9, as amended by [ADR-0004](adr/0004-hard-stop-only-in-v1.md): v1 has one idle timer and reclaims by stopping the container.** There is no soft unload, no `IDLE_SOFT` and no `POST /unload`. [ADR-0002](adr/0002-shared-node-soft-unload.md) had promoted soft unload into v1; the requester clarified that a timer suffices — *"we just don't want to block all the resources indefinitely"*.
+> **Decision D7**, as amended by [ADR-0002](adr/0002-shared-node-soft-unload.md) §6 (**retained**): pinned devices and groups remain the scheduling primitive. Free VRAM may be **measured** before a start; a model's consumption is still never **predicted**.
 >
 > This is the heart of the product. Everything else is plumbing around it.
 
@@ -9,12 +11,12 @@
 
 ## 0. The deployment that shapes this document
 
-**tool-swap runs on a shared DGX node.** Other tenants, whom we do not control and cannot see, use the same GPUs. Two consequences run through everything below, and neither was assumed by the first draft of this plan:
+**tool-swap runs on a shared DGX node.** Other tenants, whom we do not control and cannot see, use the same GPUs. Two consequences run through everything below:
 
-1. **The contended resource is node VRAM, not a slot in our own table.** A container that is alive but holding no weights costs a few hundred megabytes of host RAM and *zero VRAM*. This is why soft unload is the default rather than a phase-2 optimisation ([ADR-0002](adr/0002-shared-node-soft-unload.md)).
-2. **Memory we release may be taken by someone else.** A reload can therefore fail through nobody's fault, and that case must be distinguishable from a broken tool (§3.3).
+1. **We must not hold resources indefinitely**, which is what the idle timer is for. Note the requirement is *bounded* holding, **not** prompt release — [ADR-0002](adr/0002-shared-node-soft-unload.md) inferred the latter and built a state machine on it, and [ADR-0004](adr/0004-hard-stop-only-in-v1.md) reversed that.
+2. **Memory we release may be taken by someone else.** A cold start can therefore fail through nobody's fault, and that case must be distinguishable from a broken tool (**D28**).
 
-**Preemption is a requirement.** A request for tool B must be able to displace an idle incumbent A *immediately*, rather than waiting out A's remaining TTL. This is the requirement that ruled out Kubernetes at the M−1 gate ([ADR-0001](adr/0001-build-our-own-router.md)), because Kubernetes allocates devices and leaves the second pod `Pending` rather than evicting an incumbent.
+**Preemption is a requirement.** A request for tool B must be able to displace an idle incumbent A *immediately*, rather than waiting out A's remaining TTL. This is the requirement that ruled out Kubernetes at the M−1 gate ([ADR-0001](adr/0001-build-our-own-router.md)), because Kubernetes allocates devices and leaves the second pod `Pending` rather than evicting an incumbent. **The mechanism is a container stop**, so the displaced tool pays a cold start on its next request — which makes `min_residency` and thrash detection (§5.3) more important, not less.
 
 ---
 

@@ -28,24 +28,38 @@ It is directly inspired by [`llama-swap`](https://github.com/mostlygeek/llama-sw
 
 Recorded in **[ADR-0001](adr/0001-build-our-own-router.md)**. **Do not re-run them** — but do read the ADR before proposing that we should have.
 
-**Two requirements came out of that gate and shape the design**, both in **[ADR-0002](adr/0002-shared-node-soft-unload.md)**:
+**Two requirements came out of that gate and shape the design:**
 
-1. **Preemption** — a request displaces an idle incumbent immediately rather than waiting out its TTL (**D25**).
-2. **A shared DGX** — other tenants use the same GPUs. So **soft unload is the default reclamation mechanism** (**D9**, reversed from its original phase-2 position), and a reload that fails because a neighbour took the memory is **not** a tool failure (**D28**).
+1. **Preemption** — a request displaces an idle incumbent immediately rather than waiting out its TTL (**D25**). The mechanism is a container stop.
+2. **A shared DGX** — other tenants use the same GPUs, so a cold start can fail because a neighbour holds the memory. That is **not** a tool failure (**D28**).
 
-The sentiment behind the gate still applies to everything else here: we would rather you delete a chunk of this plan on evidence than implement it faithfully because it was written down.
+**Reclamation is by stopping the container, on a single idle timer.** [ADR-0002](adr/0002-shared-node-soft-unload.md) had promoted soft unload into v1, reading urgency into *"this is a shared DGX"*. **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) reverses that**, after the requester clarified the actual demand:
+
+> *"Unloading on the shared DGX is not 'so' critical… we just don't want to block all the resources indefinitely. If soft unload is not possible let's just not use it and do hard unloads and find out if it becomes a problem later by implementing more complexity in the system."*
+
+**So `IDLE_SOFT`, `POST /unload`, `SOFT_UNLOAD_THEN_GRANT` and preflight stage 8 are all out of v1**, and preflight now needs no GPU at any stage. [ADR-0004](adr/0004-hard-stop-only-in-v1.md) names the four measurements that would bring soft unload back; the design for it is complete, so re-promotion would be implementation rather than rediscovery.
+
+The sentiment behind the gate still applies to everything else here: we would rather you delete a chunk of this plan on evidence than implement it faithfully because it was written down. **[`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) is that exercise applied to ourselves**, decision by decision — read it if you suspect a part of this plan is bigger than its demand.
+
+**A fourth candidate was challenged after the gate closed: Ray Serve.** It had never been spiked and had only a one-paragraph dismissal, so the challenge was fair. Answered in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) (**v3**), decided in **[ADR-0003](adr/0003-ray-serve-not-adopted.md)** (**D29**), and **no milestone changed**.
+
+**Three capability concessions stand, and are not re-argued:** `image_uri` gives each Serve application its own image (**Ray can satisfy D2** — our first answer was wrong on its central point); `@serve.multiplexed` is off-the-shelf bounded LRU residency; and application-level autoscaling policies are a designed home for a scheduler.
+
+**The decision rests on maintainability, which is what was actually asked for.** Adopting Ray means depending at once on `image_uri` (*experimental*, predecessor already deprecated), custom autoscaling policies (*experimental*), the external scaling API (*alpha*), a config mechanism driven at a cadence its docs warn against, and a per-deployment `image_uri` question the documentation **contradicts itself on** — plus **every image locked to the cluster's exact Ray and Python patch version**, and *"if you aren't using KubeRay, when the Ray cluster fails, Ray Serve cannot recover"* against guardrail 8. **Spike D is retired**: its decisive step tested whether `reconfigure()` can release VRAM, and [ADR-0004](adr/0004-hard-stop-only-in-v1.md) means we no longer need that.
 
 ---
 
 ## 3. What is decided, and what is not
 
-**Decided:** twenty-eight decisions, D1–D28, each with its reasoning, in [`13_OPEN_QUESTIONS.md`](13_OPEN_QUESTIONS.md) Part A. The ones that shape everything else:
+**Decided:** twenty-nine decisions, D1–D29, each with its reasoning, in [`13_OPEN_QUESTIONS.md`](13_OPEN_QUESTIONS.md) Part A. The ones that shape everything else:
 
 - **D2** — one container image per tool. This is the non-negotiable core; §21 of the reference document is the evidence for why.
 - **D14** — the in-container runtime is BentoML, behind our own contract. We write no batcher.
 - **D13** — schemas are JSON Schema, projected into standard tool definitions. This is the integration surface for agents.
 - **D17** — `tswap preflight` is how a tool author finds out whether their tool will actually deploy.
-- **D9 / D25 / D28** — the shared-node trio: soft unload by default, preemption on demand, and a neighbour's VRAM usage never marking our tool broken.
+- **D9 / D25 / D28** — the shared-node trio, **as amended by [ADR-0004](adr/0004-hard-stop-only-in-v1.md)**: one idle timer with a container stop, preemption on demand, and a neighbour's VRAM usage never marking our tool broken.
+
+**Read the ADRs before the decision log where they conflict.** Four decisions have been reversed on evidence (**D9** twice), and in each case the ADR is authoritative and the prose around it is being caught up.
 
 **Genuinely open:** three items, in [`13_OPEN_QUESTIONS.md`](13_OPEN_QUESTIONS.md) Part B — Q1, the gating question, is now closed. Each remaining item has a recommended default and a milestone by which it must be settled. None blocks a start.
 
@@ -61,7 +75,7 @@ Do not read these in file order. Read them in this order:
 
 1. **[`README.md`](README.md)** — what we are building, the vocabulary, and the decision table. Includes a note explaining the "R8" references you will see throughout.
 2. **[`00_CONTEXT_AND_MOTIVATION.md`](00_CONTEXT_AND_MOTIVATION.md)** — where this comes from and what went wrong there. This is the *why*, and skipping it makes several later decisions look arbitrary.
-3. **[`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md)** — the honest "are we reinventing the wheel?" evaluation, the spikes, and the growth path to Kubernetes. **Read before committing to build.**
+3. **[`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md)** — the honest "are we reinventing the wheel?" evaluation, the spikes, and the growth path to Kubernetes. **Read before committing to build.** Then **[`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md)**, which answers the same question for Ray Serve — the closest match of any candidate, and the one whose dismissal was originally too thin.
 4. **[`01_ARCHITECTURE.md`](01_ARCHITECTURE.md)** through **[`08_REPO_LAYOUT.md`](08_REPO_LAYOUT.md)** — the design proper, each assuming the previous.
 5. **[`09_IMPLEMENTATION_PLAN.md`](09_IMPLEMENTATION_PLAN.md)** and **[`10_TESTING_STRATEGY.md`](10_TESTING_STRATEGY.md)** — milestones in TDD order, and how to test each.
 6. **[`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md)** — reach for this when a claim seems unsupported, or when a milestone says "port this".
@@ -97,7 +111,7 @@ Things this document cannot tell you, where a conversation will be faster than i
 | Topic | Why you may need to ask |
 |---|---|
 | **The real workload** — how many tools, sizes, request rates, concurrency | Still needed to set `soft_ttl`/`ttl` defaults and size the groups, though Spike C has already established that the tools do not all fit. |
-| **The GPU hosts** — count, VRAM, driver and CUDA versions, **and how much of the shared DGX is ours versus other tenants** | Constrains base images and determines how aggressive the soft sweep should be. The tenancy split is the new question: it decides whether releasing VRAM promptly is a courtesy or a necessity. |
+| **The GPU hosts** — count, VRAM, driver and CUDA versions, **and how much of the shared DGX is ours versus other tenants** | Constrains base images and sets sensible `ttl` defaults. **Note this question already caused one wrong decision**: [ADR-0002](adr/0002-shared-node-soft-unload.md) shipped a v1 feature on an *inferred* answer to it, and [ADR-0004](adr/0004-hard-stop-only-in-v1.md) reversed it. Ask rather than infer. |
 | **Which tools to port first** | The plan suggests the TensorFlow/Keras one, because it is the one that was structurally broken before. Confirm it is still relevant. |
 | **The consuming agent setup** | `?format=tools` is the integration surface (**D13**); its acceptance test needs a real LLM deployment to run against. |
 | **Weights and data locations** | **D18** assumes shared mounts in v1 and object storage later; the actual storage arrangement determines how soon "later" is. |

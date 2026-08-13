@@ -54,23 +54,31 @@ Format: an abbreviated ADR. Copy these into `docs/adr/` in the new repo.
 **Division of labour:** compose owns the **router only**; the **router** owns model containers (created via the Docker API with our labels). Model containers cannot be compose services because they come and go dynamically, which is the entire point.
 **Acknowledged cost:** mounting `/var/run/docker.sock` gives the router root-equivalent access to the host. Documented plainly, with running the router on the host as the alternative.
 
-### D9 — Both TTLs ship in v1; soft unload is the default reclamation mechanism
-> **Amended by [ADR-0002](adr/0002-shared-node-soft-unload.md).** The original decision — *"hard TTL first, soft TTL later"* — is superseded. Its reasoning is preserved below, because it was correct given what was known at the time and the premise is what moved.
+### D9 — One idle timer; reclamation is by stopping the container
 
-**The deployment is a shared DGX.** Other tenants use the same GPUs, so the genuinely contended resource is **node VRAM**, not a slot in our own table. A container that is alive but holds no weights costs a few hundred megabytes of host RAM and *zero VRAM*.
+> **Current basis: [ADR-0004](adr/0004-hard-stop-only-in-v1.md) (2026-08-13).** This decision has been reversed twice. Both reversals turned on a **premise about the deployment**, never on the reasoning — which is worth knowing before reversing it a third time.
 
-**Decision:**
-- **Soft unload is the default.** A tool idle for `soft_ttl` receives `POST /unload`, releasing its weights while the container stays alive. This is how VRAM goes back to the node.
-- **Hard stop is the backstop**, after a longer idle (`ttl > soft_ttl`), reclaiming the container and host RAM — and the **forced fallback** for handlers whose `unload()` cannot genuinely release.
-- **Build order is unchanged:** hard TTL is implemented first in TDD order (M6), because everything depends on stop working and because it always works. Soft unload builds on it.
+**Decision:** a tool idle for `ttl` is **stopped**. The OS reclaims VRAM, host RAM, the container and the group slot in one action, and it works for every tool regardless of what its handler does. **There is no soft unload, no `IDLE_SOFT`, and no `POST /unload` in v1.**
 
-**Superseded reasoning, recorded so the reversal is legible:** *"hard stop frees everything including the group slot, which is the contended resource; soft unload keeps the slot and therefore does not help the case that motivates the project."* That holds when we own the whole box, where slot and VRAM are the same scarce thing. On a shared node they come apart, and releasing VRAM while holding a slot becomes exactly the trade we want. The third original objection — that the scheduler must then distinguish "resident in the group" from "resident in VRAM" — stands, and is now simply paid for ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.1).
+**Chosen because** the requirement was clarified as a liveness requirement, not a latency one:
 
-**Consequence — `unload()` is no longer optional for GPU tools.** It is required in the handler contract for any tool declaring `devices`, and preflight stage 8 verifying it becomes a hard **`FAIL`** rather than advisory (**D26**).
+> *"Unloading on the shared DGX is not 'so' critical… we just don't want to block all the resources indefinitely. If soft unload is not possible let's just not use it and do hard unloads and find out if it becomes a problem later by implementing more complexity in the system."*
 
-**`keep_warm` exempts a tool from TTL, but not from eviction.** The two are separate concerns: TTL is about idleness, eviction is about contention. Conflating them would let a badly-configured group of `keep_warm` members deadlock every other member of that group. True pinning is expressed with `eviction: none` on the group, which says what it means. `tswap validate` **warns** when every member of a group is `keep_warm` and `max_resident` is smaller than the member count, because that configuration guarantees starvation and is almost always a mistake rather than an intention.
+A timer satisfies that. [ADR-0002](adr/0002-shared-node-soft-unload.md) had inferred urgency from *"this is a shared DGX"* and built a state machine on the inference.
 
-**Verifying that VRAM was really freed.** Stopping the container makes the OS reclaim the memory, but drivers and zombie processes occasionally lie about it — and with soft unload the guarantee is weaker still, since no process exits. Preflight stage 8 is therefore a **hard `FAIL`** for GPU tools rather than advisory (**D26**), and operators still run `nvidia-smi` for ad-hoc diagnosis. A report in `tswap status` / `tswap doctor` remains a reasonable later addition. **It must never become a scheduling input** (**D7**, **D27**).
+**`soft_ttl` is reserved in the config schema and rejected with a message pointing at [ADR-0004](adr/0004-hard-stop-only-in-v1.md)** — reserving it keeps re-promotion additive; rejecting it loudly stops anyone setting a key that does nothing.
+
+**Cost accepted:** every displacement costs the victim a full cold start on its next request, rather than a weight load. Consequently **`min_residency` and thrash detection matter more, not less** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.3).
+
+**Superseded reasoning, preserved so both reversals stay legible:**
+- *v1:* *"hard stop frees everything including the group slot, which is the contended resource."* True when we own the whole box.
+- *v2 ([ADR-0002](adr/0002-shared-node-soft-unload.md)):* on a shared node the slot and the VRAM come apart, so releasing VRAM while holding a slot is exactly the trade we want. **Sound, but it answered a demand nobody had made.**
+
+**Re-promote when a measurement says so**, not when it feels right — the four triggers are in [ADR-0004](adr/0004-hard-stop-only-in-v1.md), the strongest being cold starts exceeding ~20% of total request time for a frequently-used tool.
+
+**`keep_warm` exempts a tool from TTL, but not from eviction.** TTL is about idleness, eviction about contention; conflating them lets a group of `keep_warm` members starve every other member. True pinning is `eviction: none` on the group. `tswap validate` **warns** when every member of a group is `keep_warm` and `max_resident` is smaller than the member count.
+
+**Verifying that VRAM was really freed** is no longer a v1 concern: stopping the container makes the OS reclaim, whatever the handler believes. Operators still run `nvidia-smi` for ad-hoc diagnosis, and a report in `tswap status` / `tswap doctor` remains a reasonable later addition. **It must never become a scheduling input** (**D7**, **D27**).
 
 ### D10 — The R8 client is separate and later
 **Chosen because** v1 must not be shaped by one consumer. Its plan is written now, while context is fresh ([`11_R8_CLIENT_PLAN.md`](11_R8_CLIENT_PLAN.md)), and it lives in the **R8 repo** so tool-swap stays ignorant of R8.
@@ -217,16 +225,13 @@ A request for tool B **displaces** an idle incumbent A immediately, subject only
 
 **What makes it affordable:** soft unload (**D9**). Displacement becomes a `POST /unload` rather than a container stop, so the displaced tool keeps its process, its imports and its CUDA context. A mistaken eviction therefore costs a weight load rather than a full cold start, which also defuses much of the thrashing risk in [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.3.
 
-### D26 — `unload()` is mandatory for GPU tools, and preflight stage 8 is a hard `FAIL`
+### D26 — ~~`unload()` mandatory for GPU tools~~ → advisory
 
-**Chosen because** soft unload is now the primary way VRAM returns to a **shared** node (**D9**). A handler whose `unload()` silently fails to release produces the worst outcome available: we believe the memory is free, we tell the scheduler so, and we hold it anyway — degrading the whole DGX, other tenants included, with no error raised anywhere.
+> **Reversed by [ADR-0004](adr/0004-hard-stop-only-in-v1.md) §4.** This decision existed only to protect soft unload, and soft unload is out of v1.
 
-**Rules:**
-- a tool declaring `devices` **must** define `unload()` — a hard validation error;
-- preflight stage 8 measures release with `nvidia-smi` before/after and **fails** if it does not happen;
-- a tool that genuinely cannot release is **not rejected**. It is classified **hard-stop-only**: never soft-unloaded, reclaimed exclusively by hard TTL and eviction.
+**Now:** `unload()` is **optional**, documented as good hygiene and as the hook soft unload will use if it returns. **Preflight stage 8 is removed from v1** — it was the only GPU-requiring stage, so preflight is now runnable end to end on a laptop, satisfying guardrail 12 by construction. The **hard-stop-only tool class disappears**, along with `can_soft_unload` in the scheduler snapshot: every tool is hard-stop-only now, so the distinction carries no information.
 
-**Why not rejection:** **D17**'s severity principle — *a gate that refuses everything imperfect gets bypassed, and a bypassed gate protects nobody*. TensorFlow/Keras tools are the expected members of this class, and they must still be deployable. They lose the fast path and their author is told exactly why.
+**Why the original reasoning no longer applies:** it feared a handler that *believes* it released VRAM while holding it. **Nothing calls `unload()` on the reclamation path any more**, so the lie has no victim — the container stops and the OS reclaims. The TensorFlow/Keras problem dissolves rather than being solved.
 
 ### D27 — Free VRAM may be measured; a model's consumption is still never predicted
 
@@ -238,17 +243,38 @@ A request for tool B **displaces** an idle incumbent A immediately, subject only
 
 **Boundary that must hold:** the measurement happens in the *caller* and enters the policy as a plain value on the snapshot. It never becomes I/O inside `request_slot`, which stays pure (guardrail 2), and it is never a scheduling input in the sense D7 forbids.
 
-### D28 — A reload that fails for lack of VRAM is not a tool failure
+### D28 — A start that fails for lack of VRAM is not a tool failure
 
-**Chosen because** on a shared DGX, memory released while idle can be taken by another tenant before we reload it. Every other failure path in the design leads to `FAILED`, which means *"this tool is broken"* — and a tool marked broken because a neighbour was busy is both wrong and actively misleading during an incident.
+> **Retained in full by [ADR-0004](adr/0004-hard-stop-only-in-v1.md) §5**, with the trigger moved from *reload from `IDLE_SOFT`* to *cold start from `STOPPED`*. The exposure is identical; only the state name changes.
 
-**Rules** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §3.3):
-- the tool returns to **`IDLE_SOFT`**, never `FAILED`;
+**Chosen because** on a shared DGX, memory is taken and released by tenants we do not control. Every other failure path in the design leads to `FAILED`, which means *"this tool is broken"* — and a tool marked broken because a neighbour was busy is both wrong and actively misleading during an incident.
+
+**Rules:**
+- the tool returns to **`STOPPED`**, never `FAILED`;
 - the occurrence is **excluded from `max_consecutive_failures`** — a busy neighbour must never permanently disable our tool;
 - the caller receives **503 `TOOL_UNAVAILABLE` with `reason: vram_unavailable`** and a `Retry-After`, phrased so that nobody starts debugging a tool that is working perfectly;
 - it is **logged under its own reason**, because the rate of these describes the *node* and is the number an operator needs when negotiating for capacity.
 
 **The regression this prevents** is a tool that quietly marks itself broken whenever the DGX is busy and stays broken until a human notices.
+
+### D29 — Ray Serve is not the router; Ray inside a tool image is fine
+
+> **Settled on maintainability grounds, with triggers.** Re-based 2026-08-13 after the requirement was restated as *"prioritise making the tool robust and easy to maintain"* and after [ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed the one open question that could have reversed it.
+
+**Full analysis:** [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) (**v3**). **Decision:** [ADR-0003](adr/0003-ray-serve-not-adopted.md).
+
+**Three capability concessions stand permanently and are not re-argued:** `image_uri` gives each tool its own image (**D2 satisfiable on Ray**); `@serve.multiplexed` is off-the-shelf bounded LRU residency; and application-level autoscaling policies are a designed home for a scheduler. **None of these is the basis of the decision.**
+
+**The basis is what we would have to keep running.** Adopting Ray means depending at once on `image_uri` (*experimental*, and its predecessor already deprecated), custom autoscaling policies (*experimental*), the external scaling API (*alpha*), a config mechanism driven at a cadence its docs warn against, and a per-deployment `image_uri` question **the documentation contradicts itself on**. Plus two facts that are not features: **every image locked to the cluster's exact Ray and Python patch version** — so a Ray bump is a coordinated rebuild of the whole zoo, where **D14**'s BentoML pin is upgraded per image — and *"if you aren't using KubeRay, when the Ray cluster fails, Ray Serve cannot recover"*, against guardrail 8's requirement that restart be cheap and stateless.
+
+**What [ADR-0004](adr/0004-hard-stop-only-in-v1.md) changed:** the hinge was *can `reconfigure()` release VRAM, giving Ray an `IDLE_SOFT` equivalent*. **We no longer build `IDLE_SOFT`**, so **D9** and **D26** leave the scorecard and **Spike D is retired** rather than rescoped.
+
+**Three roles, kept separate:**
+- **Router — refused**, on the grounds above.
+- **In-container runtime (option C of D14) — refused on cost, reversible** behind the `RuntimeBackend` seam. Note `@serve.batch` is a **fixed-window** dispatcher, not adaptive like BentoML's — which mildly favours **D14**.
+- **Inside a tool's own image — permitted, and always was.** **We are not rejecting Ray; we decline to make it the boundary between tools.**
+
+**Revisit when** `image_uri` leaves experimental status **and** the version lockstep is relaxed (both, not either); when we adopt Kubernetes for other reasons, since KubeRay answers the recovery objection; when the zoo becomes homogeneous enough that **D2** stops being load-bearing; or when a second host is added. Full triggers in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §11.
 
 ---
 
@@ -309,9 +335,9 @@ For anyone returning to this document with an older copy, or wondering why a que
 | Was | Now |
 |---|---|
 | Build a router, or reuse one? (the gating question) | **[ADR-0001](adr/0001-build-our-own-router.md)** — build our own; all three spikes failed |
-| Should soft TTL wait for phase 2? | **D9 as amended** — no; on a shared node it is the default reclamation mechanism |
+| Should soft TTL wait for phase 2? | **Yes, after all** — [ADR-0004](adr/0004-hard-stop-only-in-v1.md). [ADR-0002](adr/0002-shared-node-soft-unload.md) promoted it into v1 on an inferred premise; the requester clarified that a timer suffices. **D9** is now one idle timer and a container stop |
 | Does a request wait for an incumbent's TTL, or displace it? | **D25** — displace |
-| What happens when a reload cannot get VRAM? | **D28** — not a tool failure; `vram_unavailable`, back to `IDLE_SOFT` |
+| What happens when a start cannot get VRAM? | **D28** — not a tool failure; `vram_unavailable`, back to `STOPPED` |
 | Build our own in-container runtime, or reuse one? | **D14** — BentoML behind our own contract |
 | What type vocabulary for schemas? | **D13** — JSON Schema plus open `x-semantic` hints |
 | How are large payloads passed? | **D18** — paths in v1, object-storage URIs as the designed growth path |
@@ -325,7 +351,9 @@ For anyone returning to this document with an older copy, or wondering why a que
 | Config in one file or many? | **D24** — both |
 | Model versioning / A-B? | **D23** — by tool name; aliases only at a real trigger |
 | GPU sharing beyond whole devices? | **D7** — whole devices only |
-| How do we detect that VRAM was really freed? | **D9** — manually via `nvidia-smi` in v1 |
+| How do we detect that VRAM was really freed? | **Moot in v1** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)) — the container stops and the OS reclaims. `nvidia-smi` remains an ad-hoc diagnostic |
+| Are we reimplementing Ray Serve? | **D29** / [ADR-0003](adr/0003-ray-serve-not-adopted.md) — partly and knowingly. **Settled on maintainability**, not capability: three experimental-or-alpha APIs, a Ray/Python patch lockstep across every image, and a cluster that cannot recover without KubeRay. Spike D is **retired** |
+| Is the plan itself too complex? | **[`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md)** — audited decision by decision. One elective feature removed (soft unload), two trims recommended, three things named as never-trim |
 
 ---
 
@@ -343,11 +371,14 @@ Recorded so they are not re-invented as if new, and not built prematurely.
 | Idea | Why parked |
 |---|---|
 | Kubernetes / KServe with scale-to-zero | **Evaluated and rejected at the M−1 gate** ([ADR-0001](adr/0001-build-our-own-router.md)), not merely parked. Provides no preemption semantic — Kubernetes allocates devices and leaves the second pod `Pending` — which **D25** requires; and Knative cannot express "keep the pod, release the weights", which **D9** now depends on. Also contradicts **R1** and **D8** for a single-box deployment. Remains the documented growth path with explicit triggers ([`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md) §8.6). Minikube specifically: host-built images are invisible to the cluster, and GPU support is the experimental path. |
+| **Soft unload / `IDLE_SOFT`** | **Removed from v1 by [ADR-0004](adr/0004-hard-stop-only-in-v1.md)**, having been promoted into it by [ADR-0002](adr/0002-shared-node-soft-unload.md). Fully designed and ready to re-promote; the four measurements that would justify it are in that ADR. `soft_ttl` is reserved in the config schema so its return is additive. |
 | Predictive pre-warming (start a model because a workflow is about to need it) | Genuinely valuable with the R8 orchestration layer, which *knows* the graph ahead of time. But it needs a hint API (`POST /admin/hint`) and a consumer that uses it. Phase 3. |
 | Cost/priority-aware scheduling (a "premium" client cannot be evicted) | Needs auth and tenancy first. |
 | Automatic TTL tuning from observed traffic | Attractive, but users must be able to predict behaviour. Report the statistics; let humans decide. |
 | Model warm-up on config reload | Surprising resource usage on an innocuous command. Keep `tswap warm` explicit. |
 | Speculative multi-model residency using free VRAM | Requires the VRAM accounting deliberately deferred by **D7**. |
+| A "model family" tool — several closely-related models multiplexed *inside* one image, presented to the router as one tool | Would give intra-family LRU residency for free, and is the shape Ray Serve's multiplexing suggests ([`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §8). Parked because it collides with **D23** (one tool per container) and with per-tool identity in `/tools`. Recorded so it is not reinvented as if new. |
+| Ray Serve as the router or as the in-container runtime | **Evaluated and refused** ([ADR-0003](adr/0003-ray-serve-not-adopted.md), **D29**), not merely parked. Ray *inside* a tool image is permitted and needs no decision. |
 | A web UI beyond the status page | `/ui` covers the operational need; anything more is a product, not a tool. |
 | Result caching (identical inputs → cached output) | Tempting for deterministic embedders, but correctness questions (input identity, model version) and a healthcare context argue for caution. If added, opt-in per model. |
 
@@ -362,8 +393,8 @@ Guardrails against well-intentioned drift during implementation.
 3. **The runtime's dependency budget is BentoML and its transitive set, and nothing further of our own choosing.** A new *direct* dependency added by us needs written justification (**D14**, [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1). Every package in a tool image competes with that tool's own pins.
 4. **Descriptions stay mandatory.** They are what make the zoo self-documenting and agent-consumable.
 5. **Batch result attribution is safety-critical.** Never relax the length/order checks; in a healthcare context a misattributed result is the worst possible bug.
-5b. **A neighbour's VRAM usage must never mark our tool `FAILED`** (**D28**). We share the node; a reload that cannot get memory returns to `IDLE_SOFT` with its failure counter untouched. Collapsing this back into the ordinary failure path produces tools that disable themselves whenever the DGX is busy, and an operator who spends the outage debugging code that works.
-5c. **A handler that cannot release VRAM is never soft-unloaded** (**D26**). Believing memory was freed when it was not is worse than not trying: it degrades the whole shared node silently. Hard-stop-only is a valid classification, not a defect to be worked around.
+5b. **A neighbour's VRAM usage must never mark our tool `FAILED`** (**D28**). We share the node; a start that cannot get memory returns to `STOPPED` with its failure counter untouched. Collapsing this back into the ordinary failure path produces tools that disable themselves whenever the DGX is busy, and an operator who spends the outage debugging code that works.
+5c. ~~**A handler that cannot release VRAM is never soft-unloaded.**~~ **Retired with soft unload** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)); nothing calls `unload()` on the reclamation path in v1. **Reinstate it verbatim if soft unload is ever re-promoted** — the failure it guards against (believing memory was freed when it was not) is real, and it is why this line is struck through rather than deleted.
 6. **Errors keep honest HTTP status codes.** Never regress to R8's blanket 500.
 7. **Logs are always persisted**, never gated behind a verbosity flag, and always survive the container that produced them.
 8. **No database.** State is in memory plus the container runtime. Restarting the router must stay safe and cheap.

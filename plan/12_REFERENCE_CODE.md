@@ -715,6 +715,8 @@ Note that per-item failure isolation and the batch-length check are **not** on t
 
 ## 8. `RayBatcher` — a cautionary tale
 
+> **Scope of the lesson.** This is a cautionary tale about **a calling pattern**, not about Ray. The defect below is a synchronous caller force-flushing its own batch, and it would be equally fatal in FastAPI, BentoML or anything else. Do **not** cite this section as evidence against Ray Serve — that question is answered on its own merits in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md), and [ADR-0003](adr/0003-ray-serve-not-adopted.md) explicitly withdraws this citation.
+
 *`src/core/service_engine/ray_engine/ray_batcher.py`* (abridged; note the author's own hedging in the docstrings)
 
 ```python
