@@ -6,10 +6,15 @@ Local copies of external documentation that the plan's evaluations depend on, so
 
 | Directory | Upstream | Version captured | Why it is here |
 | --- | --- | --- | --- |
+| [`bentoml/`](bentoml/INDEX.md) | https://docs.bentoml.com/en/latest/ | BentoML 1.4.39 | **The reference material for D14** — the in-container runtime we *adopted* ([`05_RUNTIME_AND_BATCHING.md`](../05_RUNTIME_AND_BATCHING.md) §1). Working input to **M3.5** and **M4** |
 | [`ray-serve/`](ray-serve/INDEX.md) | https://docs.ray.io/en/latest/serve/ | Ray 2.57.0 | Evidence base for [`15_RAY_SERVE_EVALUATION.md`](../15_RAY_SERVE_EVALUATION.md) and [`ADR-0003`](../adr/0003-ray-serve-not-adopted.md) |
 | [`ray-core/`](ray-core/runtime-env-excerpt.md) | https://docs.ray.io/en/latest/ray-core/ | Ray 2.57.0 | The `runtime_env` / `image_uri` reference that **D2** would depend on |
 
-Start with [`ray-serve/INDEX.md`](ray-serve/INDEX.md): it catalogues every page in the Ray Serve section, captured or not, and records which findings post-date the evaluation document.
+**The two captures differ in kind, and it matters when reading them.** The Ray material supports a **rejection**, so it only had to be good enough to justify not proceeding. The BentoML material supports an **adoption**, and M4 builds `backends/bentoml_backend.py` directly on it — so its job is to make specific plan claims *checkable*. Several turned out not to survive checking: see §3 of [`bentoml/INDEX.md`](bentoml/INDEX.md).
+
+Start with whichever INDEX matches your question. Each catalogues every page in its section, captured or not, and records findings that post-date the plan documents citing it.
+
+**Sources other than documentation sites.** Two captures are deliberately not web pages, and say so in their headers: [`bentoml/dependency-constraints.md`](bentoml/dependency-constraints.md) is **packaging metadata** from the PyPI JSON API, and [`bentoml/health-endpoints-and-lifecycle-source.md`](bentoml/health-endpoints-and-lifecycle-source.md) is a **source excerpt** from GitHub `main`. Both exist because the documentation site does not answer the question, which is itself recorded as a finding. Source read from `main` is *ahead of the released version* and must be re-verified against the pinned tag before it is relied on.
 
 ## Conventions
 
