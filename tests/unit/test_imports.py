@@ -25,9 +25,31 @@ ROUTER_PACKAGE = "tool_swap"
 RUNTIME_PACKAGE = "tool_swap_runtime"
 
 
-def _lint_imports_bin() -> Path:
-    """Return the path to the lint-imports binary in the dev venv."""
-    return ROOT / ".venv" / "bin" / "lint-imports"
+def _lint_imports_bin() -> list[str]:
+    """Return the command to run lint-imports.
+
+    Returns a list suitable for subprocess.run().
+    
+    Tries the venv path first (local development), then falls back to
+    finding the executable on PATH (GitHub Actions CI where pip installs
+    to the system Python location). If neither works, uses
+    `python -c` to invoke the CLI directly.
+    """
+    venv_bin = ROOT / ".venv" / "bin" / "lint-imports"
+    if venv_bin.exists():
+        return [str(venv_bin)]
+    # Fallback: find on PATH (GitHub Actions / system install)
+    import shutil
+    path_bin = shutil.which("lint-imports")
+    if path_bin:
+        return [path_bin]
+    # Last resort: use python -c to invoke it directly
+    # This ensures it works in CI even when the script isn't on PATH
+    return [
+        sys.executable,
+        "-c",
+        "from importlinter.cli import lint_imports_command; lint_imports_command()",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +291,7 @@ class TestImportLinterCleanRepo:
         """Helper to run lint-imports via subprocess."""
         env = {**os.environ, "PYTHONPATH": str(SRC_ROOT)}
         result = subprocess.run(
-            [str(_lint_imports_bin()), "--config", config_path],
+            _lint_imports_bin() + ["--config", config_path],
             cwd=cwd or str(ROOT),
             capture_output=True,
             text=True,
@@ -316,7 +338,7 @@ class TestImportLinterViolationFixture:
     ) -> subprocess.CompletedProcess:
         """Run lint-imports against the fixture directory."""
         result = subprocess.run(
-            [str(_lint_imports_bin()), "--config", str(config_path)],
+            _lint_imports_bin() + ["--config", str(config_path)],
             cwd=str(config_path.parent),
             capture_output=True,
             text=True,
@@ -386,7 +408,7 @@ class TestImportLinterViolationFixture:
             )
 
             result = subprocess.run(
-                [str(_lint_imports_bin()), "--config", str(config_path)],
+                _lint_imports_bin() + ["--config", str(config_path)],
                 cwd=tmpdir,
                 capture_output=True,
                 text=True,
@@ -435,7 +457,7 @@ class TestImportLinterViolationFixture:
             )
 
             result = subprocess.run(
-                [str(_lint_imports_bin()), "--config", str(config_path)],
+                _lint_imports_bin() + ["--config", str(config_path)],
                 cwd=tmpdir,
                 capture_output=True,
                 text=True,
