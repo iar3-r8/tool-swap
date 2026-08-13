@@ -143,6 +143,12 @@ graph TB
 
 ### 2.1 Responsibilities, strictly separated
 
+> **Convergent evidence, worth knowing about.** llama-swap is rewriting its own router after four years and 249 releases, and the decomposition it settled on is this one: *"The legacy `ProxyManager` collapses three concerns into one struct: the HTTP mux, the model→process router, and the cross-cutting services… The new layout keeps the `router.Router` implementations focused on model dispatch and lets `internal/server.Server` own the mux and all cross-cutting middleware."*
+>
+> Their standing warning is the one to internalise: **"preserve that abstraction rather than reintroducing the branch in every handler."** That is precisely what happens when scheduling policy leaks into request handlers — the failure [`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §5 names as never-trim item 2. **We have the warning before writing the code; they got it after writing it twice.**
+>
+> A second borrowing from the same source: their `Router` interface has three implementations (static groups, a solver, and a remote peer) behind one abstraction, and a `LocalRouter` sub-interface that a remote peer opts out of. **We have one policy and need no second implementation — but the interface shape is worth copying anyway**, because it is what makes federation ([`14_ALTERNATIVES_EVALUATION.md`](14_ALTERNATIVES_EVALUATION.md) §8.6) addable later without touching a single handler. Same reasoning as `ContainerBackend` and `RuntimeBackend`.
+
 | Component | Owns | Must NOT |
 |---|---|---|
 | **HTTP layer** | Route parsing, request validation, error mapping to status codes, streaming responses. | Contain lifecycle or scheduling logic. |
@@ -182,11 +188,7 @@ stateDiagram-v2
     STOPPED --> STARTING: request arrives / manual start
     STARTING --> LOADING: container is up, /health OK
     LOADING --> READY: /ready OK
-    READY --> IDLE_SOFT: soft TTL expires
-    IDLE_SOFT --> READY: request arrives, weights reloaded
-    IDLE_SOFT --> IDLE_SOFT: reload failed, no free VRAM
-    READY --> STOPPING: hard TTL expires / evicted / manual stop
-    IDLE_SOFT --> STOPPING: hard TTL expires / evicted
+    READY --> STOPPING: TTL expires / evicted / manual stop
     STOPPING --> STOPPED
     STARTING --> FAILED: start error / timeout
     LOADING --> FAILED: readiness timeout / crash
@@ -201,7 +203,6 @@ stateDiagram-v2
 | `STARTING` | Container created/started; not yet answering `/health`. | No — requests queue |
 | `LOADING` | Process is up but weights are still loading (`/health` yes, `/ready` no). | No — requests queue |
 | `READY` | Fully warm. | **Yes** |
-| `IDLE_SOFT` | Container alive, weights released. Group slot still held, **VRAM freed** — which is the point on a shared node. The normal resting state of an idle tool ([ADR-0002](adr/0002-shared-node-soft-unload.md)). | No — a request triggers a fast reload |
 | `STOPPING` | Graceful shutdown in progress. | No |
 | `FAILED` | Start or readiness failed, or the container died. Holds an error message and a failure count. | No — returns 503 with the reason |
 
@@ -311,7 +312,7 @@ These are the details that make or break correctness. Specify them now, test the
 1. **One in-flight transition per model.** `ensure_ready` must be idempotent and coalescing: if ten requests arrive simultaneously for a `STOPPED` model, exactly **one** container start occurs and all ten requests await the same future. Implement with a per-model `asyncio.Lock` + a stored "pending readiness" awaitable.
 2. **Global scheduling lock.** Slot granting and eviction must be serialised across models, or two concurrent starts can both believe the same group slot is free. One global `asyncio.Lock` around the scheduler decision is entirely sufficient at our scale — do not get clever.
 3. **In-flight requests block eviction.** A model with `inflight > 0` is never evicted and never TTL-stopped. Maintain an in-flight counter incremented before proxying and decremented in a `finally`. TTL is measured from `last_used`, which is updated on request *completion*.
-4. **Graceful drain on stop.** On eviction/TTL, stop accepting new proxied requests for that model, wait up to `drain_timeout` for in-flight ones, then `SIGTERM` the container, then `SIGKILL` after `stop_timeout`. R8's process engine used `killpg(SIGTERM)` then `kill()` after a 5 s wait — same idea, now delegated to Docker's own stop semantics.
+4. **Graceful drain on stop.** On eviction/TTL, stop accepting new proxied requests for that tool, wait up to `drain_timeout` for in-flight ones, then `SIGTERM` the container, then `SIGKILL` after `stop_timeout`. R8's process engine used `killpg(SIGTERM)` then `kill()` after a 5 s wait — same idea, now delegated to Docker's own stop semantics. **This survives [ADR-0004](adr/0004-hard-stop-only-in-v1.md) unchanged**, and is more careful than llama-swap's flat 10 s `unloadTimeout`, because rule 3 means we never force-kill mid-inference at all. **Check `drain_timeout` against your slowest single inference** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §2.1).
 5. **Queue bounds.** Waiting for a cold start must be bounded: `queue_timeout` (return 503 with a `Retry-After` if exceeded) and `max_queue_depth` per model (return 429 when exceeded). Never allow unbounded pile-up during a slow load.
 6. **Swap-retry.** If a proxied request fails with a connection error *because the model was concurrently stopped*, retry `ensure_ready` + proxy **once**. Beyond that, fail. This handles the benign race between the watchdog and a late request.
 
@@ -369,6 +370,19 @@ Rules:
 - A running container whose model is no longer in the config → log a warning, stop it (it is an orphan). Make this behaviour configurable (`orphans: stop | adopt | ignore`, default `stop`).
 - There is **no port allocation to reconcile**: tools are reached by container name on the shared network (**D21**, §9), so a restarted router rediscovers a container by its label and name rather than by remembering which port it was given. This is the structural fix for the originating system's `BASE_PORT + i` flaw, where reordering the registry silently reassigned every port — the state that could be wrong no longer exists.
 - Reconciliation must be safe to run repeatedly and must never kill a container that is currently serving.
+
+### 7.1 Shutdown ordering on `tswap down`
+
+**Drain the HTTP server before tearing down containers.** llama-swap's own router-rewrite notes state the failure directly: *"`httpServer.Shutdown` must drain inflight requests before `Server.Shutdown` tears down processes, otherwise inflight requests 502."*
+
+**Ours is harder than theirs, because "drain" has two meanings here** (**D22**): a request may be *in flight against a container*, or *queued behind a cold start* for a container we are about to stop. The order is therefore:
+
+1. **Stop accepting new requests** at the router.
+2. **Fail queued requests fast** with 503 + `Retry-After` and a shutting-down reason. They are waiting for a container that is about to stop; making them wait out `queue_timeout` first is pointless and looks like a hang.
+3. **Drain in-flight requests**, bounded by `drain_timeout`.
+4. **Then** stop containers, in the ordinary drain-then-`SIGTERM`-then-`SIGKILL` sequence (§5.1 rule 4).
+
+Cheap to specify now; a source of flaky integration tests if left to implementation.
 
 ---
 

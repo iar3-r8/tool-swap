@@ -43,9 +43,20 @@ Listed so a future reader can judge whether to fetch it, rather than assuming it
 
 ---
 
-## 3. Findings — where this capture corrects or updates the plan
+## 3. Findings — ✅ **APPLIED 2026-08-13**
 
-**These are recorded here and nowhere else.** By explicit decision, the plan documents that carry the affected statements were **not edited**; a reader who follows a citation to this directory will find the correction, and the plan text stands as written. Anyone reopening the affected decisions should read this section first.
+> **These were originally recorded here and nowhere else**, by explicit decision: the plan documents carrying the affected statements were *not* edited. **That convention was reversed** on the requester's instruction — *"the goal of this exercise is to improve the plan"* — because a correction sitting beside the document it contradicts is documentation drift with extra steps ([`16_COMPLEXITY_AUDIT.md`](../../16_COMPLEXITY_AUDIT.md) §7).
+>
+> **Where each finding landed:**
+>
+> | Finding | Applied to |
+> | --- | --- |
+> | **F1** — "manages processes, not containers" is stale | [`00 §4`](../../00_CONTEXT_AND_MOTIVATION.md) llama-swap row, rewritten; **D2 gains an independent witness** |
+> | **F2** — Spike A's reason is broader than the evidence | [ADR-0001](../../adr/0001-build-our-own-router.md) Spike A and [`14 §6`](../../14_ALTERNATIVES_EVALUATION.md), both restated as *routes by `body.model`*. **The verdict is unchanged.** |
+> | **F3** — features that post-date Spike A | The five gaps are **settled**, not open: see §5 of [`17_LLAMA_SWAP_PHILOSOPHY.md`](../../17_LLAMA_SWAP_PHILOSOPHY.md) |
+> | **F4** — `checkEndpoint` confirms readiness cannot be delegated | Already a confirmation rather than a correction; [`05 §3.2`](../../05_RUNTIME_AND_BATCHING.md) now carries the source note |
+>
+> **The captured prose below is unchanged and still is not edited** — that half of rule 2 stands. Anyone reopening the affected decisions should still read this section first.
 
 ### F1 — "It manages processes, not containers" is stale
 

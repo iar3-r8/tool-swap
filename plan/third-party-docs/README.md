@@ -34,6 +34,7 @@ Each file ends with a **tool-swap notes** section separating what the source say
 
 1. **These are snapshots, not the truth.** Upstream moves. Before a captured fact is used to decide something, check the version in the header, and re-verify anything marked *experimental* or *alpha*.
 2. **Do not edit the captured prose.** Corrections and disagreements belong in the tool-swap notes section, or in the plan document that cites it.
+   > ⚠️ **Amended 2026-08-13.** This rule was originally read as *"findings stay in the capture and the plan is left alone"*, and both INDEXes accumulated corrections marked **"proposed, not applied"** beside the documents they contradicted. **That is documentation drift with extra steps** — precisely the risk [`16_COMPLEXITY_AUDIT.md`](../16_COMPLEXITY_AUDIT.md) §7 names as the plan's largest. On the requester's instruction — *"the goal of this exercise is to improve the plan"* — **approved findings are now applied in `plan/`**, and the INDEX records where each one landed. The rule still holds for its actual subject: **the captured upstream prose is never edited.**
 3. **Record what was skipped.** The catalogue lists uncaptured pages and their contents, so that "not considered" is distinguishable from "considered and set aside".
 4. **Attribute clearly.** These are third-party materials reproduced for internal technical evaluation; they retain their original authorship and licensing.
 

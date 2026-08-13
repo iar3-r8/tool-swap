@@ -69,7 +69,7 @@ On a **single research GPU box**, that stack is heavier than everything it is se
 
 **It was confirmed, and the answer is "swap":** *"We don't want to wait for TTL as it could take quite some time, if another process is not being used right now we want to stop it and warm up any process that has a request"* (**D25**). The crux resolved against Kubernetes.
 
-**A second mismatch appeared later and is arguably worse.** On our shared DGX the default reclamation mechanism is soft unload — keep the container, release the weights ([ADR-0002](adr/0002-shared-node-soft-unload.md)). Knative has no representation for that state: a pod is up or it is down. This is a disagreement at the level of primitives rather than configuration, and no amount of tuning reconciles it.
+**A second mismatch was recorded here and has since been withdrawn.** This section argued that Knative cannot represent soft unload — keep the container, release the weights — and that the disagreement was at the level of primitives. **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed soft unload from v1**, so the argument no longer applies and must not be cited. **The rejection stands entirely on preemption** (§2.2 above, **D25**): Kubernetes allocates devices and leaves the second pod `Pending`, and never evicts an incumbent to make room.
 
 ---
 
@@ -166,8 +166,8 @@ The intellectually honest framing of the project: **tool-swap's value is the aut
 | Spike | Result | Basis |
 |---|---|---|
 | **C** | ❌ Failed | The tools do not all fit on the GPUs simultaneously. |
-| **A** | ❌ Failed | llama-swap is built for LLM/OpenAI-compatible endpoints; our tools are custom models speaking `/predict`. |
-| **B** | ❌ Failed, answered without standing up a cluster | Preemption is required (**D25**) and Kubernetes does not provide it; soft unload (**D9**) has no Knative representation. Minikube separately unsuitable. |
+| **A** | ❌ Failed | ⚠️ **Recorded reason corrected.** Not *"built for LLMs only"* — about a third of llama-swap's schema is LLM-specific and **the swap machinery is not**, and it drives containers perfectly well. The precise reason: **llama-swap dispatches by extracting `model` from a chat-completion body; our tools are addressed by URL path with JSON-Schema-validated bodies, and no configuration of theirs expresses that.** Two independent blockers behind it: no batching contract to give a tool (**D5**), and no schema surface to project into tool definitions (**D13**). |
+| **B** | ❌ Failed, answered without standing up a cluster | Preemption is required (**D25**) and Kubernetes does not provide it. Minikube separately unsuitable. *(The soft-unload half of this reason is withdrawn — see §2.2.)* |
 
 ### Spike A — llama-swap driving containers ❌
 1. Install llama-swap. Configure two models whose commands are `docker run --rm -p ...` of two trivially different images (`example_echo` at two ports).
@@ -272,6 +272,14 @@ Re-evaluate deliberately, rather than drifting, when one of these becomes true:
 - a **second GPU host** is added, making single-box scheduling insufficient;
 - **multi-tenant isolation** becomes a requirement, meaning more than about two parties who must be kept apart;
 - an **infrastructure team already operating Kubernetes** takes on the deployment, which changes the operational cost calculation entirely.
+
+#### ⚠️ Price static federation before reaching for Kubernetes
+
+**The "second GPU host" trigger has a third answer nobody has considered, and it is much cheaper than a cluster.** llama-swap ships `peers`: *"a dictionary of remote peers and models they provide"* — a second host runs its own instance, and the first forwards requests for tools it does not own, over the proxy we have already built.
+
+No cluster, no control plane, no scheduler rewrite. **And no cross-host scheduling either** — which is precisely the expensive feature, and precisely what makes Kubernetes worth its cost when you genuinely need it.
+
+**Recorded so the trigger has options rather than a reflex.** If a second host appears, price federation first; adopt Kubernetes when the answer is *"we need one scheduler across both hosts"*, which is a much narrower claim than *"we have two hosts"*.
 
 Absent one of those, adopting Kubernetes to serve twenty models on one box inverts the complexity budget (section 5). **The models are the durable asset; the router is replaceable.** Protecting that property is the whole of the strategy, and today it costs nothing.
 

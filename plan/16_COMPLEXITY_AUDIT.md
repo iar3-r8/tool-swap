@@ -30,7 +30,8 @@ So each decision is scored on three axes, and only the third is new:
 2. **The router itself is not the problem.** After the descope, the core is a config loader, a container backend, a pure scheduler of a few hundred lines, a proxy and a watchdog. That is proportionate, and the alternatives cost more (§6).
 3. **Two further items are recommended for deferral** (§4): the `?format=tools` projection's *timing*, and the CLI's long tail. Neither is wrong; both are early.
 4. **Three things must not be simplified**, and the audit says so explicitly (§5), because a complexity audit that only ever subtracts is as unbalanced as a plan that only ever adds.
-5. **The plan's real risk is not over-engineering, it is over-documentation.** Sixteen planning documents, four ADRs and ~29 decisions for a service whose v1 is perhaps 4,000 lines. §7 addresses this directly, since it is a maintenance burden like any other.
+5. **The plan's real risk is not over-engineering, it is over-documentation.** Seventeen planning documents, five ADRs and ~29 decisions for a service whose v1 is perhaps 4,000 lines. §7 addresses this directly, since it is a maintenance burden like any other.
+6. **A second round of simplification landed on 2026-08-13**, from the BentoML and llama-swap captures — and notably, **most of it removed things rather than adding them**. See §3.2.
 
 ---
 
@@ -56,7 +57,7 @@ So each decision is scored on three axes, and only the third is new:
 | **D12** | Reuse self-hostable software | ⬛ | *explicit instruction* | none — it is a *principle*, and it saves | ✅ **This audit is D12 applied to ourselves.** |
 | **D13** | JSON Schema → standard tool definitions | ⬜ | **D4**'s consequence; agent-callability | Schema compiler + projections | ✅ compiler; ⏸ *second* projection (§4.2) |
 | **D14** | BentoML as in-container runtime | ⬜ | **D12**; batching is subtle | Pinned dep in every image; the `RuntimeBackend` seam | ✅ **The single biggest complexity *avoided*** — we write no batcher |
-| **D15** | Batched tools declare only batchable inputs | ⬛ | safety: silent misattribution | One validation rule + `params:` | ✅ Cheap, prevents the worst bug class |
+| **D15** | ~~Batched tools declare only batchable inputs~~ **one uniform calling convention** | ⬛ | safety: silent misattribution | ~~One validation rule + `params:`~~ **none — the rule is deleted** | ↩ **[ADR-0005](adr/0005-one-uniform-batched-calling-convention.md).** *Negative cost*: removes `scalar_inputs`, the per-input `batchable:` flag, a validation rule and a second schema shape. **The safety property survives as a shape rather than a check.** |
 | **D17** | `tswap preflight` as author gate | ⚠ | **R2**, inferred — *nobody asked for this command* | 9 stages, a check registry, fixtures per check | ✅ **but trimmed** (§4.1). High value, and the largest elective item remaining |
 | **D18** | Payloads by reference, URI-ready | ⬜ | 500 MB CTs are a fact | A resolver seam (v1: identity function) | ✅ Cost is genuinely near zero |
 | **D19** | Mandatory descriptions | ⬜ | agent-consumability; R8 precedent | Two validation rules | ✅ |
@@ -70,6 +71,27 @@ So each decision is scored on three axes, and only the third is new:
 | **D27** | Measure free VRAM, never predict | ⬜ | shared node | One optional pre-start read | ✅ retained; the boundary is what matters |
 | **D28** | VRAM failure is not a tool failure | ⬛ | shared node; correctness | One state edge + one error reason | ✅ **retained in full** — moved from reload to cold start |
 | **D29** | Ray Serve not adopted | ⬜ | a challenge, twice | none — it is a *refusal* | ✅ see [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) |
+
+### 3.2 The second round: what the captures removed
+
+Applied 2026-08-13, after reading [`third-party-docs/bentoml/`](third-party-docs/bentoml/INDEX.md) and [`third-party-docs/llama-swap/`](third-party-docs/llama-swap/INDEX.md) against the plan. **Scored the same way, and the column sums the right direction.**
+
+| Change | Class | Carrying cost |
+|---|---|---|
+| **[ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)** — one calling convention | ⬜ chosen | **Negative.** Deletes two authoring concepts, a validation rule and a schema variant |
+| **Drop our handler lock** — BentoML's `CapacityLimiter(1)` already serialises | ⬜ | **Negative.** One fewer concurrency primitive to reason about |
+| **`keep_warm` as a synthetic request** | ⬜ | **Negative.** Deletes a second warm-up code path before it is written |
+| **`metrics={"namespace": "tswap"}`** | ⬜ | **Negative.** Three metrics arrive free; one promised metric that does not exist is dropped |
+| **Purging the stale soft-unload spec** from [`06 §3`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) and [`01 §4`](01_ARCHITECTURE.md) | ⬛ forced | **Negative.** ADR-0004 was never fully propagated; a live contradiction is now gone |
+| `evict_cost` (**G2**) | ⬜ | One optional integer and a comparator. **The solver is refused** |
+| Queue-policy seam (**G3**) | ⬜ | An interface, no feature |
+| `max_concurrent` (**G4**) | ⬜ | One optional key; the adapter half is forced, not chosen |
+| Non-root `USER` (**G5**) | ⬛ forced | One Dockerfile line. **Nearly free before M5, awkward after** |
+| `log_output` (**D-P3**) | ⬜ | One enum replacing per-tool toggles |
+
+**Five of the ten reduce the carrying cost outright**, and the four additions are one integer, one interface, one optional key and one Dockerfile line. **This is what a healthy round looks like** — contrast the round that produced soft unload, where every item added a state.
+
+**The pattern worth naming**, since it is now the audit's second general finding after "nobody sums the column": **the cheapest simplifications came from reading the manual of something we had already adopted.** Three of the removals above are features BentoML was always going to provide, which the plan had budgeted to build itself.
 
 ### 3.1 Why D25 survives an audit that killed D9's other half
 
@@ -133,7 +155,7 @@ Twenty-two commands is a lot for v1. Most are thin wrappers over the API and cos
 
 A complexity audit is dangerous if it only subtracts. These are the places where the apparent complexity **is** the product:
 
-1. **Batch result attribution** (guardrail 5). The length and order checks, and `retry_singly`, look like defensive over-engineering until the day one patient receives another's result. **Never trim.**
+1. **Batch result attribution** (guardrail 5). The length and order checks, and `retry_singly`, look like defensive over-engineering until the day one patient receives another's result. **Never trim** — and note that [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) **raises** its importance by putting every tool on one batched path. Anyone citing that ADR as grounds to relax attribution has misread it.
 2. **The pure scheduler** (guardrail 2). Keeping `request_slot` free of I/O is why the entire policy surface — the reason this project exists — is testable in milliseconds. It looks like purity theatre; it is the difference between a scheduler we can change confidently and one we cannot.
 3. **Truthful `/ready`** ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3.2). Reporting server-up instead of weights-loaded is the specific R8 defect that motivated this project. It costs one background task and one status code.
 

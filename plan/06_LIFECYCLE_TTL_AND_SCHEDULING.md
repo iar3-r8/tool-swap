@@ -28,16 +28,28 @@ We have (say) 4 GPUs and 20 models, on a node we share with other tenants. Total
 
 ## 2. Hard TTL
 
-**Rule:** a model in `READY` or `IDLE_SOFT` with `inflight == 0` and `now - last_used >= ttl` is **stopped**.
+**Rule:** a tool in `READY` with `inflight == 0` and `now - last_used >= ttl` is **stopped**.
 
 - `last_used` updates on request **completion** (not arrival), so a long-running request cannot expire mid-flight.
 - `inflight > 0` makes a model immune (§5).
-- `ttl: 0` means never expire. `keep_warm: true` implies exemption from TTL.
+- **Sentinel discipline, stated explicitly** (copied from llama-swap, which names all three in its schema): **`-1` inherits `defaults.ttl`**, **`0` never expires**, **`>0` is a number of idle seconds**. `keep_warm: true` implies exemption from TTL regardless.
 - The watchdog runs on a tick (default 5 s) and processes expiries; it does not need to be precise, and TTL is documented as "at least `ttl` seconds of idleness", never an exact deadline.
 
 Stopping frees everything: VRAM, host RAM, the group slot, the CPU. Cost: the next request pays a full cold start.
 
-**Hard stop is the backstop, not the default path.** On the shared node it has two jobs: reclaiming host RAM and the container after a *longer* idle than `soft_ttl`, and serving as the forced fallback for handlers whose `unload()` cannot genuinely release VRAM (§3.4). Build it first because everything else depends on it and because it always works — the OS reclaims on process exit, whatever the handler believes.
+**Stopping is the only reclamation path in v1** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)), and it always works — the OS reclaims on process exit, whatever the handler believes.
+
+### 2.1 The grace period before a force-kill
+
+A tool being stopped is given time to finish, in three steps ([`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §5.1–5.2, restated here because this is where a reader looks for it):
+
+1. **In-flight requests block eviction entirely.** A tool with `inflight > 0` is never evicted and never TTL-stopped — so the mid-inference force-kill does not arise for us at all.
+2. Wait up to **`drain_timeout`** (default 30 s) for in-flight work to finish, then **SIGTERM**.
+3. **SIGKILL** after **`stop_timeout`** (default 30 s).
+
+**Confirmed compatible with [ADR-0004](adr/0004-hard-stop-only-in-v1.md).** That ADR rewrote the reclamation path around hard stop while these rules predate it; nothing in it changes them, and this sentence exists so nobody has to re-derive that.
+
+> **A default worth checking against your slowest tool.** llama-swap force-kills after a flat **10 s** `unloadTimeout` — reasonable for servers that stream tokens continuously. **Ours must cover one long, atomic call**: a CT segmenter whose single inference takes 90 s will exceed `drain_timeout: 30` and be SIGTERMed mid-request. Rule 1 protects it only while the request is counted as in-flight. **Set `drain_timeout` above the p99 inference time for such tools**, and let `tswap preflight`'s measured inference time inform it.
 
 ### Choosing TTL values
 
@@ -54,48 +66,30 @@ Rule of thumb worth documenting: **TTL ≈ 20–50× the cold start**, then adju
 
 ---
 
-## 3. Soft TTL — the default reclamation mechanism (v1)
+## 3. ~~Soft TTL~~ — **removed from v1**
 
-**Rule:** a model idle for `soft_ttl` (where `soft_ttl < ttl`) receives `POST /unload`; the handler releases weights but the container stays alive.
+> **This section previously specified soft unload as "the default reclamation mechanism (v1)", with an `IDLE_SOFT` state, a `RELOADING` state and a soft sweep. [ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed all of it, and the specification survived here by oversight** — a live contradiction with this document's own header. It is deleted rather than preserved, because [ADR-0002](adr/0002-shared-node-soft-unload.md) already holds the complete design should the triggers ever fire.
 
-```mermaid
-graph LR
-    READY -->|idle >= soft_ttl| IDLE_SOFT
-    IDLE_SOFT -->|request arrives| RELOADING --> READY
-    RELOADING -->|no free VRAM| IDLE_SOFT
-    IDLE_SOFT -->|idle >= ttl| STOPPED
-    READY -->|idle >= ttl, no soft_ttl| STOPPED
-```
+**v1 has one idle timer (§2) and one reclamation mechanism: stop the container.** There is no `soft_ttl`, no `IDLE_SOFT`, no `RELOADING`, no `POST /unload`, and no soft sweep in the watchdog.
 
-| | Frees | Recovery cost | Group slot |
-|---|---|---|---|
-| Soft | **VRAM** (and most host RAM the weights held) | Only `load()` — no container start, no Python import, no CUDA context init | Still held |
-| Hard | Everything | Container start + import + CUDA init + `load()` | Released |
+**What survives from the old §3, and it is important:** the shared node can still take VRAM out from under us. That exposure has simply moved from a failed *reload* to a failed *cold start*, and it is specified in §3.3 below.
 
-Soft unload is worthwhile because on a real system the *fixed* costs are surprisingly large: importing torch, initialising a CUDA context and JIT-warming kernels can easily be 10–20 s before a single weight is read. Soft TTL keeps all of that and pays only for weight loading.
+### 3.1 Why the fast path was given up
 
-### 3.1 Why this is v1 and not phase 2
+The saving was real — importing torch, initialising a CUDA context and JIT-warming kernels is 10–20 s before a single weight is read, and soft unload skipped all of it. It was given up because the requirement turned out to be *"we just don't want to block all the resources indefinitely"*, which a timer satisfies. **[ADR-0004](adr/0004-hard-stop-only-in-v1.md) names the four measurements that would bring it back**; the strongest is cold starts exceeding ~20% of total request time for a frequently-used tool.
 
-**D9** originally deferred soft TTL, and its decisive reason was that an `IDLE_SOFT` model still holds its group slot and therefore *"does not help the contended-GPU case at all"*. That reasoning assumed **we own the whole box**, where the slot and the VRAM are the same scarce thing.
+### 3.2 What this costs preemption
 
-On a shared DGX they come apart (§0). The contended resource is node VRAM; a group slot is a row in a table we invented. Releasing VRAM while holding a slot is therefore *exactly* the trade we want, and the objection dissolves. [ADR-0002](adr/0002-shared-node-soft-unload.md) records the reversal in full.
+Displacement (**D25**) now costs the victim a **full cold start** rather than a weight load. Two consequences, and both make §5.3 more important rather than less:
 
-The third original objection stands and is now simply paid for: the scheduler must distinguish **resident in the group** from **resident in VRAM** (§5.1).
+- **`min_residency` is the primary defence against thrashing, not a secondary one.**
+- **Thrash detection is the instrumentation that tells us whether ADR-0004 was the wrong call.**
 
-### 3.2 Soft displacement is how preemption stays cheap
+### 3.3 Cold start under contention — a failure that is nobody's fault
 
-Since preemption is required (§0), the question is what it costs. Soft unload is the answer: displacing an incumbent becomes a `POST /unload` rather than a container stop, so the *next* start of that model skips the entire fixed cost above.
+**This is the "memory management" the shared node forces on us, and it is a first-class failure mode.**
 
-Two consequences for the design:
-
-- **The scheduler prefers soft-unloading an incumbent over stopping it** (§5.1).
-- **Being wrong about an eviction costs an order of magnitude less.** This materially defuses the thrashing scenario in §5.3 — `min_residency` still exists, but it now guards against a much cheaper mistake.
-
-### 3.3 Reload under contention — a failure that is nobody's fault
-
-**This is the "memory management" the shared node forces on us, and it is a new first-class failure mode.**
-
-While a model sits in `IDLE_SOFT`, another tenant may take the VRAM. The reload then fails with an out-of-memory error that no retry will immediately fix and that no change to our tool would have prevented.
+A neighbour may hold the VRAM when we try to start. The start then fails with an out-of-memory error that no retry will immediately fix and that no change to our tool would have prevented.
 
 The trap to avoid: treating this as a tool failure. Every other failure path leads to `FAILED`, which means *"this tool is broken"* — and a tool marked broken because a neighbour was using the GPU is both wrong and actively misleading during an incident.
 
@@ -103,24 +97,18 @@ Required behaviour:
 
 | Aspect | Rule |
 |---|---|
-| Resulting state | Return to **`IDLE_SOFT`**, never `FAILED`. The tool is intact; it could not get memory. |
+| Resulting state | Return to **`STOPPED`**, never `FAILED`. The tool is intact; it could not get memory. |
 | Failure budget | **Excluded from `max_consecutive_failures`** (§8.5). A neighbour's usage must never permanently disable our tool. |
 | Caller response | **503 with `Retry-After`** and a reason meaning *the GPU is full*, never one implying the tool is broken. Guardrail 6 (honest status codes), applied to a case the first draft did not anticipate. |
 | Logging | **Logged distinctly.** A rising rate of these describes the *node*, not our tools, and it is the number an operator needs when negotiating for capacity. |
 
-**Fail fast where possible.** The router may read live free VRAM immediately before attempting a reload, and return the above rather than starting a load it can predict will OOM. This is *measurement*, explicitly permitted by [ADR-0002](adr/0002-shared-node-soft-unload.md) §6 — as distinct from *predicting* how much a model will consume, which **D7** rejects and which remains rejected. The line: **"is there memory right now" is a fact; "will this model fit" is a guess.** We take the first and still refuse the second, and neither ever becomes an input to `request_slot` (§9).
+**Fail fast where possible.** The router may read live free VRAM immediately before attempting a start, and return the above rather than paying a container start it can predict will OOM. This is *measurement*, explicitly permitted by **D27** — as distinct from *predicting* how much a model will consume, which **D7** rejects and which remains rejected. The line: **"is there memory right now" is a fact; "will this model fit" is a guess.** We take the first and still refuse the second, and neither ever becomes an input to `request_slot` (§9).
 
-### 3.4 Handlers that cannot release
+### 3.4 Handlers that cannot release — no longer our problem
 
-Soft unload depends on handler cooperation, and handlers are user-authored (**D6**). A handler whose `unload()` silently fails to release is the worst case available: we believe the VRAM is free, we tell the scheduler so, and we hold it anyway — degrading the whole shared node, other tenants included, with no error raised anywhere.
+Under soft unload, a handler whose `unload()` silently failed to release was the worst case available: we would believe the VRAM was free, tell the scheduler so, and hold it anyway. **With nothing calling `unload()` on the reclamation path, that failure has no victim** — the container stops and the OS reclaims regardless ([ADR-0004](adr/0004-hard-stop-only-in-v1.md) §4).
 
-This is why `unload()` verification becomes a **hard `FAIL`** in preflight stage 8 for GPU tools ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §10.1), measured with `nvidia-smi` before and after.
-
-**A tool that cannot release is not rejected.** It is classified **hard-stop-only**: the scheduler never soft-unloads it, and it is reclaimed exclusively by hard TTL and eviction. TensorFlow/Keras tools are the expected members of this class — R8's own code carries the confession that clearing a Keras session is *"process-wide, not scoped to this model alone"*. The tool still deploys; it loses the fast path, and its author is told exactly why (**D17**'s severity principle: a gate that refuses everything imperfect gets bypassed, and a bypassed gate protects nobody).
-
-### 3.5 Build order
-
-Hard TTL is still implemented **first** in TDD order (M6), because everything else depends on stop working correctly and because it is the mechanism that always works. Soft unload builds on it; it does not replace it.
+Consequently: `unload()` is **advisory**, preflight stage 8 is **removed**, and the **hard-stop-only tool class disappears** — every tool is hard-stop-only now, so the distinction carries no information. **The TensorFlow/Keras problem dissolves rather than being solved**: those handlers could not reliably release in-process, and nobody asks them to.
 
 ---
 
@@ -147,7 +135,7 @@ Why groups rather than modelling VRAM directly (**D7**):
 
 Semantics:
 - Every model belongs to exactly one group (`default` if unspecified).
-- `max_resident` counts models in `STARTING`, `LOADING`, `READY` and `IDLE_SOFT` — i.e. anything holding or about to hold resources. Not `STOPPED` or `FAILED`.
+- `max_resident` counts tools in `STARTING`, `LOADING` and `READY` — i.e. anything holding or about to hold resources. Not `STOPPED` or `FAILED`.
 - A group may declare `devices`, which members inherit unless they override.
 - Groups are independent: a full `gpu0` never blocks `gpu1`.
 - Multiple groups *may* be configured onto the same physical device. That is the user's choice and their responsibility; we warn at validation but do not forbid it (someone will legitimately want two 3 GB models on a 24 GB card).
@@ -159,50 +147,70 @@ Semantics:
 ### 5.1 The algorithm (pure, synchronous, unit-testable)
 
 ```
-request_slot(model) -> Decision:
-    group = groups[model.group]
-    resident = [m for m in group.members if m.state in HOLDING_STATES]
+request_slot(tool) -> Decision:
+    group = groups[tool.group]
+    resident = [t for t in group.members if t.state in HOLDING_STATES]
 
-    if model in resident:                       return Decision.ALREADY_RESIDENT
-    if len(resident) < group.max_resident:      return Decision.GRANT(device=assign_device(model, group))
+    if tool in resident:                        return Decision.ALREADY_RESIDENT
+    if len(resident) < group.max_resident:      return Decision.GRANT(device=assign_device(tool, group))
 
     # group is full: consider displacing an incumbent
     if group.eviction == "none":                return Decision.WAIT
-    candidates = [m for m in resident
-                  if m.inflight == 0
-                  and not m.keep_warm
-                  and m.state in EVICTABLE_STATES]
+    candidates = [t for t in resident
+                  if t.inflight == 0
+                  and not t.keep_warm
+                  and t.state in EVICTABLE_STATES]
     if not candidates:                          return Decision.WAIT
     victim = rank(candidates, group.eviction)[0]
-
-    # prefer the cheap displacement: release VRAM, keep the container
-    if victim.can_soft_unload and victim.state == READY:
-        return Decision.SOFT_UNLOAD_THEN_GRANT(victim)
     return Decision.EVICT_THEN_GRANT(victim)
 ```
 
-`Decision` is one of `ALREADY_RESIDENT | GRANT(device) | SOFT_UNLOAD_THEN_GRANT(victim) | EVICT_THEN_GRANT(victim) | WAIT`. Being a pure function of a state snapshot means the entire policy surface — the whole reason this project exists — is testable in milliseconds with no Docker, no GPU and no sleeping. Do not let this function acquire I/O.
+**There is exactly one displacement decision** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). `SOFT_UNLOAD_THEN_GRANT` and `can_soft_unload` are gone, and with them the slot-versus-VRAM residency split — one residency question again.
+
+### 5.1.1 Victim selection: LRU, with an optional eviction weight
+
+**LRU alone assumes cold starts are comparable. Ours are not** — a CPU function restarts in under a second, a large segmenter takes ninety — so evicting the expensive tool because it idled marginally longer is a bad trade, and on a zoo with this spread it will happen routinely.
+
+**The remedy is one optional per-tool integer**, breaking ties in an otherwise-LRU comparator:
+
+```yaml
+tools:
+  ct_segmenter:
+    evict_cost: 10        # optional, default 1; higher = prefer to keep resident
+```
+
+`rank()` orders by `(evict_cost, last_used)` rather than `last_used` alone, so a cheap-to-restart tool is displaced first and LRU decides among equals. **It stays pure and stays testable** (guardrail 2).
+
+> **What we deliberately refuse.** llama-swap generalises this into `matrix` — a constraint solver over declared legal combinations, with a DSL (`&`, `|`, `()`, `+ref`) and a `vars` indirection table of 8-character names — *"the solver minimizes eviction cost when swapping"*. **That is the clearest illustration in the whole llama-swap capture of what R4 costs when scheduling expressiveness wins.** One integer captures nearly all the benefit; we take the integer and leave the solver.
+
+### 5.1.2 The queue policy is a seam, even with one implementation
+
+Our queue (**D22**) is FIFO, and **v1 keeps it that way deliberately** — priority is where schedulers acquire starvation bugs, and [`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §5 names scheduler purity as never-trim.
+
+**What we copy from llama-swap is the *shape*, not the feature.** Their `routing.scheduler.use` is an enum whose only current value is `fifo`, with per-model `priority` available underneath it. Declaring the seam now means a second policy is **a new implementation rather than a rewrite** — the same reasoning as `ContainerBackend` and `RuntimeBackend`. **Cost: an interface boundary and no feature.** Do this before M2, when there is no code to retrofit.
+
+`Decision` is one of `ALREADY_RESIDENT | GRANT(device) | EVICT_THEN_GRANT(victim) | WAIT` — **four kinds, not five** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). Being a pure function of a state snapshot means the entire policy surface — the whole reason this project exists — is testable in milliseconds with no Docker, no GPU and no sleeping. Do not let this function acquire I/O.
 
 **Two things this function must never do**, both consequences of the shared node:
 
 - **Read `nvidia-smi`.** Free-VRAM measurement (§3.3) happens in the *caller* and enters the policy as a plain value on the snapshot, if at all. Guardrail 2 holds: the scheduler is pure.
 - **Use `vram_gb` to decide anything.** It stays advisory. Measuring the present is permitted; predicting a model's consumption is not (**D7**, [ADR-0002](adr/0002-shared-node-soft-unload.md) §6).
 
-`can_soft_unload` is false for tools classified hard-stop-only by preflight stage 8 (§3.4) and for tools with no `unload()` — a CPU tool holding no VRAM has nothing to release, so displacing it means stopping it.
+*(The `can_soft_unload` flag and the tool classification behind it are gone — [ADR-0004](adr/0004-hard-stop-only-in-v1.md) §4. Every tool is displaced the same way: the container stops.)*
 
 ### 5.1.1 Residency is now two questions, not one
 
-`max_resident` counts group **slots**; the shared GPU holds **VRAM**. An `IDLE_SOFT` model holds the first and not the second. The snapshot must therefore carry both facts, and the scheduler must not conflate them — this is the complexity **D9** originally deferred and [ADR-0002](adr/0002-shared-node-soft-unload.md) accepts deliberately.
+*(The slot-versus-VRAM residency split is removed — [ADR-0004](adr/0004-hard-stop-only-in-v1.md). With no alive-but-unloaded state, holding a group slot and holding VRAM are the same fact again, which is the complexity **D9** originally deferred this work to avoid.)*
 
 ### 5.2 Eviction ranking
 
 For `eviction: lru`, rank candidates by:
 
-1. `IDLE_SOFT` before `READY` (cheapest to kill — nothing loaded, so no VRAM is even reclaimed by stopping it).
+1. **`evict_cost` ascending** — displace the cheapest-to-restart tool first (§5.1.1).
 2. Then by `last_used` ascending (least recently used).
 3. Tie-break on lower `vram_gb` if declared, else name (deterministic ordering matters for reproducible tests).
 
-Note the interaction with §5.1: an `IDLE_SOFT` victim is *hard-stopped*, because there is nothing left to soft-unload. A `READY` victim is *soft-unloaded* where its handler permits. So the ranking picks the victim and the victim's state picks the mechanism.
+**The ranking picks the victim; there is only one mechanism** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). Ties must break deterministically — by tool name — so the policy is reproducible in tests.
 
 Other policies: `lifo` (evict the most recently started — occasionally useful to protect a long-running warm model from a burst of one-off requests) and `none` (never evict; `WAIT` instead).
 
@@ -271,8 +279,7 @@ The request **blocks** until ready or `queue_timeout`. No 202-and-poll in v1 (it
 
 One periodic task, tick default 5 s:
 
-1. **TTL sweep** — expire `READY`/`IDLE_SOFT` models past their deadline (skipping `inflight > 0` and `keep_warm`).
-2. **Soft sweep** — `READY` → `IDLE_SOFT` past `soft_ttl`, for models whose handler can release (§3.4). This is the tick that does most of the useful work on a shared node, since it is what returns VRAM to the neighbours.
+1. **TTL sweep** — expire `READY` tools past their deadline (skipping `inflight > 0` and `keep_warm`).
 3. **Liveness** — verify containers believed to be running still exist; mark vanished ones `FAILED` (a container can die from an OOM kill or a host restart without anyone noticing otherwise).
 4. **Readiness re-check** — occasionally re-probe `/ready` for `READY` models to catch a model that silently unloaded itself.
 5. **Retry** — retry `FAILED` models whose backoff has elapsed, but only if `keep_warm` (do not spontaneously resurrect on-demand models; wait for a request).
@@ -298,30 +305,20 @@ t=60   request A                                   -> evict B, start A -> serve
 
 Assertions: exactly one model resident at any time; no request lost; `min_residency` respected; `TOOL_UNAVAILABLE` with `reason: evicted` is never returned to a client (the wait absorbed it).
 
-### 8.1b Soft swap — preemption on the cheap path
+### ~~8.1b Soft swap~~ · ~~8.1c Hard-stop-only tool~~ — **both removed**
+
+Both scenarios tested soft unload, which [ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed from v1. They are struck out rather than deleted so that a reader of the ADR's *"Scenarios §8.1b and §8.1c are removed"* line can see what was here — and so they can be restored verbatim if the ADR's triggers ever fire.
+
+### 8.1d Eviction prefers the cheap-to-restart victim
 
 ```
-groups: gpu0 { max_resident: 1 }, A and B both in gpu0, both can_soft_unload
-A is READY and idle; B is IDLE_SOFT (container alive, weights released)
-
-t=0    request B     -> group full, A idle and past min_residency
-                     -> SOFT_UNLOAD_THEN_GRANT(A)
-                     -> A releases VRAM, container stays alive
-                     -> B reloads (load() only, no container start) -> serve
+groups: gpu0 { max_resident: 1 }
+A = cpu_helper     evict_cost: 1   last_used: t-100
+B = ct_segmenter   evict_cost: 10  last_used: t-120   (idle LONGER, but 90s cold start)
+C requests the slot
 ```
 
-Assertions: **A's container is never stopped**; A's state is `IDLE_SOFT`, not `STOPPED`; B's recovery does **not** include container start or CUDA init; A's group slot accounting is unchanged; a subsequent request for A reloads without a cold start.
-
-This is the scenario the shared-node design exists to produce — the one that turns preemption from a 20 s penalty into a weight load. It is also the test that fails loudly if someone "simplifies" `SOFT_UNLOAD_THEN_GRANT` back into `EVICT_THEN_GRANT`.
-
-### 8.1c Hard-stop-only tool is never soft-unloaded
-
-```
-A has can_soft_unload = false (preflight stage 8 classified it hard-stop-only)
-B requests the slot
-```
-
-Assertion: the decision is `EVICT_THEN_GRANT(A)`, never `SOFT_UNLOAD_THEN_GRANT`. A tool whose `unload()` cannot release must never be asked to, because believing it did is worse than not trying (§3.4).
+Assertion: the victim is **A**, not B, even though B is less recently used. Under plain LRU B would be evicted and the zoo would pay a 90-second cold start to save a one-second one (§5.1.1). With `evict_cost` equal, ranking falls back to LRU and is deterministic on ties.
 
 ### 8.2 TTL expiry
 
@@ -360,13 +357,13 @@ Assertion: `FAILED` with the traceback available in logs and `last_error` in `/s
 ### 8.5b Reload under contention — the shared-node case
 
 ```
-A is IDLE_SOFT. Another tenant takes the GPU's free VRAM.
-t=0    request A     -> RELOADING -> load() raises OOM
+A is STOPPED. Another tenant takes the GPU's free VRAM.
+t=0    request A     -> STARTING -> load() raises OOM
 ```
 
 Assertions, each of which is a distinct way this could be got wrong (§3.3):
 
-- A returns to **`IDLE_SOFT`**, *not* `FAILED`;
+- A returns to **`STOPPED`**, *not* `FAILED`;
 - `consecutive_failures` is **unchanged** — a neighbour must never exhaust our failure budget;
 - the caller gets **503** with a reason meaning *the GPU is full* and a `Retry-After`, never a message implying the tool is broken;
 - the event is logged under its own reason, separable from handler failures when someone greps the logs during an incident;
@@ -409,18 +406,35 @@ class ModelRuntimeState:
     queued: int
     keep_warm: bool
     ttl: float
-    soft_ttl: float
+    evict_cost: int                # default 1; higher = prefer to keep resident (§5.1.1)
     vram_gb: float | None          # advisory only; never an input to a decision
-    can_soft_unload: bool          # false for hard-stop-only tools (§3.4)
-    consecutive_failures: int      # reload-contention failures never increment this
+    consecutive_failures: int      # vram_unavailable failures never increment this
 
 
-def request_slot(snapshot: SchedulerSnapshot, model: str, now: float) -> Decision:
+def request_slot(snapshot: SchedulerSnapshot, tool: str, now: float) -> Decision:
     """Pure. No I/O, no clock access, no logging side effects."""
 
 
 def find_expired(snapshot: SchedulerSnapshot, now: float) -> list[Expiry]:
-    """Pure. Returns the models whose hard or soft TTL has elapsed."""
+    """Pure. Returns the tools whose TTL has elapsed."""
 ```
 
+**`soft_ttl` and `can_soft_unload` are gone from the snapshot** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)); `evict_cost` replaces them as the only addition. **One residency question, one idle timer, one eviction mechanism.**
+
 With `ManualClock`, §8's scenarios are all sub-millisecond unit tests. Docker-backed integration tests then verify only that the *effects* happen (a container really starts, really stops, really frees VRAM) — a handful of slow tests behind `@pytest.mark.docker`, not the primary safety net.
+
+---
+
+## 10. Back-pressure on a tool that is `READY` but saturated
+
+**`max_queue_depth` bounds the cold-start queue and never engages here.** A tool that is already `READY` and receiving more than it can serve is not queued for a start, so a third case exists that **D22** does not cover.
+
+Three layers could own it, and the decision is deliberate:
+
+| Layer | Mechanism | Verdict |
+|---|---|---|
+| **The runtime** | BentoML's dispatcher raises `ServiceUnavailable("process is overloaded")` when it cannot meet the latency budget | **It will happen whether we plan for it or not.** The adapter **must** catch it and give it a distinct saturation reason ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §4.5), or the cause is stripped from the body and the caller sees a bare 503 |
+| **The router** | An optional per-tool in-flight cap, returning **429** beyond it — llama-swap's `concurrencyLimit`, default 10 | **Optional, off by default in v1.** The config key exists; unset means uncapped and the runtime's answer applies |
+| Nobody | — | ❌ **Rejected.** A saturated tool and a starting tool would both answer 503, and **D28** is precisely about not misattributing a failure |
+
+**Why the router cap is optional rather than default:** the tool knows its own latency budget and we do not. A fixed router-side number would be a guess that overrides a measurement. The cap exists for tools where queueing at the router is genuinely preferable to queueing at the container — and for the operator who wants a hard bound.

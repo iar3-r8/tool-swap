@@ -3,6 +3,10 @@
 > Decision **D5**: micro-batching is in scope and valuable; take vLLM's continuous-batching behaviour as the model to imitate.
 > Decision **D12**: reuse existing self-hostable software where we can.
 > Decision **D14** (new, this document): **the in-container runtime is built on BentoML.** Batching is the cumbersome part, BentoML already does it well, and R8 has already run it in production. See §1.
+> **[ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)**: **every handler takes and returns a list, always.** `scalar_inputs` and the per-input `batchable:` flag are gone; `batching.enabled: false` now means only `max_batch_size: 1`. §4.3 and §4.4 are rewritten accordingly.
+> **[ADR-0004](adr/0004-hard-stop-only-in-v1.md)**: there is **no `POST /unload` and no soft unload** in v1. §3.1 and §6 are corrected.
+>
+> **Verified against [`third-party-docs/bentoml/`](third-party-docs/bentoml/INDEX.md) (1.4.39, captured 2026-08-13).** Claims in this document that the capture corrected are marked ✅ where confirmed and ⚠️ where they were wrong.
 
 > **This document is load-bearing.** Since every tool is one we build ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §0), there is no third-party server in the zoo with a better batcher to defer to. Batching quality for the entire zoo is decided here.
 >
@@ -26,7 +30,7 @@
 Reasoning, stated plainly:
 
 1. **Batching is the cumbersome part, and it is the part with a mature answer.** Everything else in the runtime (import a handler, load in the background, answer readiness truthfully, expose a schema) is easy code we would write either way. Writing our own batcher buys control over the one component where control is worth least and correctness risk is highest.
-2. **The dependency-conflict fear is speculative; treat it as such.** BentoML's locked pins (pydantic, starlette, click, and their transitive set) are assumed **not** to be a problem until a specific model proves otherwise. We do not pay a permanent architectural cost — writing and maintaining an inference server — to pre-empt a conflict nobody has yet hit. §1.2 defines how we would find out, and §2 defines what we do if we ever do.
+2. **The dependency-conflict fear is speculative; treat it as such.** BentoML's constrained dependencies are assumed **not** to be a problem until a specific model proves otherwise. We do not pay a permanent architectural cost — writing and maintaining an inference server — to pre-empt a conflict nobody has yet hit. §1.2 defines how we would find out, and §2 defines what we do if we ever do.
 3. **The reuse principle (D12) applies here too.** It would be possible to argue that D12 stops at the image boundary, on the grounds that a heavyweight framework in every image partially undoes D2 — but that carve-out exists only to justify writing a batcher. With the batcher reused, the principle is honoured uniformly.
 
 **What this does *not* change:** the author still writes a plain `handler.py` with `load()` / `predict()` / `unload()` and never imports BentoML, and the router still talks to a fixed logical contract. Those are protected by §2, and they are the reason this decision is reversible.
@@ -35,7 +39,24 @@ Reasoning, stated plainly:
 
 The stance is deliberate, so it can be checked rather than argued about later:
 
-> **A locked dependency is acceptable until a concrete model demonstrates an unresolvable conflict.** "BentoML pins pydantic" is not a conflict; "`tool X` requires pydantic <2 and therefore cannot install alongside BentoML" is. Only the second justifies action.
+> **A locked dependency is acceptable until a concrete model demonstrates an unresolvable conflict.** "BentoML constrains pydantic" is not a conflict; "`tool X` requires pydantic <2 and therefore cannot install alongside BentoML" is. Only the second justifies action.
+
+#### ⚠️ Which dependencies actually constrain us — corrected
+
+Four plan documents said *"locked pins (pydantic, starlette, click)"*. **Checked against the packaging metadata for 1.4.39 ([`dependency-constraints.md`](third-party-docs/bentoml/dependency-constraints.md)), that list is wrong in the way that matters:**
+
+| Dependency | Actual constraint | Can it conflict? |
+|---|---|---|
+| `pydantic` | `<3` | Upper bound only — plausible, but wide |
+| `starlette` | `>=0.24.0` | **No.** A lower bound cannot conflict with a newer requirement |
+| `click` | `>=7.0` | **No.** Same |
+| **`cattrs`** | **`>=22.1.0,<23.2.0`** | **Yes — a genuine two-sided pin, and nobody had noticed it** |
+| **OpenTelemetry** (seven packages) | pinned to a **beta** series | **Yes**, and beta series move without ceremony |
+| **`fsspec`** | `>=2025.7.0` | A recent floor; a conflict with an older-pinned stack is realistic |
+
+**The three packages the plan named are the three least informative ones**, two of which cannot conflict at all. The spike must measure `cattrs`, the OpenTelemetry family and `fsspec` (§1.2, [`09_IMPLEMENTATION_PLAN.md`](09_IMPLEMENTATION_PLAN.md) M3.5 step 1).
+
+**Also confirmed:** BentoML's **extras are not installed** by default, so the tree is smaller than a reading of its `pyproject.toml` suggests. Check yank status before pinning and before upgrading; pin `bentoml==X.Y.Z` with **no extras**.
 
 Consequences:
 
@@ -62,6 +83,8 @@ Evidence, not vibes. Three cheap mechanisms:
 **We are choosing BentoML without being locked into it.** The mechanism is a single internal boundary, specified now and implemented once.
 
 > **Scope statement:** v1 ships **exactly one** backend, `bentoml`. The `native` backend is **architecture only** — a documented interface and a written plan, with **no code in v1**. The point is that writing it later is a bounded, well-understood job, not a rewrite. Do not build it speculatively; building two backends to hedge a risk nobody has hit would cost more than the risk.
+>
+> ⚠️ **The seam's stated first use case has been withdrawn.** §4.3 used to name "a tool needing per-request non-batchable inputs" as the reason `native` would earn its keep beyond dependency risk; [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) removed that need entirely. **The seam still stands on its original justification** — a tool whose stack cannot resolve alongside BentoML (§1.2) — which is the risk M3.5 actually measures. One fewer reason is not no reason, but it should be stated rather than quietly dropped.
 
 ```mermaid
 graph TB
@@ -147,17 +170,24 @@ This is the contract the router relies on. Keep it minimal and stable — it is 
 | `GET /health` | `200 {"status":"alive"}` | BentoML's `/livez`, re-exposed at our path. Process is up. Must answer **before** weights load and must never block. |
 | `GET /ready` | `200 {"ready":true}` / `503 {"ready":false,"reason":"loading","detail":...}` | **Ours** (§3.2) — BentoML's `/readyz` is not sufficient. |
 | `GET /schema` | JSON Schema (draft 2020-12) for inputs and outputs, plus batching config and static params | Ours, mounted ASGI route. |
-| `POST /predict` | `{"outputs": ..., "meta": {...}}` | The batched BentoML API (§4). |
-| `POST /predict/batch` | Parallel outputs with per-item status | Same endpoint path family; explicit batch submission. |
-| `POST /unload` | `202` | Ours. **v1** — the default reclamation mechanism on the shared node ([ADR-0002](adr/0002-shared-node-soft-unload.md)). Releases weights; the process stays alive and `/ready` then answers 503 until the next `load()`. |
+| `POST /predict` | `{"outputs": ..., "meta": {...}}` | The batched BentoML API (§4). Accepts one item or a list; **the handler always sees a list** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)). |
 | `GET /metrics` | Prometheus text | BentoML built-in, plus our custom metrics (§9). |
 | `GET /info` | Runtime version, **backend name and version**, handler name, device, pid, loaded-at | Ours. |
 
-**Implementation note:** BentoML serves an ASGI app and supports mounting additional ASGI routes, so `/health`, `/ready`, `/schema`, `/info` and `/unload` are our own handlers mounted alongside its generated API. We do **not** ask the router to speak `/healthz` / `/readyz`; the router speaks our contract, and the adapter does the translation. That indirection is cheap and is what §2.2 is buying.
+**`POST /unload` is not in v1** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). Reclamation is by stopping the container; nothing asks a live container to release its weights. **`POST /predict/batch` is also gone** — with one uniform convention there is no second submission shape to give it ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)).
+
+**Implementation note:** BentoML serves an ASGI app and supports mounting additional ASGI routes ✅ (`@bentoml.asgi_app` is a documented first-class decorator), so `/health`, `/ready`, `/schema` and `/info` are our own handlers mounted alongside its generated API. We do **not** ask the router to speak `/healthz` / `/readyz`; the router speaks our contract, and the adapter does the translation. That indirection is cheap and is what §2.2 is buying.
+
+**Four adapter facts, verified in source, that are cheap now and painful in M4** ([`health-endpoints-and-lifecycle-source.md`](third-party-docs/bentoml/health-endpoints-and-lifecycle-source.md)):
+
+1. **`/metrics` is registered only if metrics are enabled.** §9 assumes the endpoint exists, so **the adapter must enable metrics explicitly** rather than rely on the default.
+2. **The adapter must never set `path_prefix`.** It moves BentoML's system routes, its API routes **and our mounted contract routes** together — so it silently relocates the very endpoints the router depends on. It looks harmless; leave a comment in `bentoml_backend.py` saying why it is not.
+3. **BentoML already serves `/schema.json`**, which is *its* description of the service. Ours is **`/schema`**, compiled by us under **D13**. Five characters apart, unrelated payloads — **contract tests must assert the content**, or a path typo passes silently.
+4. **Any response with status ≥500 has its body replaced** with *"An unexpected error has occurred, please check the server log."* Our contract must therefore never encode meaning in a ≥500 status alone; the reason has to travel in a body we control (§3.2, §4.5).
 
 ### 3.2 Readiness must mean "weights loaded"
 
-BentoML's `/readyz` reports that the *server* is up — which, for a model taking four minutes to load, is a lie in the only direction that matters. R8's `wait_while_warming_up()` polled exactly that endpoint and therefore proved almost nothing ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §4). R8 then bolted a custom `readyz` API onto its service to compensate — the right instinct, and we make it a first-class part of the contract rather than an afterthought.
+✅ **Confirmed in source.** BentoML's `/readyz` reports that the *server* is up — the base class flips `_is_ready = True` in an `on_startup` hook that does nothing else, and the Service-level override falls through to an unconditional 200. For a model taking four minutes to load, that is a lie in the only direction that matters. R8's `wait_while_warming_up()` polled exactly that endpoint and therefore **proved nothing** ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §4). R8 then bolted a custom `readyz` API onto its service to compensate — the right instinct, and we make it a first-class part of the contract rather than an afterthought.
 
 Our `/ready` returns 200 only when:
 
@@ -165,6 +195,16 @@ Our `/ready` returns 200 only when:
 2. `warmup()` (if declared) has completed.
 
 and returns 503 **with the reason and, on failure, the exception message** otherwise. `STARTING` vs `LOADING` in the router's state machine ([`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §4) depends entirely on this distinction being honest.
+
+### 3.3 Also wire `__is_ready__` — one readiness fact, two projections
+
+BentoML calls a service's `__is_ready__` hook on every `/readyz` request if it exists, and returns 503 with a reason when it is `False` (likewise `__is_alive__` for liveness). **The adapter should wire both to the same underlying state our `/ready` reads.** Three reasons:
+
+1. it makes `/readyz` truthful for anyone bypassing our contract — a `docker run` user, a `curl`, a future Kubernetes probe — which is the standalone-image promise (guardrail 11);
+2. it is about three lines;
+3. it gives **one readiness fact with two projections**, instead of two facts that can disagree.
+
+> ⚠️ **These hooks are not on the documentation site.** They were found by reading `main`, and could change without a release note. Treat them as a **bonus**: our mounted `/ready` stays the load-bearing one, and `NATIVE.md` should record that a native backend owes only our route, not these.
 
 ---
 
@@ -178,16 +218,20 @@ The batched endpoint is declared once, by our adapter, from the model's declarat
 @bentoml.api(
     batchable=True,
     batch_dim=0,
-    max_batch_size=settings.max_batch_size,
-    max_latency_ms=settings.max_latency_ms,
+    max_batch_size=settings.max_batch_size,     # ALWAYS passed explicitly
+    max_latency_ms=settings.max_latency_ms,     # ALWAYS passed explicitly
 )
 def predict(self, batch: list[Inputs]) -> list[Outputs]:
     return self._wrapper.run_batch(batch)   # ours, above the seam
 ```
 
-We inherit BentoML's dispatcher, which is **better than the policy we planned to write**: rather than a fixed "flush at size N or after W ms", it estimates the request-arrival rate and the model's own latency curve and adapts the wait window to keep p99 under `max_latency_ms`. R8's `CoreBatcher` implemented the fixed policy (flush on `max_batch_size` **or** oldest-item age ≥ `max_wait_ms`); that policy remains the specification for a future `native` backend and the mental model for tuning, but it is no longer what runs.
+✅ **The adaptive claim is sourced.** In the vendor's words the dispatcher *"continuously adjusts batch size and window based on real-time traffic patterns"*, and it respects `max_latency_ms` *"by predicting the time it takes to process the batch."* Prediction of processing time is precisely what a fixed-window dispatcher does not do, and it is why this was preferred over both our own batcher and `@serve.batch`. R8's `CoreBatcher` implemented the fixed policy (flush on `max_batch_size` **or** oldest-item age ≥ `max_wait_ms`); that policy remains the specification for a future `native` backend and the mental model for tuning, but it is no longer what runs.
 
-Config maps as: `batching.max_batch_size` → `max_batch_size`, `batching.max_wait_ms` → `max_latency_ms`, `batching.enabled: false` → `batchable=False`.
+> **Caveat, kept deliberately:** the source says *that* the window adapts, never *how*. It is a Get-Started page, not an algorithm specification. **M3.5 step 4 still earns its place** — do not treat the citation as a substitute for measuring it.
+
+Config maps as: `batching.max_batch_size` → `max_batch_size`, `batching.max_wait_ms` → `max_latency_ms`, `batching.enabled: false` → `max_batch_size: 1` ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) — *not* `batchable=False`, since the handler's signature must not change).
+
+⚠️ **Always pass both knobs explicitly.** `max_latency_ms` defaults to **`60000`** — that is **BentoML's own default**, inherited by every tool that does not override it, and not, as [`02_CONFIGURATION.md`](02_CONFIGURATION.md) §7 previously said, a nonsensical value chosen by R8. Batching is also **off by default** in BentoML, so `batchable=True` must be set explicitly for every tool.
 
 ### 4.2 What the dispatcher does not give us, and what we do about it
 
@@ -196,52 +240,65 @@ Honest accounting of the five improvements a batcher of our own would have been 
 | Planned improvement | Status under BentoML | Resolution |
 |---|---|---|
 | **1. Group by compatibility key** (never batch requests whose non-batchable args differ) | **Not supported.** The dispatcher batches whatever arrives. | **Made impossible by construction**, not handled at runtime — see §4.3. This is the most important consequence of the decision. |
-| **2. Cap by payload size** (`max_batch_bytes`) | Not supported | Dropped from v1. Mitigate with a conservative per-model `max_batch_size` (a 64-CT-volume batch is a configuration error, and the config is per model). `max_batch_bytes` is recorded as a `native`-backend feature and a phase-2 request upstream. |
-| **3. Preserve order and identity** | **Provided** — the dispatcher fans results back positionally | Ours to verify: §4.4's length check plus the contract test for interleaved arrivals. |
+| **2. Cap by payload size** (`max_batch_bytes`) | Not supported | Dropped from v1. Mitigate with a conservative per-tool `max_batch_size` (a 64-CT-volume batch is a configuration error, and the config is per tool). `max_batch_bytes` is recorded as a `native`-backend feature and a phase-2 request upstream. **Note `batch_dim` exists** and is irrelevant while handlers take and return lists; it would matter only for a handler batching along a tensor axis. Recorded so it is a decision rather than an oversight. |
+| **3. Preserve order and identity** | **Provided** — the dispatcher fans results back positionally | Ours to verify: §4.4's length check plus the contract test for interleaved arrivals. ⚠️ **The vendor states plainly that *"the order of the requests in a batch is not guaranteed"*** — arrival order is not preserved into the batch. Assert *attribution*, never submission order (§4.4). |
 | **4. Per-item failure isolation (`retry_singly`)** | Not supported | **Ours**, in the predict wrapper above the seam: catch a batch-wide exception, re-run items individually, attribute the failure. Default on. Unaffected by the backend choice. |
 | **5. Injectable clock for unit tests** | **Impossible** — the dispatcher owns its own timing and adapts it | Batching tests move from L1 (`ManualClock`, milliseconds) to L2 (in-process server, real time, statistical assertions). A real cost, and the main testing consequence of this decision ([`10_TESTING_STRATEGY.md`](10_TESTING_STRATEGY.md)). Assert *observable* properties — "N concurrent calls produced fewer than N handler invocations", "every caller got its own correct result" — never exact timings. |
 
-### 4.3 The homogeneity rule — batched tools take only batchable inputs
+### 4.3 One uniform convention — every handler takes a list of items
 
-Because the dispatcher cannot separate requests by their non-batchable arguments, a tool with `batching.enabled: true` **may declare only batchable inputs.** A per-request non-batchable input on a batched tool is a **hard error in `tswap validate`**, with a message naming the offending input and the two ways out.
+> **Rewritten by [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md).** This section previously banned non-batchable inputs on batched tools and pushed every per-request knob into a static param. That restriction is gone, replaced by something simpler.
 
-Why an authoring-time ban rather than a runtime workaround: the failure it prevents is silent. Two requests with `threshold=0.5` and `threshold=0.9` would be batched and one answered with the other's parameter — no exception, no log line, a plausible-looking wrong number returned to a clinician. Making that state unrepresentable is worth a restriction on the authoring surface.
+**The rule: a handler always receives a list of typed items and returns a list of the same length.** There is no second calling convention, no `scalar_inputs`, and no per-input `batchable:` flag.
 
-**The escape hatch: static parameters.** Values like `threshold` are usually *per-deployment*, not per-request. So the authoring surface gains a third input class:
+BentoML's constraint is real and confirmed — *"a batchable API endpoint only accepts one parameter in addition to `bentoml.Context`"* — but the vendor documents the remedy we now take: **make the batched element a composite item**, so each item carries its own parameters.
 
 ```yaml
 # tool.yaml
-params:                                    # fixed at load time, not per request
-  - { name: threshold, type: number, default: 0.5,
-      description: Confidence threshold applied to detections. }
-inputs:                                    # per request, and all batchable
-  - { name: paths, type: string, batchable: true, required: true,
+params:                                    # per DEPLOYMENT: changes what the batch computes
+  - { name: input_resolution, type: integer, default: 512,
+      description: Resolution every image is resized to before the forward pass. }
+inputs:                                    # per REQUEST: fields of one item
+  - { name: path, type: string, required: true,
       description: Path to the DICOM series. }
+  - { name: threshold, type: number, default: 0.5,
+      description: Confidence threshold applied to this item's detections. }
 ```
 
-Static params are passed to `load()` (not `predict()`), are overridable per config entry, and are part of the tool's identity. A genuine need for two thresholds becomes two config entries over the same image — which the scheduler, TTL and status surfaces already handle, at the cost of two resident models.
+**Why this is safe where the old rule was strict.** The D15 hazard — two requests with `threshold=0.5` and `threshold=0.9` batched together, one silently answered with the other's value — **cannot be expressed any more.** `threshold` belongs to the item, so item `i` is scored with item `i`'s threshold. The state is unrepresentable rather than detected, which was always D15's instinct; it now costs the author nothing.
 
-**If a tool truly needs per-request non-batchable inputs**, it has two options, both acceptable and both explicit:
+**The test for `params:` versus `inputs:`**, which is now a real question with a real answer:
 
-1. `batching.enabled: false` — the common answer, and free for CPU tools and single-request workloads.
-2. The `native` backend — **the first real use case for §2**, and the honest reason that seam earns its keep beyond dependency risk.
+> **Does this value change what the batched forward pass computes?** If yes → `params:` (input resolution, dtype, a different model head, a weights path). If it only shapes that item's own result → `inputs:` (threshold, top-k, NMS IoU, output format).
+
+Static params are passed to `load()`, are overridable per config entry, and are part of the tool's identity. A genuine need for two input resolutions is two config entries over the same image — which the scheduler, TTL and status surfaces already handle.
+
+> ⚠️ **One unverified premise, and M3.5 must settle it.** BentoML's documented per-item example uses a *wrapper Service* via `bentoml.depends` — but that wrapper exists to expose a non-list, multi-parameter API to *its* clients. **Our `/predict` contract is ours**, so a wrapper may be unnecessary. If it turns out to be required, **the adapter generates it and `handler.py` never sees it** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) is explicit that framework accommodations must not reach the author). See [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) §5.
 
 ### 4.4 The batch-length check is safety-critical and stays ours
 
 ```python
-# tool.yaml declares paths batchable; threshold is a static param
-def predict(self, paths: list[str]) -> list[dict]:
-    # paths: N items;  self.threshold: fixed at load
-    # MUST return exactly N results, in the same order
+def predict(self, items: list[Item]) -> list[dict]:
+    # items: N items, each carrying its own threshold
+    # self.input_resolution: fixed at load
+    # MUST return exactly N results, positionally aligned with items
 ```
 
 Rules:
 
-- Batchable inputs arrive as lists; static params are attributes bound at load.
-- The handler **must** return a list of length N in order. The wrapper validates the length and fails loudly on mismatch. A silent misalignment returns one patient's result for another — in a healthcare context, the worst possible bug. **This check runs above the seam and is independent of the batching engine**, which is exactly why it lives there.
-- `batching.enabled: false` → the wrapper still calls with lists of length 1, so authors write one code path, unless the handler declares `scalar_inputs: true`.
+- **Every handler is called with a list, always** — length 1 when `max_batch_size: 1`. One code path, no exceptions ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)).
+- The handler **must** return a list of length N, positionally aligned. The wrapper validates the length and fails loudly on mismatch. A silent misalignment returns one patient's result for another — in a healthcare context, the worst possible bug. **This check runs above the seam and is independent of the batching engine**, which is exactly why it lives there.
+- ⚠️ **Assert attribution, never submission order.** *"The order of the requests in a batch is not guaranteed"* is documented vendor behaviour. Send N *distinguishable* concurrent requests and assert each caller receives its own answer; do **not** assert the handler observes them in submission order, and do not report that as a flake.
 
-R8 expressed batchability as `Batchable[T] = Union[T, List[T]]`, which forces annotation introspection. Declaring `batchable: true` in `tool.yaml` is explicit and readable by the router without importing anything, and remains the direction chosen.
+**ADR-0005 raises the stakes on this check rather than lowering them.** With every tool on the batched path, an off-by-one in a handler now has the same consequence everywhere. [`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md) §5 names batch attribution as never-trim; nothing in ADR-0005 may be cited to weaken it.
+
+R8 expressed batchability as `Batchable[T] = Union[T, List[T]]`, which forces annotation introspection. We need no such flag at all now: batching is a property of the *tool's configuration*, and the handler signature is the same either way.
+
+### 4.5 A saturated tool must be distinguishable from a starting one
+
+When the dispatcher cannot meet its latency budget it calls a fallback that raises `ServiceUnavailable("process is overloaded")` — **HTTP 503**. The router already uses 503 + `TOOL_UNAVAILABLE` for its *own* cold-start queueing ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §6), so without intervention **"the tool is starting" and "the tool is overloaded" are indistinguishable** to the caller and to us. Worse, because 503 ≥ 500, BentoML **replaces the message** with a generic string, so the cause is lost.
+
+**The adapter must catch `ServiceUnavailable` before BentoML's handler and re-emit it in our envelope with a distinct saturation reason.** This is not optional polish: **D28** is precisely about not misattributing a failure, and an unexplained 503 under load reads as a broken tool. See [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) for the router-side concurrency cap that decides whether the container is ever asked to make this judgement.
 
 ---
 
@@ -250,9 +307,9 @@ R8 expressed batchability as `Batchable[T] = Union[T, List[T]]`, which forces an
 The trap is unchanged by the backend choice: **a GPU inference call must not block the event loop**, or `/health` and `/ready` stop answering and the router declares a busy model dead.
 
 1. Handlers are **synchronous** by default and run in a thread executor. BentoML runs sync API methods off the loop already; do not defeat it by declaring the handler `async`.
-2. Exactly **one** inference at a time per worker. Serialise with a lock; use batching for throughput, not concurrency.
-3. `/health` and `/ready` are served from mounted routes that **never touch the handler lock** — they must answer during a five-second inference. Contract-tested.
-4. `workers > 1` → multiple BentoML workers, each with its own handler and device. **Pass an explicit device list and index into it.** R8 derived `gpu_id = max(0, worker_index - 1)` from BentoML's 1-based `worker_index` ([`12_REFERENCE_CODE.md`](12_REFERENCE_CODE.md) §5) — fragile and off-by-one-prone. Read `worker_index` once, map through `TSWAP_DEVICE_LIST`, **log the resulting mapping at startup**, and fail loudly if the list is shorter than the worker count.
+2. ✅ Exactly **one** inference at a time per worker — **and we do not have to enforce this.** BentoML dispatches every sync API call through a single `anyio.CapacityLimiter(threads)`, with **`threads` defaulting to 1**. Our design and the framework's default agree, so **the lock this section used to require is redundant and is removed.** Two obligations replace it: the adapter **sets `threads` explicitly** rather than relying on the default, and **M3.5 reports the value it ran with** — firing 32 concurrent requests and declaring batching working or broken without stating `threads` produces an uninterpretable result.
+3. `/health` and `/ready` are served from mounted routes that **never touch the handler's limiter** — they must answer during a five-second inference. Contract-tested.
+4. `workers > 1` → multiple BentoML workers, each with its own handler and device. **Pass an explicit device list and index into it.** R8 derived `gpu_id = max(0, worker_index - 1)` from `worker_index`; ⚠️ **that is the vendor's own documented idiom with an added guard, not an R8 blunder** — and the vendor's own page gives the index as 0-based and 1-based three paragraphs apart. The lesson is therefore *do not build device identity on a framework's indexing convention*, not *R8 got it wrong*. Read `worker_index` once, map through `TSWAP_DEVICE_LIST`, **log the resulting mapping at startup**, fail loudly if the list is shorter than the worker count, and **have M3.5 observe the actual value.**
 5. Multiple workers multiply VRAM by the worker count. Document loudly; the scheduler does not know (**D7**).
 6. Support `async def predict` for genuinely I/O-bound handlers, detected by inspection.
 
@@ -287,16 +344,30 @@ sequenceDiagram
     H-->>A: N outputs
     A->>A: length check, fan out
     S-->>R: outputs
-    Note over R,S: ... idle ...
-    R->>S: POST /unload (soft TTL — the normal idle path)
-    A->>H: unload()
-    S-->>R: 202 (now /ready -> 503)
-    R->>S: SIGTERM (hard TTL)
-    A->>H: unload()
+    Note over R,S: ... idle until ttl ...
+    R->>S: SIGTERM (idle TTL — the only idle path in v1)
+    A->>H: unload() (advisory hygiene hook)
     S-->>D: exit 0
 ```
 
-Bind-then-load is kept from R8's BentoML service, which started warm-up on a background thread precisely so the HTTP server could bind at once. **But R8's `_warmup_background` swallowed the exception**, leaving a service that was alive, never ready, and silent about why — the worst debugging experience in that setup, compounded by an unbounded readiness poll on the caller's side.
+> **There is no soft-unload step** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). One idle timer, one reclamation mechanism: the container stops and the OS reclaims. `unload()` survives only as an advisory hook on `SIGTERM`.
+
+### ⚠️ 6.1 Bind-then-load is **mandatory**, not stylistic — the M4 trap
+
+Bind-then-load is kept from R8's BentoML service, which started warm-up on a background thread precisely so the HTTP server could bind at once. **What the plan never said is why it was necessary**, and it is not a matter of taste:
+
+**BentoML's `lifespan` awaits `create_instance` — which constructs the service class, running `__init__` — *before* the socket accepts connections.** Uvicorn does not serve until lifespan startup completes. So if M4 loads the handler in `__init__` or in an `on_startup` hook, then during a four-minute load:
+
+| Plan commitment | What actually happens |
+|---|---|
+| *"`/health` must answer **before** weights load and must never block"* (§3.1) | **Nothing answers.** The socket is not listening — the router gets *connection refused*, not a 503 |
+| The `STARTING` → `LOADING` → `READY` progression ([`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §4) | `LOADING` is **unobservable**; the two states collapse and the diagnostic value is lost |
+| *"`/ready` is 503 with a reason while loading"* (M4 contract suite) | **Untestable** — there is no response at all |
+| *"`load()` raising leaves `/ready` at 503 with the traceback"* | An exception in `__init__` **fails lifespan startup and exits the process**; no server survives to report it |
+
+**Therefore M4 must load off the lifespan path** — a background thread or task started from `__init__`, returning immediately — recording the outcome (loaded, or the exception) in adapter state that both `/ready` and `__is_ready__` (§3.3) read. **R8's background warm-up thread was correct**; its bug was narrow — `_warmup_background` swallowed the exception, leaving a service that was alive, never ready, and silent about why, compounded by an unbounded readiness poll on the caller's side. Keep the design; fix the bug.
+
+**M3.5 must verify this before M4 builds on it**: sleep 30 s in `__init__` and confirm whether the port refuses connections throughout.
 
 Failure handling:
 
@@ -351,13 +422,17 @@ Serve them at `/metrics`, relabelled into our namespace where they overlap, plus
 
 | Metric | Type | Source |
 |---|---|---|
-| `tswap_requests_total` | counter | BentoML |
-| `tswap_request_duration_seconds` | histogram | BentoML |
-| `tswap_batch_size` | histogram | BentoML dispatcher |
-| `tswap_queue_wait_seconds` | histogram | BentoML dispatcher |
+| `tswap_requests_total` | counter | BentoML (`request_total`) |
+| `tswap_request_duration_seconds` | histogram | BentoML (`request_duration_seconds`) |
+| `tswap_request_in_progress` | gauge | BentoML (`request_in_progress`) — **in-flight, free** |
+| `tswap_batch_size` | histogram | BentoML dispatcher (`adaptive_batch_size`) |
 | `tswap_tool_loaded` | gauge (0/1) | Ours |
 | `tswap_load_duration_seconds` | histogram | Ours |
 | `tswap_batch_item_failures_total` | counter | Ours (`retry_singly`) |
+
+**Set `metrics={"namespace": "tswap"}`.** It renames BentoML's entire default set in one parameter, which is where most of the table above comes from **free**.
+
+⚠️ **`tswap_queue_wait_seconds` has been removed from this table: no such BentoML metric exists.** The dispatcher exposes `request_in_progress`, `request_total`, `request_duration_seconds` and `adaptive_batch_size` — and nothing else. Queue wait is the key diagnostic for tuning `max_wait_ms`, so it must be **measured above the seam** if we want it. Do not plan around a metric the framework does not emit.
 
 Router-side additions: `tswap_tool_state`, `tswap_cold_starts_total`, `tswap_evictions_total`, `tswap_tool_resident_seconds`. Together these answer the questions that justify the project: how often do we swap, what a cold start costs, and whether batching is actually happening.
 

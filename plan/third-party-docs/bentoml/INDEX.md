@@ -109,23 +109,25 @@ The same section says the index starts at `0` and, three paragraphs later, that 
 
 ---
 
-## 4. Proposed amendments — **not applied**
+## 4. Amendments — ✅ **APPLIED 2026-08-13**
 
-Recorded for deliberate decision, per rule 2 of [`../README.md`](../README.md). No plan document was edited.
+**These were originally recorded as "proposed, not applied", per the old reading of rule 2.** That convention was reversed on the requester's instruction — *"the goal of this exercise is to improve the plan"* — and every item below is now **in** the plan document named. See [`../README.md`](../README.md) rule 2 and [`plans/capture-refinement-proposals.md`](../../../plans/capture-refinement-proposals.md) for the verdicts.
 
-| # | Document | Change | Severity |
+| # | Document | Change | Status |
 | --- | --- | --- | --- |
-| 1 | [`05 §6`](../../05_RUNTIME_AND_BATCHING.md), [`09 M4`](../../09_IMPLEMENTATION_PLAN.md) | State that background loading is **required**, not preferred, and why; require load state readable by both `/ready` and `__is_ready__` | **High — M4 correctness** |
-| 2 | [`09 M3.5`](../../09_IMPLEMENTATION_PLAN.md:129) | Step 1: record `cattrs`, the OTel set, `fsspec`, `numpy` — not starlette/click. Step 5: add a blocking-startup probe, a root-mount check, a `worker_index` observation, and a poisoned-batch-item test | **High — the spike measures the wrong things** |
-| 3 | [`05 §9`](../../05_RUNTIME_AND_BATCHING.md:353) | Remove or reassign `tswap_queue_wait_seconds`; add `request_in_progress`; align names with the `namespace` output | Medium |
-| 4 | [`05 §1.1`](../../05_RUNTIME_AND_BATCHING.md), [`13 D14`](../../13_OPEN_QUESTIONS.md), [`08 §3`](../../08_REPO_LAYOUT.md), [`00 §4`](../../00_CONTEXT_AND_MOTIVATION.md) | Replace "locked pins (pydantic, starlette, click)" with the actual constraints; note that extras are not installed | Medium |
-| 5 | [`13 D15`](../../13_OPEN_QUESTIONS.md:120) | Record the per-item Pydantic remedy; narrow D15 to parameters that change the batched computation, or state why we decline | Medium |
-| 6 | [`02 §7`](../../02_CONFIGURATION.md:345) | Attribute `60000` to BentoML; require the adapter to always pass both batching knobs explicitly | Low |
-| 7 | [`12 §5`](../../12_REFERENCE_CODE.md), [`06 §7`](../../06_LIFECYCLE_TTL_AND_SCHEDULING.md) | Re-word the `worker_index - 1` criticism: the lesson is "do not build device identity on a framework's indexing convention" | Low |
-| 8 | [`10_TESTING_STRATEGY.md`](../../10_TESTING_STRATEGY.md) | Note that unordered batches are documented vendor behaviour; assert attribution, never submission order | Low |
-| 9 | [`02 §7`](../../02_CONFIGURATION.md) / M1 | `tswap validate` should warn when `workers > 1` with `devices:` set — VRAM multiplies invisibly to the scheduler | Low |
-| 10 | [`08 §3`](../../08_REPO_LAYOUT.md) | Pin policy: check yank status before pinning and before upgrading; `bentoml==X.Y.Z` with **no extras** | Low |
-| 11 | [`15 §2`](../../15_RAY_SERVE_EVALUATION.md) | Cite the concrete contrast: BentoML constrains only the interpreter to a four-version range, versus Ray's exact-patch lockstep | Low |
+| 1 | [`05 §6.1`](../../05_RUNTIME_AND_BATCHING.md), [`09 M4`](../../09_IMPLEMENTATION_PLAN.md) | Background loading stated as **required, not preferred**, with the four things that break otherwise; load state read by both `/ready` and `__is_ready__` | ✅ Applied — new §6.1 *"the M4 trap"* |
+| 2 | [`09 M3.5`](../../09_IMPLEMENTATION_PLAN.md) | Step 1 now records `cattrs`, the OTel set, `fsspec`, `numpy`. Step 5 gains the blocking-startup probe, the root-mount check, the `worker_index` observation, the poisoned-item test, a non-root check, and the ADR-0005 wrapper question | ✅ Applied |
+| 3 | [`05 §9`](../../05_RUNTIME_AND_BATCHING.md) | `tswap_queue_wait_seconds` **removed** with an explanation; `request_in_progress` added; `metrics={"namespace": "tswap"}` named | ✅ Applied |
+| 4 | [`05 §1.1`](../../05_RUNTIME_AND_BATCHING.md), [`13 D14`](../../13_OPEN_QUESTIONS.md), [`08 §3`](../../08_REPO_LAYOUT.md), [`00 §4`](../../00_CONTEXT_AND_MOTIVATION.md), [`03 §6`](../../03_TOOL_AUTHORING.md) | "Locked pins (pydantic, starlette, click)" replaced with the real constraints in **all five** places; extras noted as not installed | ✅ Applied |
+| 5 | [`13 D15`](../../13_OPEN_QUESTIONS.md) | **Went further than proposed.** The requester chose to collapse the distinction rather than narrow it: **one uniform calling convention**, per-item knobs, `params:` for computation-changing values only | ✅ Applied — **[ADR-0005](../../adr/0005-one-uniform-batched-calling-convention.md)** |
+| 6 | [`02 §5.5`](../../02_CONFIGURATION.md) | `60000` attributed to BentoML; adapter must always pass both batching knobs explicitly | ✅ Applied |
+| 7 | [`05 §5`](../../05_RUNTIME_AND_BATCHING.md), [`10`](../../10_TESTING_STRATEGY.md) | `worker_index` criticism re-worded to *"do not build device identity on a framework's indexing convention"* | ✅ Applied |
+| 8 | [`10 §4.2`](../../10_TESTING_STRATEGY.md), [`05 §4.4`](../../05_RUNTIME_AND_BATCHING.md) | Unordered batches recorded as **documented vendor behaviour**; assert attribution, never submission order | ✅ Applied |
+| 9 | [`02 §5.5`](../../02_CONFIGURATION.md), rule 4c | `tswap validate` warns when `workers > 1` with `devices:` set | ✅ Applied |
+| 10 | [`08 §3`](../../08_REPO_LAYOUT.md) | Three-rule pin policy: no extras, check yank status, watch the constraints that actually bind | ✅ Applied |
+| 11 | [`15 §2`](../../15_RAY_SERVE_EVALUATION.md) | The interpreter-range versus exact-patch-lockstep contrast | ⏸ **Not applied** — the Ray decision is settled and [`16 §7`](../../16_COMPLEXITY_AUDIT.md) asks for *fewer* restatements of it, not more |
+
+**Two further findings from this capture were applied that had no amendment number:** the adapter must **enable metrics explicitly** (`/metrics` is conditional) and **must never set `path_prefix`** (it moves our mounted contract routes), plus the `/schema` versus `/schema.json` collision — all now in [`05 §3.1`](../../05_RUNTIME_AND_BATCHING.md). The **saturation mapping** for `ServiceUnavailable("process is overloaded")` is in [`05 §4.5`](../../05_RUNTIME_AND_BATCHING.md).
 
 ---
 

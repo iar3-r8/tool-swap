@@ -214,9 +214,21 @@ Note the second-order effect, which is the reason the decision is framed as *ref
 
 ---
 
-## 5. Five gaps — questions, not proposals
+## 5. Five gaps — ✅ **all five settled, 2026-08-13**
 
-llama-swap has solved five problems our plan has not yet noticed. **None is a v1 blocker and none is proposed here.** Each is written as a question, with the cost of answering it and the cost of not, for the requester to settle. See [INDEX finding F3](third-party-docs/llama-swap/INDEX.md).
+llama-swap had solved five problems this plan had not noticed. They were written as questions for the requester; **all five now have answers, and each is applied in the document that owns it.** The original framing is kept below so the reasoning survives, with the verdict attached to each.
+
+| Gap | Verdict | Lives in |
+| --- | --- | --- |
+| **G1** grace period | **Already solved; cross-reference added**, plus a warning to check `drain_timeout` against a 90-second inference | [`06 §2.1`](06_LIFECYCLE_TTL_AND_SCHEDULING.md), [`01 §5.1`](01_ARCHITECTURE.md) |
+| **G2** eviction victim | **Cheap version adopted** — one optional `evict_cost` integer in an LRU tie-break. **The solver and its DSL are explicitly refused.** | [`06 §5.1.1`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) |
+| **G3** queue priority | **Seam adopted, feature refused** — a policy enum with one implementation, declared before M2 | [`06 §5.1.2`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) |
+| **G4** saturated tool | **Both halves answered**: the adapter re-emits `ServiceUnavailable` with a distinct reason, and the router gains an *optional* `max_concurrent` returning 429 | [`05 §4.5`](05_RUNTIME_AND_BATCHING.md), [`06 §10`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) |
+| **G5** non-root images | **Adopted, scheduled into M5** — a `USER` line, a read-only cache mount, and `safetensors` guidance | [`03 §6.1`](03_TOOL_AUTHORING.md), [`09 M5`](09_IMPLEMENTATION_PLAN.md) |
+
+**A sixth item, not on the original list, came from the same capture and is also applied:** their `logToStdout` four-way switch becomes our `router.log_output`, and the *"observability regressions are invisible to functional tests"* lesson becomes three assertions in [`10 §6.1`](10_TESTING_STRATEGY.md).
+
+The original questions follow. See [INDEX finding F3](third-party-docs/llama-swap/INDEX.md).
 
 ### G1 — Graceful stop: already solved, and worth checking against theirs
 
@@ -285,12 +297,12 @@ llama-swap has solved five problems our plan has not yet noticed. **None is a v1
 
 **Cost of answering:** a `USER` line in the generated base image, a read-only cache mount where downloads are not needed, and a `safetensors` recommendation in the authoring guide. **Cost of not:** the plan makes the *stability* half of the blast-radius argument (**D2**) and omits the *security* half. **Nearly free before M5, awkward after** — changing the base image's `USER` later invalidates every author's assumptions about file ownership.
 
-### Summary
+### Summary — with verdicts
 
 | Gap | Subject | Cheapest form | Urgency |
 | --- | --- | --- | --- |
-| **G1** | Grace period before force-kill | **Already solved** — needs a cross-reference and a default sanity-check | Before M6 |
-| **G2** | Eviction victim selection | An optional per-tool weight in an LRU tie-break | Before M6; policy only |
+| **G1** | Grace period before force-kill | **Already solved** — needs a cross-reference and a default sanity-check | Before M6 · ✅ **applied** |
+| **G2** | Eviction victim selection | An optional per-tool weight in an LRU tie-break | Before M6 · ✅ **applied, cheap version only** |
 | **G3** | Queue priority | Adopt the *seam*, not the feature | Before M2 |
 | **G4** | Saturated-tool back-pressure | Decide the owning layer; one error code | Before M4 |
 | **G5** | Non-root tool images | A `USER` line and a docs paragraph | **Before M5** |

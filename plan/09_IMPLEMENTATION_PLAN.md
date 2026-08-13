@@ -89,6 +89,8 @@ graph LR
 - `FakeBackend`: in-memory, scriptable failures (fail to start, never ready, die while running).
 - `DockerBackend`: create/start/stop/inspect/list-by-label/logs, with our labels, network, device requests, env, mounts, `shm_size`.
 - `LifecycleManager`: the state machine from [`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §4, coalesced `ensure_ready`, in-flight counting, graceful drain-then-stop.
+- **Declare the queue-policy seam now, with one implementation** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.2). FIFO is the only policy in v1 and priority is deliberately refused, but the *enum-and-interface shape* means a second policy is later a new implementation rather than a rewrite. **Cheapest before any code exists; an awkward retrofit after.**
+- **Shutdown ordering** ([`01_ARCHITECTURE.md`](01_ARCHITECTURE.md) §7.1): stop accepting, fail queued requests fast with a shutting-down reason, drain in-flight, *then* stop containers. Getting this backwards 502s in-flight work and produces flaky integration tests.
 - `HealthProbe` + `FakeProbe`; the `STARTING` → `LOADING` → `READY` progression.
 - Reconciliation on boot: adopt or stop labelled containers.
 
@@ -124,13 +126,16 @@ graph LR
 
 **Goal:** turn **D14**'s accepted risk into evidence. Timeboxed, throwaway code, one written outcome.
 
-The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1) rests on one assumption: *its pins do not conflict with real model stacks.* That assumption is cheap to test now and expensive to discover false in M6. **Run it before M4, not during.**
+The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1) rests on one assumption: *its constraints do not conflict with real model stacks.* That assumption is cheap to test now and expensive to discover false in M6. **Run it before M4, not during.**
 
-1. **Resolution, torch stack.** Build an image with the pinned BentoML plus `torch==2.8.0+cu129`, `transformers`, `monai`, `pydicom` — the R8 CXR/CT stack. Record the resolved versions of pydantic, starlette and click.
+1. **Resolution, torch stack.** Build an image with the pinned BentoML plus `torch==2.8.0+cu129`, `transformers`, `monai`, `pydicom` — the R8 CXR/CT stack. ⚠️ **Record `cattrs`, the seven OpenTelemetry packages, `fsspec` and `numpy` — not pydantic, starlette and click.** The latter three were what this step used to ask for, and **two of them are lower bounds that cannot conflict**; the real two-sided constraints are the former ([`third-party-docs/bentoml/dependency-constraints.md`](third-party-docs/bentoml/dependency-constraints.md)).
 2. **Resolution, TensorFlow stack.** The same with `tensorflow` / `tf-keras` on a vendor base image — the R8 `organ_donor` case, and the one most likely to fight.
-3. **Vendor base image.** Confirm the pinned BentoML installs on an `nvcr.io` base ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6), which Level 3 authoring assumes.
-4. **Batching sanity.** A trivial sleep-handler service with `batchable=True`: fire 32 concurrent requests, confirm the handler is invoked far fewer than 32 times, that every caller gets its own correct result, and that added latency is bounded near `max_latency_ms`. This measures the thing we chose BentoML *for*.
-5. **Contract feasibility.** Mount a custom ASGI route beside the generated API and serve our own `/ready` (§3.2), confirming the adapter shape in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3 is actually buildable.
+3. **Vendor base image.** Confirm the pinned BentoML installs on an `nvcr.io` base ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6), which Level 3 authoring assumes. **Also confirm it installs and runs under a non-root `USER`** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6.1) — this is the cheapest possible moment to find out that it does not.
+4. **Batching sanity.** A trivial sleep-handler service with `batchable=True`: fire 32 concurrent requests, confirm the handler is invoked far fewer than 32 times, that every caller gets its own correct result, and that added latency is bounded near `max_latency_ms`. This measures the thing we chose BentoML *for*. **Report the `threads` setting alongside the numbers** — BentoML limits sync handler calls to `threads` (default 1), and a batching result without it is uninterpretable. Also **observe the actual `worker_index`** (the docs give it as both 0- and 1-based on one page) and **submit a poisoned item** to confirm `retry_singly` isolates it.
+5. **Contract feasibility.** Mount a custom ASGI route beside the generated API and serve our own `/ready` (§3.2), confirming the adapter shape in [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3 is actually buildable. **Three additions, each cheap and each load-bearing for M4:**
+   - **Probe the blocking startup.** `sleep(30)` in `__init__`, then check whether the port refuses connections throughout. If it does — and the source says it will — **M4 must load on a background task**, or `LOADING` is unobservable and two contract tests cannot be written ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §6.1).
+   - **Confirm the mount is at the root path** and that we are not obliged to set `path_prefix` (which would move our contract routes with it).
+   - **Settle the per-item question [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) leaves open:** does a batched API taking `list[PydanticModel]` need a wrapper Service via `bentoml.depends`, or does posting a list of one suffice? **M4's whole shape depends on the answer.**
 
 **Outcomes and what each means:**
 
@@ -149,14 +154,17 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 
 **Goal:** managed models: a handler becomes a batching server, with BentoML underneath and our contract on top.
 
-- `tool_swap_runtime` **above the seam**: `@tool` decorator (metadata only), handler loader with static params, background load with **failure recorded and exposed**, schema compilation, and the predict wrapper (validation, batch-length check, `retry_singly`, error envelope).
+- `tool_swap_runtime` **above the seam**: `@tool` decorator (metadata only), handler loader with static params, **background load — which is mandatory, not stylistic** ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §6.1) — with **failure recorded and exposed**, schema compilation, and the predict wrapper (validation, batch-length check, `retry_singly`, error envelope).
+- **One uniform calling convention** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md)): the handler always receives a list of items and returns a list of the same length. No `scalar_inputs`, no per-input `batchable` flag, and `batching.enabled: false` compiles to `max_batch_size: 1` rather than to a different signature.
 - `backends/base.py`: the `RuntimeBackend` protocol ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §2.3). `backends/NATIVE.md`: the specification of the unbuilt alternative. **No native code.**
-- `backends/bentoml_backend.py`: build the service, declare the batched API from config, mount our contract routes (`/health` `/ready` `/schema` `/info`), map `worker_index` → device through `TSWAP_DEVICE_LIST` and log the mapping.
+- `backends/bentoml_backend.py`: build the service, declare the batched API from config **always passing `max_batch_size` and `max_latency_ms` explicitly** (BentoML's default is `60000` ms and batching is off by default), mount our contract routes (`/health` `/ready` `/schema` `/info`), map `worker_index` → device through `TSWAP_DEVICE_LIST` and log the mapping. **Enable metrics explicitly** (`/metrics` is only registered when they are on) and **set `metrics={"namespace": "tswap"}`**, which renames the whole default set and supplies most of [`05 §9`](05_RUNTIME_AND_BATCHING.md) free. **Never set `path_prefix`.** Set `threads` explicitly rather than relying on the default of 1.
+- **Wire `__is_ready__` / `__is_alive__`** to the same state our `/ready` reads, so `/readyz` is truthful for anyone bypassing our contract ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §3.3). Undocumented hooks: a bonus, never the mechanism we rely on.
+- **Catch `ServiceUnavailable("process is overloaded")`** and re-emit it with a distinct saturation reason. BentoML strips the body of any ≥500 response, so left alone a saturated tool is indistinguishable from a starting one — and **D28** is about not misattributing failures.
 - Truthful `/ready`: weights-loaded, not server-up (§3.2) — the correction of the R8 behaviour this milestone most depends on.
 - **No `POST /unload` and no reload path** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)). `unload()` remains in the handler protocol as an **optional** hygiene hook, called on `SIGTERM`; nothing calls it on the reclamation path. This is where the soft-unload machinery would re-attach if [ADR-0004](adr/0004-hard-stop-only-in-v1.md)'s triggers ever fire.
 - Env-var contract ([`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §7) translated into BentoML config; **effective config logged at startup**, including backend and BentoML versions.
 - BentoML's logger folded into our format; structured errors; graceful `SIGTERM`.
-- `tswap validate` enforces **D15**: a batched tool declaring a non-batchable input is a hard error.
+- *(The former D15 validation rule is gone — [ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) makes the state unrepresentable rather than checked. `tswap validate` instead **warns when `workers > 1` with `devices:` set**, since VRAM multiplies invisibly to the scheduler.)*
 
 **Tests — above the seam, fast and pure:** a length-mismatched return fails loudly (**safety-critical**: a silent misalignment returns one patient's result for another); `retry_singly` isolates the offending item and attributes the failure; validation rejects unknown, missing and mistyped inputs; static params reach `__init__` and never appear in the request schema; `validate` rejects a batched tool with a non-batchable input, naming both remedies.
 
@@ -173,7 +181,7 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 **Goal:** three files become a running image (**R2**).
 
 - Dockerfile generation from `runtime:` (levels 0–3), correct layer order, BuildKit pip/uv cache mounts.
-- Base images: `base-cpu:py312`, `base-cuda:12.4-py312`.
+- Base images: `base-cpu:py312`, `base-cuda:12.4-py312`. **Each sets a non-root `USER`** ([`03_TOOL_AUTHORING.md`](03_TOOL_AUTHORING.md) §6.1) — our tools unpickle checkpoints downloaded from the internet on a shared DGX, and this is the milestone where that costs one line instead of a migration. Mount the weights cache read-only where the tool does not download.
 - Deterministic tagging by config hash; `:latest` alias; rebuild-needed detection.
 - `tswap build [model|--all]`; generated Dockerfiles kept in `.tswap/build/<model>/` for inspection and graduation.
 - `tswap new` templates, each of which actually runs.
@@ -182,7 +190,7 @@ The decision to build the runtime on BentoML ([`05_RUNTIME_AND_BATCHING.md`](05_
 
 **Tests:** generated Dockerfile snapshot tests per level; **editing `handler.py` does not invalidate the pip layer** (assert on the generated file ordering); the hash changes when requirements change and not when only a comment changes; every template validates.
 
-**Integration:** build and serve `example_echo` end-to-end; build a torch-CUDA template if a GPU runner exists.
+**Integration:** build and serve `example_echo` end-to-end; build a torch-CUDA template if a GPU runner exists. **Assert the effective UID inside a built image is not 0**, and that the tool still reaches its GPU devices and reads its weights mount — the second half is what breaks in practice.
 
 **Done when:** `tswap new` → `tswap build` → `tswap test` succeeds for every template, and rebuilds after a code-only edit are fast.
 
@@ -220,7 +228,8 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 - `scheduler/policy.py`: **pure** `request_slot`, `find_expired`, `rank` ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5, §9).
 - Group occupancy accounting over holding states.
 - TTL watchdog (**one timer**, [ADR-0004](adr/0004-hard-stop-only-in-v1.md)); `keep_warm`; `autostart: false`.
-- LRU / LIFO / none eviction; `min_residency`; in-flight immunity.
+- LRU / LIFO / none eviction; `min_residency`; in-flight immunity. **Victim selection orders by `(evict_cost, last_used)`** ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.1.1) — one optional integer, so a 90-second segmenter is not evicted to save a one-second CPU function. **The solver and its DSL are explicitly refused.**
+- `keep_warm` is implemented as a **synthetic request through the ordinary request path**, not a separate warm-up routine — slot acquisition, readiness polling, state transitions and failure accounting then come free and cannot drift.
 - **Preemption** (**D25**): a request displaces an idle incumbent via `EVICT_THEN_GRANT` rather than waiting out its TTL. This is the existing eviction path with a request as its trigger, not new machinery.
 - Failure backoff and `max_consecutive_failures`.
 - Thrash detection with a warning that names the competing models and suggests a fix.
@@ -231,7 +240,7 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 **`min_residency` and thrash detection are load-bearing here, not garnish.** Displacement now costs the victim a full cold start, so the alternating-request pathology ([`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §5.3) is more expensive than it would have been with soft unload. Thrash detection is also the instrumentation that tells us whether [ADR-0004](adr/0004-hard-stop-only-in-v1.md) was the wrong call.
 
-**Tests:** every scenario in [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §8 as a fast unit test with `ManualClock` + `FakeBackend` — simple swap, TTL expiry, in-flight protection, thundering herd, failure/backoff, **start under contention**, router restart, group isolation. Plus: `min_residency` prevents immediate re-eviction; `eviction: none` waits instead of evicting; ranking is deterministic on ties. **Scenarios §8.1b and §8.1c are removed** with soft unload.
+**Tests:** every scenario in [`06_LIFECYCLE_TTL_AND_SCHEDULING.md`](06_LIFECYCLE_TTL_AND_SCHEDULING.md) §8 as a fast unit test with `ManualClock` + `FakeBackend` — simple swap, TTL expiry, in-flight protection, thundering herd, failure/backoff, **start under contention**, router restart, group isolation. Plus: `min_residency` prevents immediate re-eviction; `eviction: none` waits instead of evicting; ranking is deterministic on ties; **a high-`evict_cost` tool survives while a cheaper, less-recently-used one is displaced** (§8.1d). **Scenarios §8.1b and §8.1c are removed** with soft unload.
 
 **The test that matters most here:** a start that fails for lack of VRAM must leave the tool `STOPPED` with its failure counter untouched (**D28**, guardrail 5b). Get it wrong and every tool slowly marks itself broken whenever the DGX is busy — a failure that looks like our bug, reports as our bug, and is not.
 
@@ -245,13 +254,14 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 **Goal:** answer "why is it slow/failing?" without reading source (**R1**).
 
-- Log collector: container streams → per-model rotating files, **retained after the container stops**.
+- Log collector: container streams → per-tool rotating files, **retained after the container stops**.
+- **`router.log_output`** (`router` / `tool` / `both` / `none`) controlling what reaches stdout, borrowed from llama-swap ([`07_CLI_AND_OPS.md`](07_CLI_AND_OPS.md) §2.1). Files are always written regardless. **Test that each value changes the behaviour** — theirs shipped as a no-op past a completed review, and nothing 500s when logging silently breaks.
 - Router logging: console + rotating file + `.jsonl`; effective config dumped at boot; explicit INFO lines for transitions, cold starts with durations, evictions with victim and reason, TTL stops, and failures with traceback.
 - `/status` with everything in [`04_API_CONTRACT.md`](04_API_CONTRACT.md) §5, including per-tool latency percentiles and cold-start stats. This is the **only** metrics surface in v1; Prometheus `/metrics` is deferred ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §8).
 - Reuse the stats layer to enrich the preflight report with **cold-start and latency statistics across runs** rather than the single measurement M5.5 produces, so `ready_timeout` suggestions stop being derived from one sample.
 - `/ui` status page (single HTML file, polls `/status`, start/stop buttons, log tail).
 
-**Tests:** logs survive a container stop (the key requirement); rotation caps disk use; a `request_id` appears in the response header, the body `meta`, the router log and the container log; `/status` shape is snapshot-tested; TTL countdown maths is correct.
+**Tests:** logs survive a container stop (the key requirement); **`tswap logs <tool>` on a `STOPPED` tool returns its history rather than an error**; rotation caps disk use; a `request_id` appears in the response header, the body `meta`, the router log and the container log; **each `log_output` value demonstrably changes what reaches stdout**; `/status` shape is snapshot-tested; TTL countdown maths is correct.
 
 **Done when:** a deliberately-broken model can be diagnosed from `/status` plus `tswap logs` alone.
 
@@ -287,7 +297,7 @@ Placed immediately after M5 because it needs the build pipeline and the runtime,
 
 There is **no OpenAI compatibility layer and no `mapping:`** — both were deleted with `kind: external` ([`04_API_CONTRACT.md`](04_API_CONTRACT.md) §7). This milestone is correspondingly smaller than it once was.
 
-**Tests:** input validation rejects unknown/missing/mistyped inputs with 422; a list on a batchable port returns parallel outputs in order and isolates a single bad item; a list on a non-batchable port is a 422; auth is enforced on admin; `start` on a `FAILED` tool clears the failure counter. Projections: `?format=tools` output is snapshot-tested and **validated against the standard tool-definition shape**; `x-*` keys are stripped from it; `?names=a,b` subsets correctly; every tool in the zoo appears, since there is no second class of tool that could be missing one.
+**Tests:** input validation rejects unknown/missing/mistyped inputs with 422; **a list of items returns parallel outputs in order and isolates a single bad item, and a single item is accepted as a list of one** ([ADR-0005](adr/0005-one-uniform-batched-calling-convention.md) — there is no non-batchable port left to reject a list on, so that test is deleted rather than rewritten); auth is enforced on admin; `start` on a `FAILED` tool clears the failure counter. Projections: `?format=tools` output is snapshot-tested and **validated against the standard tool-definition shape**; `x-*` keys are stripped from it; `?names=a,b` subsets correctly; every tool in the zoo appears, since there is no second class of tool that could be missing one.
 
 **Integration (the milestone's real acceptance test):** feed `?format=tools` straight into an LLM SDK's `tools=[...]` against our llama-swap deployment, and confirm the model emits a well-formed call for a zoo tool, which then succeeds against `/run/{tool}`. That round trip — llama-swap for the LLM, tool-swap for the algorithm — is the entire product thesis in one test, and the end-to-end proof that **D13** delivers what it promises.
 
