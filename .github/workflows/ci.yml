@@ -24,13 +24,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: |
+          pip install -e ".[dev]"
+          # Install tool-swap-runtime in editable mode so tests can import it.
+          pip install -e "src/tool_swap_runtime"
 
       - name: Run lint
         run: make lint
 
       - name: Run import-linter
-        run: lint-imports
+        # lint-imports is installed in .venv; use the venv python to invoke it.
+        run: .venv/bin/lint-imports
 
       - name: Run tests
         run: make test
