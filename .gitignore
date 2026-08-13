@@ -1,6 +1,9 @@
 # Anvil-managed entries — do not edit manually.
 # Setup-repo appends missing entries below this marker.
 
+# Setup-repo appends missing entries below this marker.
+plan/task/
+
 .env
 anvil.local.yaml
 zoo-code-settings.json
