@@ -1,0 +1,41 @@
+# Step 3 — Two conflicting tools, one GPU, on-demand start.
+# Two SEPARATE applications (not two deployments of one app).
+#
+# Each uses:
+#   - num_gpus: 1
+#   - min_replicas: 0 (on-demand)
+#   - max_replicas: 1
+#   - downscale_to_zero_delay_s: 60
+#
+# autoscaling_config and ray_actor_options MUST be inside the
+# deployments list; ServeApplicationSchema ignores them at the
+# application level.
+
+applications:
+  - name: tool_torch
+    import_path: step3_gpu_swap:application_torch
+    deployments:
+      - name: ToolTorch
+        ray_actor_options:
+          num_gpus: 1
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60
+          upscale_delay_s: 5
+          metrics_interval_s: 5
+          look_back_period_s: 15
+
+  - name: tool_tf
+    import_path: step3_gpu_swap:application_tf
+    deployments:
+      - name: ToolTf
+        ray_actor_options:
+          num_gpus: 1
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60
+          upscale_delay_s: 5
+          metrics_interval_s: 5
+          look_back_period_s: 15

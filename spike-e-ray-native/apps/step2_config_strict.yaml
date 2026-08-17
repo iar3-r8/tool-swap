@@ -1,0 +1,17 @@
+# Step 2 — Strict variant: imports torch at function scope.
+# This config is applied second, after the generic builder config.
+# If the generic builder works and the strict one fails, we know
+# the builder runs outside any tool image (in the controller env).
+#
+# NOTE: image_uri is omitted because podman is broken in this dev container.
+# The strict variant tests whether torch import fails in the controller env.
+
+applications:
+  - name: step2_torch_strict
+    import_path: step2_builder:build_strict
+    route_prefix: /strict
+    args:
+      weights_path: /opt/spike/weights/ckpt.bin
+      framework: torch
+      vram_mb: 4096
+      image_uri: ""

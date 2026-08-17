@@ -1,0 +1,25 @@
+# Step 5 — Mechanism B: Declarative config re-apply.
+# Same as mechanism A but without external_scaler_enabled.
+# Replicas are controlled by sending the full config with flipped counts.
+# This is applied dynamically by step5_alternate.py, not via serve deploy.
+
+applications:
+  - name: step5_torch
+    import_path: step3_gpu_swap:application_torch
+    ray_actor_options:
+      num_replicas: 1
+      num_gpus: 1
+    autoscaling_config:
+      min_replicas: 1
+      max_replicas: 1
+      downscale_to_zero_delay_s: 60
+
+  - name: step5_tf
+    import_path: step3_gpu_swap:application_tf
+    ray_actor_options:
+      num_replicas: 0
+      num_gpus: 1
+    autoscaling_config:
+      min_replicas: 0
+      max_replicas: 0
+      downscale_to_zero_delay_s: 60

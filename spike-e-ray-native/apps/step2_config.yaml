@@ -1,0 +1,30 @@
+# Step 2 — App builder with baked-in weights.
+# Two applications, same import_path, different args.
+# Ray's own documented multi-model pattern.
+#
+# Each application has a unique route_prefix so the ServeDeploySchema
+# uniqueness validator does not reject the pair.
+#
+# NOTE: image_uri is omitted because podman is broken in this dev container
+# (cannot clone: Operation not permitted). This config tests the builder
+# pattern only — not image isolation. Image isolation must be tested on
+# a host where podman works (e.g. DGX).
+
+applications:
+  - name: step2_torch
+    import_path: step2_builder:build
+    route_prefix: /torch
+    args:
+      weights_path: /opt/spike/weights/ckpt.bin
+      framework: torch
+      vram_mb: 4096
+      image_uri: ""
+
+  - name: step2_tf
+    import_path: step2_builder:build
+    route_prefix: /tf
+    args:
+      weights_path: /opt/spike/weights/ckpt.bin
+      framework: tensorflow
+      vram_mb: 4096
+      image_uri: ""

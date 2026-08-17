@@ -1,0 +1,23 @@
+# Step 1 — Per-deployment image_uri, expressed as a Serve config YAML.
+#
+# image_uri must go inside ray_actor_options.runtime_env, because
+# DeploymentSchema does not expose image_uri at the top level — it
+# lives in RayActorOptionsSchema.runtime_env (schema.py:227).
+#
+# If only the application-level image_uri works, that means one tool
+# = one application mapping — record and continue per the protocol.
+
+applications:
+  - name: step1_probe
+    import_path: step1_two_deployments:application
+    deployments:
+      - name: TorchProbe
+        ray_actor_options:
+          num_gpus: 0
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
+      - name: TfProbe
+        ray_actor_options:
+          num_gpus: 0
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"

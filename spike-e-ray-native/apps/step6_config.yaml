@@ -1,0 +1,29 @@
+# Step 6 — Restart and recovery.
+# Same config as step 3 — we deploy it, kill the head node, then
+# restart and see if it recovers.
+#
+# deployment-level keys (num_gpus, autoscaling_config) MUST be
+# inside the deployments list.
+
+applications:
+  - name: tool_torch
+    import_path: step3_gpu_swap:application_torch
+    deployments:
+      - name: ToolTorch
+        ray_actor_options:
+          num_gpus: 1
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60
+
+  - name: tool_tf
+    import_path: step3_gpu_swap:application_tf
+    deployments:
+      - name: ToolTf
+        ray_actor_options:
+          num_gpus: 1
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60

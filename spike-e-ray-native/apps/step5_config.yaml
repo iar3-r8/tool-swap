@@ -1,0 +1,33 @@
+# Step 5 — Preemption via replica counts.
+#
+# MECHANISM A: External scaling API
+#   - external_scaler_enabled: true on each deployment
+#   - NO autoscaling_config (mutual exclusion per Ray docs)
+#   - Scaled externally via POST /api/.../scale
+#   - Alpha feature
+#
+# deployment-level keys (num_replicas, ray_actor_options, etc.)
+# MUST be inside the deployments list.
+
+applications:
+  - name: step5_torch
+    import_path: step5_config:application_torch
+    deployments:
+      - name: ToolTorch
+        num_replicas: 1
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
+    external_scaler_enabled: true
+
+  - name: step5_tf
+    import_path: step5_config:application_tf
+    deployments:
+      - name: ToolTf
+        num_replicas: 1
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"
+    external_scaler_enabled: true
