@@ -1,15 +1,20 @@
-"""YAML loader for M1 behaviour 6: read, interpolate, parse, track source lines.
+"""YAML loader for M1 behaviours 6 and 7: read, interpolate, parse, track lines.
 
 This module is the YAML reading step of the M1 configuration pipeline.  It
 reads one config file (UTF-8, BOM and CRLF tolerant), runs behaviour 5's
-``interpolate`` on the raw text with an injected environment (``env=None``
-means the empty mapping; the ambient process environment is never read),
-parses the result with a ``SafeLoader`` subclass that records the source line
-of every mapping key in a parallel structure kept OUT of the parsed data,
-and returns a ``LoadedConfig``.  Every fatal problem (file missing, YAML
-syntax error, duplicate key, empty file, non-mapping root, and behaviour 5's
-missing-variable error) is raised as a ``ConfigError`` carrying a
-``ConfigReport`` with exactly one ERROR diagnostic.
+``interpolate`` on the raw text with an injected environment, parses the
+result with a ``SafeLoader`` subclass that records the source line of every
+mapping key in a parallel structure kept OUT of the parsed data, and returns
+a ``LoadedConfig``.  For interpolation, the injected ``env`` mapping is
+merged over a ``.env`` file (behaviour 7): a ``.env`` next to the config is
+auto-discovered unless ``env_file`` names a replacement file; the merged
+mapping is ``{**env_from_dotenv, **env}`` so the (injected) process
+environment wins.  ``env=None`` means the empty mapping and the ambient
+process environment is never read.  Every fatal problem (file missing, YAML
+syntax error, duplicate key, empty file, non-mapping root, behaviour 5's
+missing-variable error, a missing explicit env file, and an unparseable
+``.env`` line) is raised as a ``ConfigError`` carrying a ``ConfigReport``
+with exactly one ERROR diagnostic.
 """
 
 from __future__ import annotations
@@ -36,6 +41,8 @@ _CODE_SYNTAX = "TSWAP-C001"
 _CODE_DUPLICATE = "TSWAP-C002"
 _CODE_EMPTY = "TSWAP-C003"
 _CODE_NON_MAPPING = "TSWAP-C004"
+_CODE_ENV_FILE_MISSING = "TSWAP-C011"
+_CODE_ENV_PARSE = "TSWAP-C012"
 
 
 class _DuplicateKeyError(Exception):
@@ -115,6 +122,127 @@ def _syntax_message(text: str, mark: Any) -> str:
         "YAML syntax error near line "
         f"{mark.line + 1}, column {mark.column + 1}:\n{offending}\n{caret}"
     )
+
+
+class _EnvLineError(Exception):
+    """Internal signal: a ``.env`` line is not a valid ``KEY=value`` pair.
+
+    Attributes:
+        line: 1-based line number of the offending line.
+        content: The stripped offending line, for the message.
+    """
+
+    def __init__(self, line: int, content: str) -> None:
+        """Store the line number and content."""
+        super().__init__(f"unparseable .env line {line}")
+        self.line = line
+        self.content = content
+
+
+def _unquote(value: str) -> str:
+    """Strip one matching pair of surrounding single or double quotes."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a ``.env`` file into a mapping without touching ``os.environ``.
+
+    The supported format is the python-dotenv-compatible subset pinned by
+    the tests: ``KEY=value`` lines, ``export `` prefixes, ``#`` comments,
+    blank lines, and single- or double-quoted values (quotes stripped, a
+    value containing ``=`` survives intact).  Duplicate keys are last-wins,
+    matching dotenv semantics.
+
+    Args:
+        path: Path of the ``.env`` file (already checked to exist).
+
+    Returns:
+        The parsed ``KEY -> value`` mapping.
+
+    Raises:
+        _EnvLineError: On a non-empty, non-comment line that is not a
+            valid ``KEY=value`` pair, carrying the 1-based line number.
+    """
+    text = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    values: dict[str, str] = {}
+    for line_no, raw_line in enumerate(text.split("\n"), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise _EnvLineError(line_no, line)
+        values[key] = _unquote(value.strip())
+    return values
+
+
+def _env_file_missing_error(env_file: Path) -> ConfigError:
+    """Build the C011 ``ConfigError`` for a missing explicit env file."""
+    resolved = str(env_file.resolve())
+    error = Diagnostic(
+        code=_CODE_ENV_FILE_MISSING,
+        severity=Severity.ERROR,
+        message=f"env file not found: {resolved}",
+        location=Location(file=resolved),
+        remedy=(
+            "create the file, or drop --env-file to auto-discover .env "
+            "next to the config"
+        ),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _env_line_error(env_file: Path, err: _EnvLineError) -> ConfigError:
+    """Build the C012 ``ConfigError`` for an unparseable ``.env`` line."""
+    resolved = str(env_file.resolve())
+    error = Diagnostic(
+        code=_CODE_ENV_PARSE,
+        severity=Severity.ERROR,
+        message=f"unparseable .env line {err.line}: {err.content!r}",
+        location=Location(file=resolved, line=err.line),
+        remedy=("write the line as KEY=value, or prefix it with '#' to comment it out"),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _dotenv_values(path: Path, env_file: Path | None) -> dict[str, str]:
+    """Locate and parse the ``.env`` file for interpolation.
+
+    With ``env_file`` given, that file is used INSTEAD of the
+    auto-discovered ``.env`` (the auto-discovered one is not also read); a
+    missing explicit file is C011.  With ``env_file=None``,
+    ``path.parent / ".env"`` is used when present; a missing ``.env`` is
+    not an error.  The ambient process environment is never read.
+
+    Args:
+        path: Path of the config file, for auto-discovery.
+        env_file: Explicit env file, or ``None`` for auto-discovery.
+
+    Returns:
+        The parsed mapping; ``{}`` when no env file applies.
+
+    Raises:
+        ConfigError: C011 for a missing explicit file; C012 for an
+            unparseable line (the first one, in file order).
+    """
+    if env_file is not None:
+        if not env_file.is_file():
+            raise _env_file_missing_error(env_file)
+        target = env_file
+    else:
+        candidate = path.parent / ".env"
+        if not candidate.is_file():
+            return {}
+        target = candidate
+    try:
+        return _parse_env_file(target)
+    except _EnvLineError as err:
+        raise _env_line_error(target, err) from None
 
 
 @dataclass(frozen=True)
@@ -200,22 +328,34 @@ def load_config(
     path: Path,
     *,
     env: Mapping[str, str] | None = None,
+    env_file: Path | None = None,
 ) -> LoadedConfig:
     """Read, interpolate, and parse the YAML config at ``path``.
 
     Interpolation (behaviour 5) runs on the raw text BEFORE YAML parsing
-    with the injected ``env`` mapping; ``env=None`` means the empty mapping
-    and the ambient process environment is never read.  Parsing uses a
+    with a merged environment: a ``.env`` file (behaviour 7) is parsed and
+    the injected ``env`` mapping is merged over it, so a variable set in
+    both resolves to ``env``'s value.  With ``env_file=None`` the ``.env``
+    next to the config (``path.parent / ".env"``) is used when present and
+    a missing ``.env`` is not an error; with ``env_file`` given, that file
+    is used INSTEAD of the auto-discovered one and a missing file is C011.
+    ``env=None`` means the empty mapping and the ambient process
+    environment is never read.  ``.env`` values are interpolation-only:
+    they never appear in the returned data or diagnostics.  Parsing uses a
     ``SafeLoader`` subclass that records each mapping key's source line in
     a parallel structure, so the returned ``data`` stays clean for the
     schema layer.  Every fatal problem raises ``ConfigError`` carrying a
     ``ConfigReport`` with exactly one ERROR diagnostic: C000 missing file,
     C001 YAML syntax error, C002 duplicate key, C003 empty file, C004
-    non-mapping root, or C010 (behaviour 5) missing variable.
+    non-mapping root, C010 (behaviour 5) missing variable, C011 missing
+    explicit env file, or C012 unparseable ``.env`` line.
 
     Args:
         path: Path of the config file (echoed back unresolved).
-        env: Environment mapping for interpolation; keyword-only.
+        env: Environment mapping for interpolation; keyword-only; wins
+            over any ``.env`` value for the same variable.
+        env_file: Explicit env file, replacing auto-discovery;
+            keyword-only.
 
     Returns:
         The loaded config: parsed top-level mapping, path echo, diagnostics
@@ -240,7 +380,11 @@ def load_config(
     # stable regardless of the file's line endings (plan line 133).
     raw = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
 
-    env_mapping: Mapping[str, str] = env if env is not None else {}
+    dotenv_env = _dotenv_values(path, env_file)
+    env_mapping: Mapping[str, str] = {
+        **dotenv_env,
+        **(env if env is not None else {}),
+    }
     interpolated = interpolate(raw, env_mapping, file=resolved)
     if interpolated.errors:
         raise ConfigError(ConfigReport(tuple(interpolated.errors)))
