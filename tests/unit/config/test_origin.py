@@ -74,8 +74,8 @@ Conventions: pytest, AAA pattern, no ``warnings.warn`` (pyproject sets
 from __future__ import annotations
 
 import pytest
-from tool_swap.config.origin import Origin, OriginLevel, OriginMap, ResolvedValue
 
+from tool_swap.config.origin import Origin, OriginLevel, OriginMap, ResolvedValue
 
 # ---------------------------------------------------------------------------
 # OriginLevel
