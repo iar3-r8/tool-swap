@@ -89,7 +89,7 @@ import pytest
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS
 from tool_swap.config.errors import Diagnostic, Severity
 from tool_swap.config.origin import Origin, OriginLevel, OriginMap
-from tool_swap.config.resolver import ResolvedTool, resolve_tool
+from tool_swap.config.resolver import resolve_tool
 
 # ---------------------------------------------------------------------------
 # Pinned public API shape
