@@ -36,7 +36,7 @@ class Diagnostic:
 
 | Range | Owner |
 |---|---|
-| `TSWAP-C0xx` | reading/parsing the file (not found, YAML syntax, unresolvable env var) |
+| `TSWAP-C0xx` | reading/parsing the file (not found, YAML syntax, unresolvable env var, `path:` include errors) |
 | `TSWAP-C1xx` | schema shape (unknown key, wrong type, missing required) |
 | `TSWAP-C2xx` | naming and references (name charset, duplicates, unknown group) |
 | `TSWAP-C3xx` | descriptions (D19) |

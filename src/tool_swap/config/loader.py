@@ -1,4 +1,4 @@
-"""YAML loader for M1 behaviours 6 and 7: read, interpolate, parse, track lines.
+"""YAML loader for M1 behaviours 6, 7 and 8: read, interpolate, parse, include.
 
 This module is the YAML reading step of the M1 configuration pipeline.  It
 reads one config file (UTF-8, BOM and CRLF tolerant), runs behaviour 5's
@@ -12,9 +12,29 @@ mapping is ``{**env_from_dotenv, **env}`` so the (injected) process
 environment wins.  ``env=None`` means the empty mapping and the ambient
 process environment is never read.  Every fatal problem (file missing, YAML
 syntax error, duplicate key, empty file, non-mapping root, behaviour 5's
-missing-variable error, a missing explicit env file, and an unparseable
-``.env`` line) is raised as a ``ConfigError`` carrying a ``ConfigReport``
-with exactly one ERROR diagnostic.
+missing-variable error, a missing explicit env file, an unparseable
+``.env`` line, and behaviour 8's include errors) is raised as a
+``ConfigError`` carrying a ``ConfigReport`` with exactly one ERROR
+diagnostic.
+
+Behaviour 8 (``path:`` inclusion): a ``tools.<name>:`` entry whose
+``path:`` names a directory holding a ``tool.yaml`` includes that file as
+the tool's mid-precedence layer, exposed via ``LoadedConfig.tool_yaml``
+(the returned path's ``.parent`` is the directory relative paths inside
+``tool.yaml`` resolve against, behaviour 10).  A relative ``path:``
+resolves against the ROOT CONFIG FILE's directory (never the CWD), ``~``
+expands, absolute paths are honoured as-is, and a directory that does not
+exist at all is skipped silently (backward compatibility with the
+behaviours 6-7 fixtures).  The loader-level include checks are
+``TSWAP-C005`` (directory exists but has no ``tool.yaml``),
+``TSWAP-C006`` (``path:`` is a file, not a directory), ``TSWAP-C007`` (the
+included ``tool.yaml`` itself contains ``path:``; one level only, no
+recursion), ``TSWAP-C201`` (``name:`` in ``tool.yaml`` differs from the
+``tools:`` map key) and ``TSWAP-C202`` (two entries share a ``path:``; a
+WARNING, not fatal).  The loader does not schema-validate ``tool.yaml``
+content (that is behaviour 4's layer); it only records the tool.yaml's
+resolved path via the accessor so a validator can locate its diagnostics
+there.
 """
 
 from __future__ import annotations
@@ -41,8 +61,13 @@ _CODE_SYNTAX = "TSWAP-C001"
 _CODE_DUPLICATE = "TSWAP-C002"
 _CODE_EMPTY = "TSWAP-C003"
 _CODE_NON_MAPPING = "TSWAP-C004"
+_CODE_MISSING_TOOL_YAML = "TSWAP-C005"
+_CODE_PATH_IS_FILE = "TSWAP-C006"
+_CODE_RECURSION = "TSWAP-C007"
 _CODE_ENV_FILE_MISSING = "TSWAP-C011"
 _CODE_ENV_PARSE = "TSWAP-C012"
+_CODE_NAME_MISMATCH = "TSWAP-C201"
+_CODE_SHARED_PATH = "TSWAP-C202"
 
 
 class _DuplicateKeyError(Exception):
@@ -245,21 +270,226 @@ def _dotenv_values(path: Path, env_file: Path | None) -> dict[str, str]:
         raise _env_line_error(target, err) from None
 
 
+# ---------------------------------------------------------------------------
+# Behaviour 8 — ``path:`` inclusion of ``tool.yaml``
+# ---------------------------------------------------------------------------
+
+
+def _resolve_tool_path(value: str, base_dir: Path) -> Path:
+    """Resolve a ``path:`` value against the root config file's directory.
+
+    ``~`` is expanded on the value BEFORE joining, because a tilde
+    embedded in an already-joined path is not a leading one and
+    ``expanduser`` would leave it literal; a leading tilde expands to an
+    absolute path, and joining an absolute right-hand path returns that
+    path as-is, which also honours absolute ``path:`` values.
+
+    Args:
+        value: The ``path:`` value from the config.
+        base_dir: The root config file's directory (never the CWD).
+
+    Returns:
+        The resolved absolute path; relative values resolve against
+        ``base_dir``, ``~`` expands via ``expanduser``, absolute values
+        are honoured as-is.
+    """
+    return (base_dir / Path(value).expanduser()).resolve()
+
+
+def _missing_tool_yaml_error(tool_dir: Path) -> ConfigError:
+    """Build the C005 ``ConfigError``: the directory exists, no tool.yaml."""
+    resolved = str(tool_dir.resolve())
+    error = Diagnostic(
+        code=_CODE_MISSING_TOOL_YAML,
+        severity=Severity.ERROR,
+        message=f"tool directory {resolved} exists but has no tool.yaml",
+        location=Location(file=resolved),
+        remedy=(
+            "create tool.yaml in that directory, or drop the 'path:' key "
+            "and configure the tool inline"
+        ),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _path_is_file_error(target: Path) -> ConfigError:
+    """Build the C006 ``ConfigError``: ``path:`` points at a file."""
+    resolved = str(target.resolve())
+    error = Diagnostic(
+        code=_CODE_PATH_IS_FILE,
+        severity=Severity.ERROR,
+        message=f"tool path {resolved} is a file, not a directory",
+        location=Location(file=resolved),
+        remedy=(
+            "point 'path:' at the directory that holds tool.yaml "
+            "(a tool directory, e.g. ./tools/t)"
+        ),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _recursion_error(tool_yaml: Path) -> ConfigError:
+    """Build the C007 ``ConfigError``: tool.yaml contains a ``path:`` key."""
+    resolved = str(tool_yaml.resolve())
+    error = Diagnostic(
+        code=_CODE_RECURSION,
+        severity=Severity.ERROR,
+        message=(
+            "included tool.yaml contains a 'path:' key; include recursion "
+            "is not supported (one level only)"
+        ),
+        location=Location(file=resolved),
+        remedy=(
+            "remove the 'path:' key from tool.yaml; nested includes are not allowed"
+        ),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _name_mismatch_error(
+    map_key: str, declared_name: str, tool_yaml: Path
+) -> ConfigError:
+    """Build the C201 ``ConfigError``: tool.yaml ``name:`` != map key."""
+    resolved = str(tool_yaml.resolve())
+    error = Diagnostic(
+        code=_CODE_NAME_MISMATCH,
+        severity=Severity.ERROR,
+        message=(
+            f"tool.yaml declares name '{declared_name}' but the tools: "
+            f"map key is '{map_key}'"
+        ),
+        location=Location(file=resolved),
+        remedy=(
+            "make the 'name:' in tool.yaml equal the tools: map key, or "
+            "remove the 'name:' key if this tool.yaml is shared"
+        ),
+    )
+    return ConfigError(ConfigReport((error,)))
+
+
+def _shared_path_warning(keys: tuple[str, ...], config_file: str) -> Diagnostic:
+    """Build the C202 WARNING: several entries use the same ``path:``."""
+    names = " and ".join(repr(key) for key in keys)
+    return Diagnostic(
+        code=_CODE_SHARED_PATH,
+        severity=Severity.WARNING,
+        message=f"tools {names} use the same 'path:' value",
+        location=Location(file=config_file),
+        remedy=(
+            "give each tool its own directory, unless the entries "
+            "deliberately differ only by params:"
+        ),
+    )
+
+
+def _read_tool_yaml(tool_yaml: Path) -> Any:
+    """Read and parse an included ``tool.yaml`` (no interpolation).
+
+    Args:
+        tool_yaml: The tool.yaml file (already checked to exist).
+
+    Returns:
+        The parsed YAML content, whatever its type (the caller handles
+        non-mapping content; the loader does not schema-validate).
+
+    Raises:
+        ConfigError: C001, with the location in the tool.yaml file, for a
+            YAML syntax error.
+    """
+    resolved = str(tool_yaml.resolve())
+    raw_text = tool_yaml.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    try:
+        return yaml.safe_load(raw_text)
+    except yaml.error.YAMLError as err:
+        error = Diagnostic(
+            code=_CODE_SYNTAX,
+            severity=Severity.ERROR,
+            message=f"YAML syntax error in {resolved}: {err}",
+            location=Location(file=resolved),
+            remedy="fix the YAML syntax in the included tool.yaml",
+        )
+        raise ConfigError(ConfigReport((error,))) from None
+
+
+def _load_includes(
+    data: dict[str, Any], base_dir: Path, config_file: str
+) -> tuple[dict[str, tuple[Path, dict[str, Any]]], list[Diagnostic]]:
+    """Process every ``tools.<name>:`` entry's ``path:`` (behaviour 8).
+
+    Args:
+        data: The parsed root mapping (not mutated).
+        base_dir: The root config file's directory, the anchor for
+            relative ``path:`` values (CWD-independent).
+        config_file: The resolved root config file path, the C202
+            warning's location.
+
+    Returns:
+        A ``(layers, diagnostics)`` pair: ``layers`` maps each tool name
+        whose ``path:`` was successfully included to
+        ``(resolved tool.yaml path, parsed tool.yaml mapping)``; a tool
+        with no ``path:`` key, or whose resolved directory does not
+        exist, gets no layer (the backward-compat skip); ``diagnostics``
+        holds the non-fatal C202 warning(s).
+
+    Raises:
+        ConfigError: C001 (tool.yaml YAML syntax error), C005 (directory
+            without tool.yaml), C006 (path is a file), C007 (tool.yaml
+            contains ``path:``), or C201 (``name:`` mismatch).  A
+            non-mapping tool entry is skipped (its shape is the schema
+            layer's concern).
+    """
+    tools = data.get("tools")
+    layers: dict[str, tuple[Path, dict[str, Any]]] = {}
+    warnings: list[Diagnostic] = []
+    if not isinstance(tools, dict):
+        return layers, warnings
+    # Resolved path -> the tool keys using it, in map order (for C202).
+    seen_paths: dict[str, list[str]] = {}
+    for name, entry in tools.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        target = _resolve_tool_path(entry["path"], base_dir)
+        if not target.exists():
+            continue  # backward-compat skip; a later behaviour catches it
+        if not target.is_dir():
+            raise _path_is_file_error(target)
+        tool_yaml = target / "tool.yaml"
+        if not tool_yaml.is_file():
+            raise _missing_tool_yaml_error(target)
+        content: Any = _read_tool_yaml(tool_yaml)
+        if not isinstance(content, dict):
+            content = {}
+        if "path" in content:
+            raise _recursion_error(tool_yaml)
+        declared = content.get("name")
+        if declared is not None and declared != name:
+            raise _name_mismatch_error(name, str(declared), tool_yaml)
+        layers[str(name)] = (tool_yaml.resolve(), content)
+        seen_paths.setdefault(str(target), []).append(str(name))
+    for keys in seen_paths.values():
+        if len(keys) > 1:
+            warnings.append(_shared_path_warning(tuple(keys), config_file))
+    return layers, warnings
+
+
 @dataclass(frozen=True)
 class LoadedConfig:
-    """A successfully loaded config: raw data, path echo, and line info.
+    """A successfully loaded config: raw data, path echo, line info, layers.
 
     Attributes:
-        data: The parsed top-level mapping; line info is kept OUT of it.
+        data: The parsed top-level mapping; line info and included
+            ``tool.yaml`` layers (behaviour 8) are kept OUT of it.
         path: The path exactly as passed to ``load_config`` (not resolved).
         diagnostics: Non-fatal notes; ``[]`` on a clean load.
         _line_map: Dotted YAML path -> 1-based source line, for ``line_for``.
+        _tool_layers: Tool name -> included tool.yaml layer (behaviour 8).
     """
 
     data: dict[str, Any]
     path: Path
     diagnostics: list[Diagnostic]
     _line_map: dict[str, int] = field(default_factory=dict)
+    _tool_layers: dict[str, tuple[Path, dict[str, Any]]] = field(default_factory=dict)
 
     def line_for(self, yaml_path: str) -> int | None:
         """Return the 1-based source line of the key named by ``yaml_path``.
@@ -280,6 +510,28 @@ class LoadedConfig:
                 return None
             current = current[segment]
         return self._line_map.get(yaml_path)
+
+    def tool_yaml(self, name: str) -> tuple[Path, dict[str, Any]] | None:
+        """Return the included ``tool.yaml`` layer for tool ``name``.
+
+        The first element is the resolved absolute path of the included
+        ``tool.yaml``; its ``.parent`` is the directory that relative
+        paths inside ``tool.yaml`` (``handler.py:Cls``,
+        ``requirements.txt``) resolve against (behaviour 10).  The
+        second is the parsed ``tool.yaml`` mapping, as-is.  ``data`` is
+        NOT polluted: the layer is exposed only through this accessor.
+
+        Args:
+            name: The ``tools:`` map key of the tool.
+
+        Returns:
+            ``(resolved tool.yaml path, parsed tool.yaml mapping)`` for a
+            tool whose ``path:`` was included, or ``None`` when the tool
+            has no ``path:`` key, its resolved directory does not exist
+            (the backward-compat skip), or ``name`` is not a key of
+            ``tools:``.
+        """
+        return self._tool_layers.get(name)
 
 
 class LineTrackingLoader(yaml.SafeLoader):
@@ -344,11 +596,18 @@ def load_config(
     they never appear in the returned data or diagnostics.  Parsing uses a
     ``SafeLoader`` subclass that records each mapping key's source line in
     a parallel structure, so the returned ``data`` stays clean for the
-    schema layer.  Every fatal problem raises ``ConfigError`` carrying a
-    ``ConfigReport`` with exactly one ERROR diagnostic: C000 missing file,
-    C001 YAML syntax error, C002 duplicate key, C003 empty file, C004
-    non-mapping root, C010 (behaviour 5) missing variable, C011 missing
-    explicit env file, or C012 unparseable ``.env`` line.
+    schema layer.  Behaviour 8's ``path:`` inclusion then loads each
+    tool's ``tool.yaml`` (kept OUT of ``data``, exposed via
+    ``LoadedConfig.tool_yaml``); a missing target directory is skipped
+    silently (backward compatibility).  Every fatal problem raises
+    ``ConfigError`` carrying a ``ConfigReport`` with exactly one ERROR
+    diagnostic: C000 missing file, C001 YAML syntax error, C002 duplicate
+    key, C003 empty file, C004 non-mapping root, C005 (behaviour 8)
+    directory without tool.yaml, C006 (behaviour 8) path is a file, C007
+    (behaviour 8) include recursion, C010 (behaviour 5) missing variable,
+    C011 missing explicit env file, C012 unparseable ``.env`` line, or
+    C201 (behaviour 8) tool.yaml name mismatch.  The C202 shared-path note
+    is a WARNING in the returned diagnostics, not fatal.
 
     Args:
         path: Path of the config file (echoed back unresolved).
@@ -452,4 +711,12 @@ def load_config(
 
     lines: dict[str, int] = {}
     _walk_lines(loader.root_node, (), loader.line_of, lines)
-    return LoadedConfig(data=data, path=path, diagnostics=[], _line_map=lines)
+
+    layers, diagnostics = _load_includes(data, path.parent, resolved)
+    return LoadedConfig(
+        data=data,
+        path=path,
+        diagnostics=diagnostics,
+        _line_map=lines,
+        _tool_layers=layers,
+    )
