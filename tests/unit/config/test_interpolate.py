@@ -63,9 +63,9 @@ from __future__ import annotations
 
 import pytest
 import yaml
-from tool_swap.config.interpolate import Interpolated, interpolate
 
 from tool_swap.config.errors import Severity
+from tool_swap.config.interpolate import Interpolated, interpolate
 
 # Pinned default location.file when no file is passed (text-level API).
 _DEFAULT_FILE = "<text>"
