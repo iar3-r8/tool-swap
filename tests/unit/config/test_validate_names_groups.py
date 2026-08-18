@@ -88,6 +88,27 @@ _BEHAVIOUR_12_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C223",
 )
 
+#: Every builtin rule id landed so far, in code order — the six
+#: behaviour-12 ids plus behaviour 13's four (C300-C303; plan line 437:
+#: "appended to ``BUILTIN_RULES`` in code order").  Mirrors
+#: ``_EXPECTED_BUILTIN_IDS`` in ``test_validate_registry_builtins.py``
+#: (behaviour 11a): BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER — add
+#: each behaviour's codes here, in code order, when that behaviour's
+#: rules land in ``BUILTIN_RULES``, so the next extension is one place.
+_LANDED_BUILTIN_IDS: Final[tuple[str, ...]] = (
+    "TSWAP-C210",
+    "TSWAP-C211",
+    "TSWAP-C220",
+    "TSWAP-C221",
+    "TSWAP-C222",
+    "TSWAP-C223",
+    # Behaviour 13 (D19 mandatory descriptions) extends the set here.
+    "TSWAP-C300",
+    "TSWAP-C301",
+    "TSWAP-C302",
+    "TSWAP-C303",
+)
+
 #: The pinned C210 reason phrase (plan line 214).
 _URLS_REASON: Final[str] = "used in URLs, container names and log directory names"
 
@@ -246,35 +267,39 @@ def test_effective_groups_returns_groups_block_unchanged_and_deep_copied() -> No
 # ---------------------------------------------------------------------------
 
 
-def test_register_builtin_rules_registers_the_six_behaviour_12_ids() -> None:
-    """The central entry point registers the six behaviour-12 rules.
+def test_register_builtin_rules_registers_every_builtin_rule() -> None:
+    """The central entry point registers every landed builtin rule, none dropped.
 
-    Proves the same thing the retired import-time reload test reached for —
-    the behaviour-12 rules are reachable from a central entry point and
-    none is dropped — without module reloading and with no dependence on
-    test collection order.  The reload form was superseded by the
-    "Registration mechanism — DECIDED" (2026-08-18) mechanism: the rules
-    are module-level constants aggregated in ``BUILTIN_RULES`` and
-    registered by the explicit, idempotent ``register_builtin_rules()``.
+    This proves the entry point registers EVERY rule that has landed in
+    ``BUILTIN_RULES`` — the six behaviour-12 rules plus behaviour 13's four
+    C3xx rules (plan line 437: "appended to ``BUILTIN_RULES`` in code
+    order") — in code order, so no rule is silently dropped.  The durable
+    intent is "every landed builtin, none dropped"; the specific count was
+    behaviour-snapshot-specific and is extended per behaviour.  It proves
+    the same thing the retired import-time reload test reached for — the
+    builtin rules are reachable from a central entry point — without
+    module reloading and with no dependence on test collection order.  The
+    reload form was superseded by the "Registration mechanism — DECIDED"
+    (2026-08-18) mechanism: the rules are module-level constants aggregated
+    in ``BUILTIN_RULES`` and registered by the explicit, idempotent
+    ``register_builtin_rules()``.
 
-    Arrangement: the registry cleared by the autouse fixture, with none of
-    the six ids registered.
+    The expected list is the module-top constant ``_LANDED_BUILTIN_IDS``
+    (mirroring ``_EXPECTED_BUILTIN_IDS`` in
+    ``test_validate_registry_builtins.py``); behaviours 14-19 extend that
+    constant as their rules land, so the next extension is one place.
+
+    Arrangement: the registry cleared by the autouse fixture, with no
+    builtin ids registered.
     Action: call ``register_builtin_rules()``.
-    Assertion: ``registered_rule_ids()`` equals exactly the six
-    behaviour-12 ids.
+    Assertion: ``registered_rule_ids()`` equals the full landed set in
+    code order.
     """
     assert registered_rule_ids() == []
 
     register_builtin_rules()
 
-    assert registered_rule_ids() == [
-        "TSWAP-C210",
-        "TSWAP-C211",
-        "TSWAP-C220",
-        "TSWAP-C221",
-        "TSWAP-C222",
-        "TSWAP-C223",
-    ]
+    assert registered_rule_ids() == list(_LANDED_BUILTIN_IDS)
 
 
 def test_behaviour_12_rule_objects_carry_expected_ids_and_severities() -> None:
