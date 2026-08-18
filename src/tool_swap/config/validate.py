@@ -23,13 +23,21 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final
 
+from tool_swap import __version__
 from tool_swap.config.errors import (
     ConfigReport,
     Diagnostic,
     Location,
     Severity,
 )
-from tool_swap.config.resolver import ResolvedTool
+
+# ``RESERVED_KEYS`` is defined in the resolver (behaviour 14, block 2) and
+# re-exported here as part of this module's pinned public API (the
+# behaviour-14 test file imports it from ``validate``).
+from tool_swap.config.resolver import (  # noqa: F401  (re-export)
+    RESERVED_KEYS,
+    ResolvedTool,
+)
 from tool_swap.config.schema import GroupConfig
 from tool_swap.config.suggest import nearest_alternative
 
@@ -908,6 +916,352 @@ ALLOW_MISSING_DESCRIPTIONS_BANNER: Final[str] = (
     "prototyping and is never permitted in CI"
 )
 
+# ---------------------------------------------------------------------------
+# Behaviour 14 — withdrawn and reserved keys (§6 rules 4, 1c)
+# ---------------------------------------------------------------------------
+
+#: The pinned ADR-0004 citation — path AND title, verbatim (plan block 7),
+#: verified against the ADR file's own ``# `` heading.
+_ADR_0004_CITATION: Final[str] = (
+    "plan/adr/0004-hard-stop-only-in-v1.md (ADR-0004 — v1 reclaims "
+    "resources by stopping containers; soft unload is deferred)"
+)
+
+#: The pinned ADR-0005 citation — path AND title, verbatim (plan block 7),
+#: verified against the ADR file's own ``# `` heading.  Both C403 and C404
+#: cite this same string so the two consumers cannot drift.
+_ADR_0005_CITATION: Final[str] = (
+    "plan/adr/0005-one-uniform-batched-calling-convention.md "
+    "(ADR-0005 — One uniform calling convention: every handler takes "
+    "and returns a list)"
+)
+
+#: The valid ``runtime.server`` values (TSWAP-C402 lists them).
+_VALID_RUNTIME_SERVERS: Final[tuple[str, ...]] = ("bentoml", "native")
+
+#: The only implemented ``runtime.server`` backend (TSWAP-C401).
+_IMPLEMENTED_RUNTIME_SERVER: Final[str] = "bentoml"
+
+
+def _reserved_key_path(tool_key: str, key: str, layer: str) -> str:
+    """The ``yaml_path`` a reserved-key finding carries (plan block 6).
+
+    The ``defaults:`` layer resolves to ``defaults.<key>``; the inline
+    and ``tool.yaml`` layers both resolve to ``tools.<key>.<key>`` (the
+    line map belongs to the root config, so a ``tool.yaml``-authored key
+    has no line here, and the message names its layer in words).
+
+    Args:
+        tool_key: the ``tools:`` map key of the tool.
+        key: the reserved key (``soft_ttl`` / ``scalar_inputs`` /
+            ``max_batch_bytes``).
+        layer: the layer label from the carrier pair.
+
+    Returns:
+        The dotted YAML path for the finding's location.
+    """
+    if layer == "defaults":
+        return f"defaults.{key}"
+    return f"tools.{tool_key}.{key}"
+
+
+def _reserved_key_layer_phrase(layer: str) -> str:
+    """How a reserved-key message names the layer the key was written in.
+
+    A ``tool.yaml``-authored key has no line in the root config's map,
+    so the message must name the layer in words (the same
+    self-sufficiency requirement as behaviour 13's C301–C303).
+
+    Args:
+        layer: the layer label from the carrier pair.
+
+    Returns:
+        A phrase naming the layer for the message.
+    """
+    if layer == "tool.yaml":
+        return "written in the tool's tool.yaml"
+    if layer == "defaults":
+        return "written in the defaults: block"
+    return "written inline"
+
+
+def _check_reserved_key(
+    rule: Rule,
+    config: ValidatedConfig,
+    tool_key: str,
+    tool: ResolvedTool,
+    key: str,
+    message: str,
+) -> list[Diagnostic]:
+    """One diagnostic per carrier pair carrying the reserved ``key``.
+
+    Shared by C400/C403/C405 (same mechanism, plan block 2): the
+    ``layer`` element of the pair is load-bearing for the message, not
+    for the path (plan block 6).
+
+    Args:
+        rule: the emitting rule (its ``id``, ``severity`` and ``remedy``
+            are used).
+        config: the validated configuration.
+        tool_key: the ``tools:`` map key of the tool.
+        tool: the resolved tool whose ``reserved_keys`` is read.
+        key: the reserved key this rule owns.
+        message: the per-key message (layer phrase appended by the
+            caller is NOT included here; each key's message already
+            names its own content).
+
+    Returns:
+        One diagnostic per offending ``(key, layer)`` pair.
+    """
+    findings: list[Diagnostic] = []
+    for found_key, layer in tool.reserved_keys:
+        if found_key != key:
+            continue
+        yaml_path = _reserved_key_path(tool_key, key, layer)
+        findings.append(
+            Diagnostic(
+                code=rule.id,
+                severity=rule.severity,
+                message=f"{message} ({_reserved_key_layer_phrase(layer)}.)",
+                location=_tool_location(config, yaml_path),
+                remedy=rule.remedy,
+            )
+        )
+    return findings
+
+
+class _C400Rule(Rule):
+    """``TSWAP-C400``: a reserved ``soft_ttl`` present at any level."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``soft_ttl`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(soft_ttl, layer)`` carrier pair,
+            citing ADR-0004 and stating that ``ttl`` is the only idle
+            timer in v1.
+        """
+        message = (
+            f"'soft_ttl' is a reserved key and is rejected: {_ADR_0004_CITATION}; "
+            "ttl: is the only idle timer in v1"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "soft_ttl", message)
+            )
+        return findings
+
+
+class _C401Rule(Rule):
+    """``TSWAP-C401``: ``runtime.server: native`` (not implemented)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool resolving ``runtime_server`` to ``"native"``.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool, naming the current
+            version and that ``bentoml`` is the only implemented
+            backend.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("runtime_server")
+            if value != "native":
+                continue
+            message = (
+                "runtime.server: 'native' is not implemented in this "
+                f"version (tool-swap {__version__}); {_IMPLEMENTED_RUNTIME_SERVER!r} "
+                "is the only implemented backend"
+            )
+            yaml_path = f"tools.{key}.runtime_server"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C402Rule(Rule):
+    """``TSWAP-C402``: ``runtime.server`` outside {bentoml, native}."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``runtime_server`` value outside the valid set.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool, naming the
+            offending value and listing the valid values.
+        """
+        valid = ", ".join(_VALID_RUNTIME_SERVERS)
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("runtime_server")
+            if not isinstance(value, str) or value in _VALID_RUNTIME_SERVERS:
+                continue
+            message = (
+                f"runtime.server {value!r} is not a valid value; valid "
+                f"values are: {valid}"
+            )
+            yaml_path = f"tools.{key}.runtime_server"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C403Rule(Rule):
+    """``TSWAP-C403``: a reserved ``scalar_inputs`` present."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``scalar_inputs`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(scalar_inputs, layer)`` carrier
+            pair, citing ADR-0005 and stating the uniform calling
+            convention.
+        """
+        message = (
+            f"'scalar_inputs' is a reserved key and is rejected: {_ADR_0005_CITATION}; "
+            "every handler takes and returns a list"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "scalar_inputs", message)
+            )
+        return findings
+
+
+class _C404Rule(Rule):
+    """``TSWAP-C404``: a per-input ``batchable:`` key (inputs ONLY)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``inputs`` entry carrying a ``batchable`` key.
+
+        Presence-not-value: ``batchable: false`` is as withdrawn as
+        ``batchable: true``.  ``outputs:`` and ``params:`` are not
+        scanned; a non-list block or a non-mapping entry is skipped
+        silently (malformed shapes are behaviour 20's ``TSWAP-S1xx``).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending input entry, named by
+            behaviour 13's entry-label convention and citing ADR-0005.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if not isinstance(tool.inputs, list):
+                continue
+            for index, entry in enumerate(tool.inputs):
+                if not isinstance(entry, Mapping) or "batchable" not in entry:
+                    continue
+                label = _entry_label(entry, "inputs", index)
+                message = (
+                    f"Input {label!r} carries a 'batchable' key, which "
+                    f"is withdrawn: batching is a property of the tool, "
+                    f"not of an input. {_ADR_0005_CITATION}"
+                )
+                yaml_path = f"tools.{key}.inputs.{index}.batchable"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C405Rule(Rule):
+    """``TSWAP-C405``: a reserved ``max_batch_bytes`` present."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``max_batch_bytes`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(max_batch_bytes, layer)`` carrier
+            pair, stating the key does not exist and naming the
+            mitigation.
+        """
+        message = (
+            "'max_batch_bytes' does not exist as a config key; set "
+            "max_batch_size low for large payloads"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "max_batch_bytes", message)
+            )
+        return findings
+
+
+#: ``TSWAP-C400`` — a reserved ``soft_ttl`` present at any level (§6 rule 4).
+TSWAP_C400_RULE: Final[Rule] = _C400Rule(
+    id="TSWAP-C400",
+    remedy="remove soft_ttl; use ttl: — it is the only idle timer in v1",
+)
+
+#: ``TSWAP-C401`` — ``runtime.server: native`` is not implemented (§6 rule 1c).
+TSWAP_C401_RULE: Final[Rule] = _C401Rule(
+    id="TSWAP-C401",
+    remedy="set runtime.server: bentoml (or remove the key)",
+)
+
+#: ``TSWAP-C402`` — ``runtime.server`` outside {bentoml, native} (§6 rule 1c).
+TSWAP_C402_RULE: Final[Rule] = _C402Rule(
+    id="TSWAP-C402",
+    remedy="set runtime.server to one of: bentoml, native",
+)
+
+#: ``TSWAP-C403`` — a reserved ``scalar_inputs`` present (§6 rule 4).
+TSWAP_C403_RULE: Final[Rule] = _C403Rule(
+    id="TSWAP-C403",
+    remedy="remove scalar_inputs; the handler already takes a list",
+)
+
+#: ``TSWAP-C404`` — a per-input ``batchable:`` key (§6 rule 4).
+TSWAP_C404_RULE: Final[Rule] = _C404Rule(
+    id="TSWAP-C404",
+    remedy="remove 'batchable' from the input entry; batching is a tool-level property",
+)
+
+#: ``TSWAP-C405`` — a reserved ``max_batch_bytes`` present (§6 rule 4).
+TSWAP_C405_RULE: Final[Rule] = _C405Rule(
+    id="TSWAP-C405",
+    remedy="remove max_batch_bytes and set max_batch_size low for large payloads",
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -922,6 +1276,12 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C301_RULE,
     TSWAP_C302_RULE,
     TSWAP_C303_RULE,
+    TSWAP_C400_RULE,
+    TSWAP_C401_RULE,
+    TSWAP_C402_RULE,
+    TSWAP_C403_RULE,
+    TSWAP_C404_RULE,
+    TSWAP_C405_RULE,
 )
 
 

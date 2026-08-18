@@ -29,6 +29,7 @@ _FLATTENING_TABLE: Final[dict[tuple[str, str], str]] = {
     ("resources", "group"): "group",
     ("lifecycle", "ttl"): "ttl",
     ("lifecycle", "ready_timeout"): "ready_timeout",
+    ("runtime", "server"): "runtime_server",
 }
 
 #: tool.yaml blocks whose nested keys must map to a flat field; an
@@ -36,6 +37,30 @@ _FLATTENING_TABLE: Final[dict[tuple[str, str], str]] = {
 _KNOWN_BLOCKS: Final[frozenset[str]] = frozenset(
     block for block, _key in _FLATTENING_TABLE
 )
+
+#: tool.yaml blocks that flatten their mapped keys but silently ignore
+#: their unmapped ones instead of emitting ``TSWAP-C106``: ``runtime``'s
+#: other keys (``base_image`` and the rest of the image-build surface)
+#: are M2 concerns M1 does not own (plan, behaviour 14, block 3).
+_PARTIAL_BLOCKS: Final[frozenset[str]] = frozenset({"runtime"})
+
+#: Withdrawn/reserved keys behaviour 14 rejects, mapped to the layers the
+#: schema reserves them at (mirrors the schema placement table).  Detected
+#: by PRESENCE in a layer mapping, never by value ("soft_ttl: null" is
+#: still present).
+RESERVED_KEYS: Final[dict[str, frozenset[str]]] = {
+    "soft_ttl": frozenset({"inline", "tool.yaml", "defaults"}),
+    "scalar_inputs": frozenset({"inline", "tool.yaml"}),
+    "max_batch_bytes": frozenset({"inline", "tool.yaml", "defaults"}),
+}
+
+#: The fixed origin a non-empty ``reserved_keys`` carrier records, per
+#: layer label (the most-specific layer present wins).
+_RESERVED_KEY_ORIGINS: Final[dict[str, tuple[OriginLevel, str]]] = {
+    "inline": (OriginLevel.INLINE, "inline"),
+    "tool.yaml": (OriginLevel.TOOL_YAML, "tool.yaml"),
+    "defaults": (OriginLevel.DEFAULTS, "defaults"),
+}
 
 
 @dataclass(frozen=True)
@@ -56,6 +81,12 @@ class ResolvedTool:
         outputs: the ``tool.yaml`` ``outputs:`` block, same contract.
         params: the ``tool.yaml`` ``params:`` block, same contract.
         json_schema: the ``tool.yaml`` ``json_schema:`` block, same contract.
+        reserved_keys: the withdrawn/reserved keys (:data:`RESERVED_KEYS`)
+            PRESENT in this tool's layers, as ``(key, layer)`` pairs with
+            the layer label (``"inline"`` / ``"tool.yaml"`` /
+            ``"defaults"``), most-specific-first then key-sorted.
+            Outside ``values`` on purpose (behaviour 14): the keys are
+            reserved, never resolved fields.
     """
 
     name: str
@@ -69,6 +100,9 @@ class ResolvedTool:
     outputs: list[dict[str, object]] | None = None
     params: list[dict[str, object]] | None = None
     json_schema: dict[str, object] | None = None
+    # Behaviour 14 carrier field; trailing on purpose so every existing
+    # construction site stays valid.
+    reserved_keys: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,6 +197,11 @@ def resolve_tool(
 
     # --- behaviour 13 carrier fields (outside ``values`` on purpose) ---
     description_winner = _winner_index_safe(layers, "description")
+    # --- behaviour 14: reserved-key presence scan (no diagnostic of its
+    # own; every C4xx is a rule reading ``reserved_keys``) ---
+    reserved_keys = _scan_reserved_keys(inline_data, tool_yaml, defaults)
+    if reserved_keys:
+        origins.record("reserved_keys", _reserved_key_origin(reserved_keys))
     if description_winner < 0:
         description: str | None = None
     else:
@@ -194,6 +233,7 @@ def resolve_tool(
         outputs=outputs,
         params=params,
         json_schema=json_schema,
+        reserved_keys=reserved_keys,
     )
 
 
@@ -341,6 +381,10 @@ def _flatten_tool_yaml(
         for key, nested in value.items():
             target = _FLATTENING_TABLE.get((block, key))
             if target is None:
+                if block in _PARTIAL_BLOCKS:
+                    # Unmapped keys of a partial block are a later
+                    # milestone's concern; ignore silently (no C106).
+                    continue
                 diagnostics.append(_unmapped_key(tool_name, block, str(key)))
             else:
                 flat[target] = copy.deepcopy(nested)
@@ -375,6 +419,65 @@ def _unmapped_key(tool_name: str, block: str, key: str) -> Diagnostic:
         location=Location(file=tool_name, yaml_path=f"{block}.{key}"),
         remedy=f"remove '{key}' from the '{block}' block or use a mapped key ({known})",
     )
+
+
+def _scan_reserved_keys(
+    inline: Mapping[str, object],
+    tool_yaml: Mapping[str, object] | None,
+    defaults: Mapping[str, object] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Scan the raw layers for the PRESENCE of reserved keys (behaviour 14).
+
+    The scan is layer-scoped per key, exactly mirroring the schema
+    placement table in :data:`RESERVED_KEYS`: the ``tool.yaml`` layer is
+    read RAW (pre-flattening, which would drop the keys), and
+    ``defaults:`` is only scanned for the keys the schema reserves there
+    (so ``defaults.scalar_inputs`` stays a schema-level ``TSWAP-C101``
+    and never also a ``TSWAP-C403``).  The group layer is never a
+    reserved-key source.  Order is layer order, most specific first,
+    then key-sorted within a layer, so the diagnostic sequence is
+    deterministic without the rule re-sorting.
+
+    Args:
+        inline: the tool's inline entry (already deep-copied on entry).
+        tool_yaml: the tool's raw ``tool.yaml`` mapping, or ``None``.
+        defaults: the user's ``defaults:`` block, or ``None``.
+
+    Returns:
+        The ``(key, layer)`` pairs, ``()`` when no reserved key is
+        present in any reserved layer.
+    """
+    layers: tuple[tuple[str, Mapping[str, object] | None], ...] = (
+        ("inline", inline),
+        ("tool.yaml", tool_yaml),
+        ("defaults", defaults),
+    )
+    pairs: list[tuple[str, str]] = []
+    for layer, data in layers:
+        if data is None:
+            continue
+        found = sorted(
+            key for key in data if key in RESERVED_KEYS and layer in RESERVED_KEYS[key]
+        )
+        pairs.extend((key, layer) for key in found)
+    return tuple(pairs)
+
+
+def _reserved_key_origin(reserved_keys: tuple[tuple[str, str], ...]) -> Origin:
+    """The origin recorded for a non-empty ``reserved_keys`` carrier.
+
+    Follows behaviour 13's carrier-field pattern: the most-specific
+    layer present (the first pair's layer, the scan's emission order)
+    supplies the origin.
+
+    Args:
+        reserved_keys: the non-empty carrier tuple.
+
+    Returns:
+        The origin for the most-specific layer present.
+    """
+    level, source = _RESERVED_KEY_ORIGINS[reserved_keys[0][1]]
+    return Origin(level=level, source=source)
 
 
 def _winner_index(layers: Sequence[_Layer], field: str) -> int:

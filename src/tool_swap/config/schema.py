@@ -19,7 +19,7 @@ from __future__ import annotations
 import types
 from typing import Any, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tool_swap.config.errors import Diagnostic, Location, Severity
 from tool_swap.config.suggest import nearest_alternative
@@ -105,6 +105,23 @@ class DefaultsConfig(BaseModel):
     # --- environment and storage (free-form values, plan line 103) ---
     env: dict[str, Any] = {}
     mounts: list[str] = []
+    # --- reserved/withdrawn keys (behaviour 14): accepted, never resolved ---
+    soft_ttl: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C400): plan/adr/0004-hard-stop-"
+            "only-in-v1.md (ADR-0004 — v1 reclaims resources by stopping "
+            "containers; soft unload is deferred). ttl: is the only idle "
+            "timer in v1."
+        ),
+    )
+    max_batch_bytes: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C405): no such key exists; set "
+            "max_batch_size low for large payloads."
+        ),
+    )
 
 
 class GroupConfig(BaseModel):
@@ -158,6 +175,31 @@ class ToolConfig(BaseModel):
     mounts: list[str] | None = None
     env: dict[str, Any] | None = None
     description: str | None = None
+    # --- reserved/withdrawn keys (behaviour 14): accepted, never resolved ---
+    soft_ttl: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C400): plan/adr/0004-hard-stop-"
+            "only-in-v1.md (ADR-0004 — v1 reclaims resources by stopping "
+            "containers; soft unload is deferred). ttl: is the only idle "
+            "timer in v1."
+        ),
+    )
+    scalar_inputs: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C403): plan/adr/0005-one-uniform-"
+            "batched-calling-convention.md (ADR-0005 — One uniform calling "
+            "convention: every handler takes and returns a list)."
+        ),
+    )
+    max_batch_bytes: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C405): no such key exists; set "
+            "max_batch_size low for large payloads."
+        ),
+    )
 
 
 class ToolYamlConfig(BaseModel):
@@ -181,6 +223,31 @@ class ToolYamlConfig(BaseModel):
     outputs: list[dict[str, Any]] | None = None
     params: list[dict[str, Any]] | None = None
     json_schema: dict[str, Any] | None = None
+    # --- reserved/withdrawn keys (behaviour 14): accepted, never resolved ---
+    soft_ttl: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C400): plan/adr/0004-hard-stop-"
+            "only-in-v1.md (ADR-0004 — v1 reclaims resources by stopping "
+            "containers; soft unload is deferred). ttl: is the only idle "
+            "timer in v1."
+        ),
+    )
+    scalar_inputs: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C403): plan/adr/0005-one-uniform-"
+            "batched-calling-convention.md (ADR-0005 — One uniform calling "
+            "convention: every handler takes and returns a list)."
+        ),
+    )
+    max_batch_bytes: Any = Field(
+        default=None,
+        description=(
+            "RESERVED and rejected (TSWAP-C405): no such key exists; set "
+            "max_batch_size low for large payloads."
+        ),
+    )
 
 
 class RootConfig(BaseModel):
