@@ -92,6 +92,28 @@ from tool_swap.config.validate import (  # noqa: E501  (names absent in RED step
 # Constants
 # ---------------------------------------------------------------------------
 
+#: The six behaviour-12 rule ids (§6 rules 2 and 3), in code order — the
+#: block immediately before the behaviour-13 append (mirrors
+#: ``_BEHAVIOUR_12_IDS`` in ``test_validate_names_groups.py`` and
+#: ``test_validate_descriptions.py``).
+_BEHAVIOUR_12_IDS: Final[tuple[str, ...]] = (
+    "TSWAP-C210",
+    "TSWAP-C211",
+    "TSWAP-C220",
+    "TSWAP-C221",
+    "TSWAP-C222",
+    "TSWAP-C223",
+)
+
+#: The four behaviour-13 rule ids (§6 rule 6b), in code order (mirrors
+#: ``_BEHAVIOUR_13_IDS`` in ``test_validate_descriptions.py``).
+_BEHAVIOUR_13_IDS: Final[tuple[str, ...]] = (
+    "TSWAP-C300",
+    "TSWAP-C301",
+    "TSWAP-C302",
+    "TSWAP-C303",
+)
+
 #: The six behaviour-14 rule ids (§6 rules 4 and 1c), in code order.
 _BEHAVIOUR_14_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C400",
@@ -264,22 +286,34 @@ def test_rule_objects_carry_expected_ids_and_severities() -> None:
 def test_builtin_rules_append_the_behaviour_14_codes_in_code_order() -> None:
     """The six rules are appended to ``BUILTIN_RULES`` after behaviour 13.
 
-    Plan block 9: all six are appended to ``BUILTIN_RULES`` in code order,
-    after behaviour 13's four — 16 landed rules in total — and their
-    *identity* is what ``register_builtin_rules()`` relies on for
-    idempotency, so the tuple must hold the very module-level singletons,
-    not equal stand-ins.
+    Plan block 9: all six are appended to ``BUILTIN_RULES`` in code order
+    after behaviour 13's four, and their *identity* is what
+    ``register_builtin_rules()`` relies on for idempotency, so the tuple
+    must hold the very module-level singletons, not equal stand-ins.
+
+    The position is asserted **relative to the behaviour-12/13 blocks**,
+    not tail-anchored: the append order is cumulative — behaviours 15-19
+    each append after the previous one — so "the last six ids" (or a
+    total-count pin) would be false as soon as behaviour 15's seven C5xx
+    rules land.  The C4xx block's position, immediately after the four
+    behaviour-13 codes, is stable under every future append.
 
     Arrangement: the ``BUILTIN_RULES`` tuple.
-    Action: read the trailing ids back; check object identity per rule.
-    Assertion: the last six ids are the behaviour-14 codes in code order,
-    the tuple holds exactly 16 rules, and each rule constant is an element
-    of the tuple.
+    Action: locate the first behaviour-14 id; check object identity per
+    rule.
+    Assertion: the first C4xx id sits at index
+    ``len(_BEHAVIOUR_12_IDS) + len(_BEHAVIOUR_13_IDS)`` (immediately after
+    the behaviour-12 and behaviour-13 codes), the six ids from there are
+    a contiguous, in-code-order block, and each rule constant is an
+    element of the tuple.
     """
     ids = [rule.id for rule in BUILTIN_RULES]
 
-    assert len(BUILTIN_RULES) == 16
-    assert ids[-6:] == list(_BEHAVIOUR_14_IDS)
+    first_c400 = ids.index(_BEHAVIOUR_14_IDS[0])
+    assert first_c400 == len(_BEHAVIOUR_12_IDS) + len(_BEHAVIOUR_13_IDS)
+    assert ids[first_c400 : first_c400 + len(_BEHAVIOUR_14_IDS)] == list(
+        _BEHAVIOUR_14_IDS
+    )
     for constant in (
         TSWAP_C400_RULE,
         TSWAP_C401_RULE,
