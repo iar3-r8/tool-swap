@@ -168,6 +168,26 @@ def _validated_config(
     )
 
 
+def _tools_structural_snapshot(tools: dict[str, ResolvedTool]) -> dict[str, tuple]:
+    """Return a value-comparable snapshot of the tools dict.
+
+    ``OriginMap`` has no value-equality ``__eq__`` (equality is
+    identity-based), so a whole-``ResolvedTool`` ``==`` against a deep
+    copy can never hold even for an unmutated input.  The snapshot
+    therefore covers exactly what ``validate_config`` could mutate --
+    the tools keys, each tool's ``name``, ``values`` dict and
+    ``diagnostics`` list -- while excluding the origins.
+    """
+    return {
+        name: (
+            tool.name,
+            copy.deepcopy(tool.values),
+            copy.deepcopy(tool.diagnostics),
+        )
+        for name, tool in tools.items()
+    }
+
+
 def _diagnostic(
     code: str = _FAKE_ERROR_CODE,
     severity: Severity = Severity.ERROR,
@@ -489,7 +509,7 @@ def test_report_diagnostics_are_sorted_per_behaviour_2() -> None:
     report = validate_config(_validated_config())
 
     assert report.diagnostics == tuple(sorted(report.diagnostics))
-    assert [d.line for d in report.diagnostics] == [2, 99]
+    assert [d.location.line for d in report.diagnostics] == [2, 99]
 
 
 # ---------------------------------------------------------------------------
@@ -703,14 +723,16 @@ def test_validate_config_is_pure_and_does_not_mutate_its_input() -> None:
     with a nested list) and two fixed fake rules.
     Action: call ``validate_config`` twice with the *same* config object,
     snapshotting deep copies of the input before the calls.
-    Assertion: both reports are equal; the input data is deep-equal to its
-    pre-call snapshot (the function did not mutate the tools, the raw mapping,
-    or any nested value).
+    Assertion: both reports are equal; the input's structural state (tools
+    keys, each tool's name/values/diagnostics) and the raw mapping equal
+    their pre-call snapshots (the function did not mutate the tools, the
+    raw mapping, or any nested value).  The tools comparison is structural
+    rather than whole-object because ``OriginMap`` equality is identity-based.
     """
     tools = {"fake": _resolved_tool()}
     raw = {"tools": {"fake": {"mounts": ["/a:/b:ro"]}}}
     cfg = _validated_config(tools=tools, raw=raw)
-    before_tools = copy.deepcopy(tools)
+    before_tools_state = _tools_structural_snapshot(tools)
     before_raw = copy.deepcopy(raw)
 
     register(
@@ -731,7 +753,7 @@ def test_validate_config_is_pure_and_does_not_mutate_its_input() -> None:
     report_2 = validate_config(cfg)
 
     assert report_1 == report_2
-    assert tools == before_tools
+    assert _tools_structural_snapshot(tools) == before_tools_state
     assert raw == before_raw
 
 
