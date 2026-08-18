@@ -84,6 +84,18 @@ from tool_swap.config.validate import (  # noqa: E501  (names absent in RED step
 # Constants and fakes
 # ---------------------------------------------------------------------------
 
+#: The six behaviour-12 rule ids (§6 rules 2 and 3), in code order — the
+#: block immediately before the behaviour-13 append (mirrors
+#: ``_BEHAVIOUR_12_IDS`` in ``test_validate_names_groups.py``).
+_BEHAVIOUR_12_IDS: Final[tuple[str, ...]] = (
+    "TSWAP-C210",
+    "TSWAP-C211",
+    "TSWAP-C220",
+    "TSWAP-C221",
+    "TSWAP-C222",
+    "TSWAP-C223",
+)
+
 #: The four behaviour-13 rule ids (§6 rule 6b), in code order.
 _BEHAVIOUR_13_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C300",
@@ -233,14 +245,28 @@ def test_builtin_rules_append_the_behaviour_13_codes_in_code_order() -> None:
     ``register_builtin_rules()`` relies on for idempotency — so the tuple
     must hold the very module-level singletons, not equal stand-ins.
 
+    The position is asserted **relative to the behaviour-12 block**, not
+    tail-anchored: the append order is cumulative — behaviours 14-19 each
+    append after the previous one (plan line 633) — so "the last four
+    ids" would be false as soon as behaviour 14's six C4xx rules land.
+    The C3xx block's position, immediately after the six behaviour-12
+    codes, is stable under every future append.
+
     Arrangement: the ``BUILTIN_RULES`` tuple.
-    Action: read the trailing ids back; check object identity per rule.
-    Assertion: the last four ids are the behaviour-13 codes in code order,
-    and each rule constant is an element of the tuple.
+    Action: locate the first behaviour-13 id; check object identity per
+    rule.
+    Assertion: the first C3xx id sits at index ``len(_BEHAVIOUR_12_IDS)``
+    (immediately after the six behaviour-12 codes), the four ids from
+    there are a contiguous, in-code-order block, and each rule constant
+    is an element of the tuple.
     """
     ids = [rule.id for rule in BUILTIN_RULES]
 
-    assert ids[-4:] == list(_BEHAVIOUR_13_IDS)
+    first_c300 = ids.index(_BEHAVIOUR_13_IDS[0])
+    assert first_c300 == len(_BEHAVIOUR_12_IDS)
+    assert ids[first_c300 : first_c300 + len(_BEHAVIOUR_13_IDS)] == list(
+        _BEHAVIOUR_13_IDS
+    )
     for constant in (
         TSWAP_C300_RULE,
         TSWAP_C301_RULE,
