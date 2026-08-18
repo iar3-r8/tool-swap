@@ -295,7 +295,146 @@ Settled by the registration decision above and by the committed RED test [`tests
   - `TSWAP-C303` **ERROR** — missing description on any entry in `params:` (§5.5.1 requires `name`, `type`, `description`).
   - `--allow-missing-descriptions` downgrades `C300`, `C301` and `C303` to warnings **and** appends to each: *"downgraded by --allow-missing-descriptions; this flag is for local prototyping and is never permitted in CI"*. The banner is part of the diagnostic, so it survives `--json` and cannot be lost by a caller that only prints diagnostics.
 - **Edge cases:** a description of `"   "` or `"\n"` counts as missing; a description present in `tool.yaml` and blank inline — inline wins per behaviour 10, so it **is** missing, and this precedence interaction gets its own test because it is easy to implement backwards. A very short description (`"x"`) is accepted — we do not invent a length rule the spec does not state.
-- **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_descriptions.py`.
+- **Files:** `src/tool_swap/config/schema.py` (the two field additions below), `src/tool_swap/config/resolver.py` (the carrier fields below), `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_descriptions.py`.
+
+#### Confirmed contract details (2026-08-18)
+
+The rule needs four data fields that the shipped modules do not carry end to end. This block pins the whole data path, so the RED step can be written and the GREEN step implemented without guessing. **No shipped test breaks under it** — that is the property the design was chosen for (see "Why not flat keys" below).
+
+**1. Schema additions ([`schema.py`](src/tool_swap/config/schema.py:1))**
+
+On [`ToolYamlConfig`](src/tool_swap/config/schema.py:159) — the authoring blocks of `plan/02` §4, kept **as authored** (the compiler of behaviour 20 owns their inner shape, so this layer stores and does not interpret):
+
+```python
+inputs: list[dict[str, Any]] | None = None
+outputs: list[dict[str, Any]] | None = None
+params: list[dict[str, Any]] | None = None
+json_schema: dict[str, Any] | None = None
+```
+
+`list[dict[str, Any]]` is deliberate: an entry is a mapping of `name` / `type` / `required` / `description` / `semantic` / `items` (§5.5.1 requires `name`, `type`, `description`; §8.4 adds the rest), but declaring a per-entry Pydantic model here would move `TSWAP-S1xx` shape validation out of behaviour 20, which owns it. `None` (absent) must stay distinct from `[]` (declared empty) — behaviour 20 pins `None ≠ {}`, and a no-argument tool is legal.
+
+On [`ToolConfig`](src/tool_swap/config/schema.py:134) — one field only:
+
+```python
+description: str | None = None
+```
+
+`description` **must** be here, because plan line 297 requires that a blank inline description beat a good one in `tool.yaml`; a value that cannot be written inline cannot win inline. `inputs:` / `outputs:` / `params:` / `json_schema:` are **not** added to `ToolConfig` in M1: every authoring example puts them in `tool.yaml`, behaviour 20's inputs are *"as authored in `tool.yaml`"*, and nothing in M1 reads an inline copy. This is a deliberate narrowing of §5.5.1's *"Overridable per config entry"* — recorded as assumption **A14** in §5, and cheap to widen later because the carrier fields already exist.
+
+*Not part of behaviour 13, but discovered while pinning it:* `ToolYamlConfig` is currently **unreachable** — no `RootConfig` field has that type, so `validate_root` never applies it, and the loader deliberately does not schema-validate an included `tool.yaml` ([`test_include_tool_yaml_unknown_key_loads_with_file_recorded`](tests/unit/config/test_includes.py:543) pins exactly that). Whoever first wires it in must also add the §4 blocks `runtime`, `batching`, `resources`, `lifecycle` and `example`, or `extra="forbid"` will reject the §4 reference `tool.yaml`. Behaviour 13 does **not** wire it in.
+
+**2. Resolver additions ([`resolver.py`](src/tool_swap/config/resolver.py:41)) — trailing carrier fields, and NO new flat keys**
+
+```python
+@dataclass(frozen=True)
+class ResolvedTool:
+    name: str
+    values: dict[str, object]
+    origins: OriginMap
+    diagnostics: list[Diagnostic]
+    # --- added by behaviour 13; outside `values` on purpose ---
+    description: str | None = None
+    inputs: list[dict[str, object]] | None = None
+    outputs: list[dict[str, object]] | None = None
+    params: list[dict[str, object]] | None = None
+    json_schema: dict[str, object] | None = None
+```
+
+- `values` is **unchanged**: still exactly `set(BUILT_IN_DEFAULTS)`, still 47 keys.
+- `BUILT_IN_DEFAULTS` is **unchanged**: still exactly 47 keys.
+- `description` is **layered** by `resolve_tool`, `inline` > `tool.yaml`, and nothing below: `defaults:`, the group layer and the built-in layer contribute no description (a defaulted description would defeat D19 entirely). A key **present with a blank value wins**, exactly like every other layer key (plan line 191), which is what makes plan line 297's case come out as *missing*. When no layer supplies the key at all, the field is `None`. The existing `_winner_index` helper cannot be reused unmodified — it raises `AssertionError` when no layer provides the field, relying on the built-in layer always having it — so this needs its own small pure helper over the same layer list.
+- `inputs` / `outputs` / `params` / `json_schema` are **not layered**: they are read from the `tool_yaml` layer only, deep-copied verbatim on entry like every other layer input, and are `None` when the key is absent.
+- These keys are invisible to [`_flatten_tool_yaml`](src/tool_swap/config/resolver.py:199) today (its first loop skips keys outside `_KNOWN_BLOCKS`, its second copies only keys in `BUILT_IN_DEFAULTS`), so they are currently **silently dropped** and, importantly, do **not** produce `TSWAP-C106`. Extraction is therefore purely additive and cannot change any existing diagnostic.
+- **Origins:** recorded in the same `OriginMap` at the dotted paths `description`, `inputs`, `outputs`, `params`, `json_schema` — and **only when some layer supplied the key**, so behaviour 9's contract (an unrecorded path raises `KeyError`) keeps meaning something.
+
+**Why not flat keys in `values` (the pin that would have broken)**
+
+Both obvious routes break a committed test, in opposite directions:
+
+| Route | Breaks |
+|---|---|
+| Add `description`/`inputs`/… to `values` but **not** to `BUILT_IN_DEFAULTS` | [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) — it asserts `set(result.values) == set(BUILT_IN_DEFAULTS)`, **set equality in both directions** |
+| Add them to `BUILT_IN_DEFAULTS` as well | [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324) — it asserts `set(BUILT_IN_DEFAULTS) == set(EXPECTED_RESOLVABLE_FIELDS)`, a 47-name table pinned literally in the test file |
+
+Carrier fields on `ResolvedTool` break neither, and they are also the honest modelling: these are not *resolvable defaultable fields*, they are authored content. Adding **trailing defaulted** fields to a frozen dataclass is safe against every existing construction site — [`test_validate_registry.py`](tests/unit/config/test_validate_registry.py:151) and [`test_validate_names_groups.py`](tests/unit/config/test_validate_names_groups.py:114) both build `ResolvedTool(name=…, values=…, origins=…, diagnostics=…)` by keyword — and against [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99), which asserts the presence of the four original fields and frozenness, not the absence of others. Defaults must be `None` (never `[]` or `{}`): a dataclass rejects a mutable default outright, and `None`-means-absent is required anyway.
+
+**3. The rule-source contract**
+
+[`ValidatedConfig`](src/tool_swap/config/validate.py:150) stays **frozen at its four fields** (`tools`, `raw`, `line_for`, `path`) — pinned by [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) and its immutability twin, and **not** amended here. Everything the rule reads therefore comes from `config.tools[<key>]`:
+
+- `tool.description` → `C300`
+- `tool.inputs` → `C301`
+- `tool.outputs` → `C302`
+- `tool.params` → `C303`
+
+The rule must **not** re-read the filesystem, must **not** call the loader, and must **not** parse `config.raw` for these four — `raw` holds the inline layer only, so a `tool.yaml`-authored description is not in it, and reading it would reintroduce precedence logic the resolver already owns. `config.raw` stays in use only for the group rules of behaviour 12.
+
+**Blankness (one helper, pinned):** a description counts as **missing** when the value is `None`, or a `str` whose `.strip()` is empty (`""`, `"   "`, `"\n"`). A **non-string** value (e.g. `description: 123`) counts as **present** and is left to the schema layer's `TSWAP-C105`, so one mistake yields one diagnostic rather than two. `"x"` is present.
+
+**Robustness (prevents a `TSWAP-C999`):** an entry inside `inputs:`/`outputs:`/`params:` that is not a mapping (e.g. `inputs: [paths]`) is **skipped silently** by this rule; malformed entries belong to behaviour 20's `TSWAP-S1xx`. A block whose value is not a list is likewise skipped.
+
+**Naming the entry:** `C301`/`C303` name the input/param and `C302` names the output, taken from the entry's `name` value when it is a non-empty string; otherwise the entry is named positionally as `inputs[<i>]` / `outputs[<i>]` / `params[<i>]` so the message stays actionable.
+
+**4. Absent blocks are legal (behaviour 23's five-line config)**
+
+`C300` applies to **every** tool. `C301`, `C302` and `C303` apply **only to entries that exist**: `inputs` absent (`None`) and `inputs: []` both yield **nothing**, from all three codes. The five-line minimal config therefore validates clean, provided `tools/example_echo/tool.yaml` carries a non-blank `description:` — which behaviour 23's fixture must, since `C300` has no escape in a zero-diagnostic assertion.
+
+**5. Location / `yaml_path` per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour-12 form; the file is never hardcoded, and `line=None` is a legal outcome.
+
+| Code | `yaml_path` |
+|---|---|
+| `C300` | `tools.<name>` |
+| `C301` | `tools.<name>.inputs.<i>.description` |
+| `C302` | `tools.<name>.outputs.<i>.description` |
+| `C303` | `tools.<name>.params.<i>.description` |
+
+`<i>` is the 0-based entry index; `<name>` is the `tools:` **map key** (not `tool.name`), matching behaviour 12's `tools.<key>` choice.
+
+**Dotted-numeric, not `[i]`, and why the two conventions differ.** The repo already has two list-index spellings and they are not interchangeable:
+
+- [`OriginMap`](src/tool_swap/config/origin.py:95) uses brackets (`mounts[0]`) — an opaque key namespace with no line information attached, documented as caller convention.
+- [`LoadedConfig`](src/tool_swap/config/loader.py:494)'s line map uses **dotted numeric** segments: [`_walk_lines`](src/tool_swap/config/loader.py:95) indexes a sequence element as `prefix + (str(index),)`, producing keys like `tools.t.inputs.0.description`.
+
+`Location.yaml_path` is the string handed to `line_for`, so it follows the **loader's** convention. Two consequences, pinned rather than discovered:
+
+- Today `line_for` returns `None` for any list-indexed path: it walks `data` dict-by-dict and bails at the first non-dict (`inputs` is a list), before it ever consults the line map that already holds the right key. Behaviour 13's tests must therefore assert `location.line == config.line_for(location.yaml_path)` (behaviour 12's shipped pattern), **never** a hardcoded line number.
+- Teaching `line_for` to walk list indices is a real improvement and a **non-goal here** — it changes a shipped, tested method, so it needs its own red step, and behaviour 13 must not depend on it. The `yaml_path` form pinned above is chosen precisely so that fix later becomes a loader-only change with no diagnostic churn.
+
+Note also that the `C301`/`C302`/`C303` paths only ever resolve to a line for an **inline**-authored block, since the line map belongs to the root config; a `tool.yaml`-authored entry has no line here. `Location.file` is `str(config.path)` for all four codes, because `ValidatedConfig` carries no per-tool `tool.yaml` path and is frozen. The remedies must therefore be self-sufficient: name the key to add and the tool it belongs to, and direct the author to *"the tool's `tool.yaml`, or its inline `tools.<name>` entry"* rather than pretending to know which file. Carrying the `tool.yaml` path (as a further `ResolvedTool` carrier field) is a deliberate deferral, not an oversight.
+
+**6. The `--allow-missing-descriptions` downgrade — mechanism (a)**
+
+**Decision: the rules always emit their documented severities; a pure post-processing function rewrites the report.** Not (b): a flag-bearing rule would have to be constructed per invocation, which collides head-on with `BUILTIN_RULES` being a tuple of module-level singletons whose *identity* `register_builtin_rules()` relies on for idempotency (behaviour 11a), and it would put CLI state inside a rule that must stay a pure function of `ValidatedConfig`.
+
+The mechanism lives in `validate.py`, **not** in the CLI, so it is unit-testable in behaviour 13's own file before behaviour 21 exists; the CLI merely calls it:
+
+```python
+MISSING_DESCRIPTION_CODES: Final[frozenset[str]] = frozenset(
+    {"TSWAP-C300", "TSWAP-C301", "TSWAP-C303"}
+)
+ALLOW_MISSING_DESCRIPTIONS_BANNER: Final[str] = (
+    "downgraded by --allow-missing-descriptions; this flag is for local "
+    "prototyping and is never permitted in CI"
+)
+
+def downgrade_missing_descriptions(report: ConfigReport) -> ConfigReport: ...
+```
+
+- Pure: returns a **new** `ConfigReport` and mutates nothing. `Diagnostic` is frozen, so each rewrite is a `dataclasses.replace(d, severity=Severity.WARNING, message=f"{d.message} — {ALLOW_MISSING_DESCRIPTIONS_BANNER}")`.
+- Exactly `C300`, `C301`, `C303` are touched. `C302` is untouched — it is already a warning, and appending "downgraded by" to a diagnostic the flag did not change would be a lie.
+- The banner goes in **`message`**, which is what makes it survive `--json`: [`to_json`](src/tool_swap/config/errors.py:159) serialises `message` and `severity`, and the CLI runs the downgrade **before** rendering or serialising, so both consumers see identical content. It is not put in `remedy` (the remedy still describes the fix, not the flag).
+- **Idempotent:** a diagnostic already carrying the banner is returned unchanged, so a double call cannot double-append. Pinned by a test, because a CLI refactor could easily call it twice.
+- Every other diagnostic passes through untouched; the returned report carries the same diagnostics otherwise, served in the existing `ConfigReport` sort order.
+- **`--strict` + `--allow-missing-descriptions` is contradictory, and `--strict` wins:** the downgrade runs first, then `--strict` promotes warnings back to errors. The flag therefore cannot smuggle a missing description past the mode CI actually uses — which is exactly what *"never permitted in CI"* asserts. Behaviour 21 owns the flag plumbing; behaviour 13 owns the function and pins this ordering so 21 has nothing left to decide.
+
+**7. What behaviour 20 reads (one contract, two consumers)**
+
+Behaviour 20's compiler keeps its pure signatures (`compile_inputs(inputs)`, `compile_outputs(outputs)`) and is handed `tool.inputs` / `tool.outputs` / `tool.params` / `tool.json_schema` from the same carrier fields — **no second storage, no re-reading of `tool.yaml`, no re-parse**. That is what lets `C301` and `S120` be asserted to agree (corpus 12) rather than merely hoped to: they read the same list out of the same field. `json_schema` is carried for the same reason — `TSWAP-S130` must detect `json_schema:` **and** `inputs:` both present, which requires both to be observable from one place.
+
+**Rule objects (behaviour 12's shape, reused):** module-level `TSWAP_C300_RULE`, `TSWAP_C301_RULE`, `TSWAP_C302_RULE`, `TSWAP_C303_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code; `TSWAP_C302_RULE` is `Severity.WARNING`, the other three `Severity.ERROR`; every `remedy` non-empty; **no import-time self-registration** — all four are appended to `BUILTIN_RULES` in code order, and behaviour 13's green step extends behaviour 11a's completeness test with the four ids.
 
 ### Behaviour 14 — withdrawn and reserved keys (§6 rules 4, 1c)
 
@@ -676,6 +815,8 @@ All of these were posted to [issue #2](https://github.com/iar3-r8/tool-swap/issu
 Subtasks: treat this section as settled fact. Do not re-litigate; do not ask again.
 
 **A13 (new, 2026-08-18) — NOT yet confirmed by the intake source.** The registration mechanism decided above (explicit `register_builtin_rules()`, no import-time self-registration) is a design choice **not** covered by Q1–Q9 or by A1–A12, and therefore not covered by the issue's "ALL CONFIRMED" comment. It is an internal-mechanism decision with no effect on the config file format, the diagnostic codes, the CLI surface, or any Definition-of-Done item, so it does not need maintainer sign-off to proceed. It is recorded here for visibility, and should be mentioned in the pull-request description rather than blocking work. The one part worth a maintainer's eye is the consequence: behaviour 12's committed reload test is superseded (behaviour 12a).
+
+**A14 (new, 2026-08-18) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 13's contract block adds `inputs:` / `outputs:` / `params:` / `json_schema:` to `ToolYamlConfig` **only**, not to the inline `ToolConfig`. §5.5.1 says `params` is *"Overridable per config entry"*, and §4's *"inline overrides beat the tool.yaml"* would extend that to `inputs:`/`outputs:` by symmetry; every worked example in `plan/02` nevertheless authors all four blocks in `tool.yaml`, and behaviour 20's stated inputs are *"as authored in `tool.yaml`"*. M1 therefore reads them from `tool.yaml` alone. The narrowing is visible in exactly one place (`ToolConfig`), and widening it later is additive — the `ResolvedTool` carrier fields and the origin paths already exist, so it becomes a layering change inside `resolve_tool`, not a redesign. The user-visible consequence to confirm: in M1, writing `params:` in a `tools.yaml` entry is an unknown-key `TSWAP-C101`, not an override. `description:` **is** inline-overridable, as behaviour 13 requires.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
