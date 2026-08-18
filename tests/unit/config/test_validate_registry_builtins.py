@@ -67,9 +67,10 @@ from tool_swap.config.validate import (  # noqa: E501  (names absent in RED step
 #: it is not a rule id, it is the code ``validate_config`` emits for a
 #: failing rule.
 #:
-#: BEHAVIOURS 13-19 EXTEND THIS CONSTANT: add each behaviour's codes here
-#: (in code order) when that behaviour's rules land in ``BUILTIN_RULES`` —
-#: the completeness test below then enforces "no silent drop" mechanically.
+#: BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER: add each behaviour's
+#: codes here (in code order) when that behaviour's rules land in
+#: ``BUILTIN_RULES`` — the completeness test below then enforces "no
+#: silent drop" mechanically.
 _EXPECTED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C210",
     "TSWAP-C211",
@@ -77,6 +78,11 @@ _EXPECTED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C221",
     "TSWAP-C222",
     "TSWAP-C223",
+    # Behaviour 13 (D19 mandatory descriptions) extends the set here.
+    "TSWAP-C300",
+    "TSWAP-C301",
+    "TSWAP-C302",
+    "TSWAP-C303",
 )
 
 
