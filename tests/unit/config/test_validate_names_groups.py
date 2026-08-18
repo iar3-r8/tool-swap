@@ -21,11 +21,12 @@ import — are the contract.
 Pinned public API (the names the GREEN step must add to ``validate.py``):
 
 - ``TSWAP_C210_RULE`` … ``TSWAP_C223_RULE`` — module-level ``Rule``
-  instances with ids ``TSWAP-C210`` … ``TSWAP-C223`` (``TSWAP-C223`` is
-  WARNING, the rest ERROR).  They must register themselves at import time
-  via explicit ``register`` calls (behaviour 12), so a re-import
-  (``importlib.reload``) of the module restores the six ids in a fresh
-  registry — pinned by one dedicated reload test.
+  constants with ids ``TSWAP-C210`` … ``TSWAP-C223`` (``TSWAP-C223`` is
+  WARNING, the rest ERROR).  They are aggregated in the
+  ``BUILTIN_RULES`` tuple and registered by the explicit, idempotent
+  ``register_builtin_rules()`` entry point (called once by the CLI,
+  behaviour 21) — importing ``validate.py`` registers nothing
+  ("Registration mechanism — DECIDED", 2026-08-18; no reload-based test).
 - ``effective_groups(raw: dict) -> dict[str, dict]`` — pure helper: when
   ``raw`` has NO ``"groups"`` key at all it returns the synthesized
   ``{"default": {"max_resident": 4, "eviction": "lru"}}``; when ``"groups"``
@@ -50,7 +51,6 @@ diagnostics=[])``.
 from __future__ import annotations
 
 import copy
-import importlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Final
@@ -68,6 +68,8 @@ from tool_swap.config.validate import (  # noqa: E501  (names absent in RED step
     TSWAP_C223_RULE,
     effective_groups,
     register,
+    register_builtin_rules,
+    registered_rule_ids,
     unregister_all,
     validate_config,
 )
@@ -244,28 +246,35 @@ def test_effective_groups_returns_groups_block_unchanged_and_deep_copied() -> No
 # ---------------------------------------------------------------------------
 
 
-def test_behaviour_12_rules_are_registered_at_import_time() -> None:
-    """Importing validate.py registers the six behaviour-12 rules.
+def test_register_builtin_rules_registers_the_six_behaviour_12_ids() -> None:
+    """The central entry point registers the six behaviour-12 rules.
 
-    A plain re-import cannot prove the import-time registration (the module
-    is already loaded and the autouse fixture has cleared the registry), so
-    this single dedicated test reloads the module in-process and reads the
-    fresh registry.
+    Proves the same thing the retired import-time reload test reached for —
+    the behaviour-12 rules are reachable from a central entry point and
+    none is dropped — without module reloading and with no dependence on
+    test collection order.  The reload form was superseded by the
+    "Registration mechanism — DECIDED" (2026-08-18) mechanism: the rules
+    are module-level constants aggregated in ``BUILTIN_RULES`` and
+    registered by the explicit, idempotent ``register_builtin_rules()``.
 
-    Arrangement: the registry cleared by the autouse fixture.
-    Action: ``importlib.reload`` ``tool_swap.config.validate`` and read the
-    reloaded module's own ``registered_rule_ids``.
-    Assertion: all six behaviour-12 ids are registered in the fresh registry.
+    Arrangement: the registry cleared by the autouse fixture, with none of
+    the six ids registered.
+    Action: call ``register_builtin_rules()``.
+    Assertion: ``registered_rule_ids()`` equals exactly the six
+    behaviour-12 ids.
     """
-    import tool_swap.config.validate as validate_module
+    assert registered_rule_ids() == []
 
-    importlib.reload(validate_module)
-    try:
-        ids = validate_module.registered_rule_ids()
-    finally:
-        validate_module.unregister_all()
+    register_builtin_rules()
 
-    assert set(_BEHAVIOUR_12_IDS) <= set(ids)
+    assert registered_rule_ids() == [
+        "TSWAP-C210",
+        "TSWAP-C211",
+        "TSWAP-C220",
+        "TSWAP-C221",
+        "TSWAP-C222",
+        "TSWAP-C223",
+    ]
 
 
 def test_behaviour_12_rule_objects_carry_expected_ids_and_severities() -> None:
@@ -617,7 +626,7 @@ def test_c223_warns_on_group_referenced_by_no_tool() -> None:
     tools = {"alpha": _tool("alpha")}  # resolves to "default"
     raw = {"tools": {"alpha": {}}, "groups": _valid_group_block() | {"orphan": {"max_resident": 2, "eviction": "lru"}}}
 
-    report = validate_config(cfg=_config(tools=tools, raw=raw))
+    report = validate_config(_config(tools=tools, raw=raw))
 
     by_code = _diagnostics_by_code(report)
     assert set(by_code) == {"TSWAP-C223"}
