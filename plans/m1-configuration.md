@@ -206,6 +206,50 @@ The code table lives in one module and is rendered into the generated docs (beha
 - **Edge cases:** a rule raising an unexpected exception is caught and reported as an internal diagnostic naming the rule id, rather than crashing the whole command and hiding the other findings.
 - **Error behaviour:** never raises for config content.
 - **Files:** `src/tool_swap/config/validate.py` (new), `tests/unit/config/test_validate_registry.py`.
+- **Status: SHIPPED (committed).** Line 205 above states a *requirement* (no rule silently dropped) but not a *mechanism*. The mechanism is decided below; under that decision **both** of behaviour 11's registry tests remain correct and unchanged — see "Registration mechanism" next.
+
+### Registration mechanism — DECIDED (2026-08-18)
+
+**The ambiguity.** Behaviour 11 ships an empty registry and its docstring says *"Importing `validate.py` never registers a rule."* Behaviour 12's committed RED test pins the opposite (import-time self-registration, verified by `importlib.reload`). Line 205 requires that no rule be silently dropped but names no mechanism. Behaviours 12–19 all need one, and behaviour 21 cannot produce a full report without it.
+
+**Options considered.**
+
+| | Option A — import-time self-registration | Option B — explicit `register_builtin_rules()` | Option C — per-test-module registration only |
+|---|---|---|---|
+| Mechanism | `validate.py` calls `register(...)` at module top level | `validate.py` defines `BUILTIN_RULES` + an idempotent `register_builtin_rules()`; the CLI entry point calls it once | Each test module registers what it needs; no central entry point |
+| B11 fresh-interpreter test | **Breaks** — a fresh interpreter would report six ids, not `[]` | **Passes unchanged** — import still registers nothing | Passes unchanged |
+| B11 `import_module` test | Passes only by accident (an already-loaded module is not re-executed), so it would assert nothing | **Passes, and means what it says** | Passes |
+| Duplicate-registration RAISING | Fine on `reload` (a fresh namespace), but a genuine double-import path collides with `ValueError` | `register()` keeps its strict duplicate guard; the bulk entry point is a no-op for rules already registered as the *same object*, so re-entry never raises while a real id clash still does | N/A |
+| Reload idempotency | **Hazardous.** `reload` rebinds the module global to a *new* `_RuleRegistry`, orphaning every `from ... import RULES` binding held elsewhere — including behaviour 11's test module. Collection is alphabetical (`names_groups` before `registry`), so the reload poisons B11's later assertions | No reload anywhere; the registry object is never replaced | No reload anywhere |
+| Test isolation (autouse `unregister_all`) | Fighting it: the fixture wipes the registry, and the only way to restore it is the hazardous reload | Working with it: a test registers exactly the rules it exercises, or calls the entry point deliberately | Working with it |
+| Line 205 no-silent-drop | Satisfied by import | **Satisfied by a completeness test** over `BUILTIN_RULES` vs the §6 scope table | **Violated** — a rule nobody registers is invisible |
+| B21 full report | Implicit, order-dependent on who imported what | One deterministic call site | No answer |
+| M5 move-not-reimplement | Rules are reachable only as import side effects | `BUILTIN_RULES` **is** the list M5 moves; the `Rule` shape is unchanged | Nothing to move |
+
+**Decision: Option B — explicit registration via `register_builtin_rules()`.** It is the only option that satisfies line 205 without invalidating a single committed behaviour-11 test, and it removes the `importlib.reload` hazard that would otherwise make the suite order-dependent.
+
+Contract added by behaviour 11a below:
+
+- `BUILTIN_RULES: tuple[Rule, ...]` — every rule M1 ships, in code order. Behaviours 12–19 each append their own rules to it.
+- `register_builtin_rules() -> None` — registers every rule in `BUILTIN_RULES`. **Idempotent:** a rule already registered *as the same object* is skipped; an id registered by a *different* object still raises `ValueError` through `register()`, so the duplicate-id guard is preserved rather than weakened.
+- Importing `validate.py` continues to register nothing. This keeps `config` a side-effect-free leaf package (behaviour 26) and keeps the fresh-interpreter test honest as the number of rules grows.
+
+### Behaviour 11a — the registration entry point (`BUILTIN_RULES`, `register_builtin_rules()`)
+
+*New numbered item, added 2026-08-18 by the decision above. Behaviour 11 is already committed, so this is a separate red→green→commit cycle. It must land **before** behaviour 12's green step, because behaviour 12's rules are the first entries in `BUILTIN_RULES`.*
+
+- **Inputs:** the module's own `BUILTIN_RULES` tuple.
+- **Expected outputs:**
+  - `BUILTIN_RULES` exists and is a tuple of `Rule`. While behaviour 11a is the only landed step it is **empty**; each of behaviours 12–19 adds its rules and extends the completeness assertion.
+  - `register_builtin_rules()` leaves `registered_rule_ids()` equal to `[rule.id for rule in BUILTIN_RULES]`.
+  - **Idempotency:** calling it twice in a row is not an error and does not duplicate ids — asserted directly, because behaviour 21 and the test suite may both reach it.
+  - After `unregister_all()`, calling it again restores exactly the same ids — the fixture-friendly property that makes Option B work with the autouse reset fixtures.
+  - A rule id present in `BUILTIN_RULES` twice (a genuine authoring mistake) raises `ValueError` naming the id, via the existing `register()` guard.
+  - Importing `validate.py` still registers nothing: behaviour 11's [`test_fresh_interpreter_starts_with_an_empty_registry`](tests/unit/config/test_validate_registry.py:685) and [`test_importing_validate_leaves_the_registry_unchanged`](tests/unit/config/test_validate_registry.py:668) stay green **unchanged**, and remain green for the rest of M1.
+  - **The line-205 completeness test lives here**: the set of `BUILTIN_RULES` ids equals the set of codes the §6 rule → behaviour map marks in scope for M1, so a rule cannot be quietly dropped. It is extended by each of behaviours 12–19, which is what makes "no silent drop" mechanical rather than aspirational.
+- **Edge cases:** no `importlib.reload` of `validate.py` anywhere in the suite. The registry is live module-level state, and `reload` rebinds it to a new object while other modules keep the old binding — a suite-order-dependent failure. A test asserting the registry survives an ordinary re-import (`import_module`) is the correct, non-destructive form.
+- **Error behaviour:** `register_builtin_rules()` never raises for config content; it raises only for an authoring error in `BUILTIN_RULES` itself.
+- **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_registry_builtins.py` (new — a new file rather than an edit to the committed behaviour-11 file, so that file's shipped assertions stay untouched).
 
 ### Behaviour 12 — names, duplicates, and group references (§6 rules 2, 3)
 
@@ -219,6 +263,27 @@ The code table lives in one module and is rendered into the generated docs (beha
   - The implicit `default` group: a tool with no `group:` resolves to `default`. If `groups:` is absent entirely, a `default` group with `max_resident: 4` is synthesised (so the five-line config works) with origin `built-in default`. If `groups:` is present but omits `default` while some tool needs it, that is `TSWAP-C220` like any other missing group — silently synthesising into a hand-written `groups:` block would hide a typo.
 - **Edge cases:** a group defined but referenced by nothing → `TSWAP-C223` warning (probably a rename); a tool named `default` is legal (names live in different namespaces) and is tested so nobody "fixes" it.
 - **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_names_groups.py`.
+
+#### Confirmed contract details (2026-08-18)
+
+Settled by the registration decision above and by the committed RED test [`tests/unit/config/test_validate_names_groups.py`](tests/unit/config/test_validate_names_groups.py:1) (commit `a285d5b`):
+
+- **Rule objects:** module-level constants `TSWAP_C210_RULE`, `TSWAP_C211_RULE`, `TSWAP_C220_RULE`, `TSWAP_C221_RULE`, `TSWAP_C222_RULE`, `TSWAP_C223_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is the matching code. `TSWAP-C223` is `Severity.WARNING`; the other five are `Severity.ERROR`. Every `remedy` is non-empty.
+- **No self-registration.** The six rules are appended to `BUILTIN_RULES` (behaviour 11a) and are registered by `register_builtin_rules()`. `validate.py` must **not** call `register(...)` at import time. Behaviour 12's green step therefore also extends behaviour 11a's completeness test with these six ids.
+- **`effective_groups(raw: dict) -> dict[str, dict]`** — a pure helper: when `raw` has no `"groups"` key it returns the synthesised `{"default": {"max_resident": 4, "eviction": "lru"}}`; when `"groups"` is present it returns that block **deep-copied and otherwise unchanged**, never inserting a `default` entry. The synthesised values match [`GroupConfig`](src/tool_swap/config/schema.py:120)'s field defaults, so the synthesis cannot drift from the schema.
+- **Location contract:** every diagnostic carries `Location(file=str(config.path), yaml_path=<dotted path>, line=config.line_for(<dotted path>))` — `tools.<name>` for `C210`, `groups.<name>.max_resident` for `C221`, `groups.<name>.eviction` for `C222`. A `line_for` returning `None` surfaces `line=None`; the file is never hardcoded.
+- **`C220` nearest-group suggestion** reuses `config/suggest.py` (behaviour 4), so the "did you mean" logic has one implementation.
+
+### Behaviour 12a — retire the reload-based registration test
+
+*New numbered item, added 2026-08-18. Behaviour 12's RED step is already committed, so correcting it is itself a test change = a new red step = a new commit.*
+
+- **Superseded test:** [`test_behaviour_12_rules_are_registered_at_import_time`](tests/unit/config/test_validate_names_groups.py:247) in `tests/unit/config/test_validate_names_groups.py`. It pins import-time self-registration, which the decision above rejects, and it does so via `importlib.reload(tool_swap.config.validate)`.
+- **Why it must go, beyond the decision:** `reload` re-executes the module top level and **rebinds `RULES` to a new `_RuleRegistry` object**, while [`tests/unit/config/test_validate_registry.py`](tests/unit/config/test_validate_registry.py:95) holds a `from tool_swap.config.validate import RULES` binding to the original. Test files are collected alphabetically, so `test_validate_names_groups.py` reloads the module *before* `test_validate_registry.py` runs, and that file's `assert (r1, r2) == RULES` assertions then compare against a detached, permanently-empty object. The reload is a latent cross-file failure regardless of which registration mechanism wins.
+- **Replacement (the new red):** a test asserting that `register_builtin_rules()` registers the six behaviour-12 ids into a registry cleared by the autouse fixture, and that the ids are absent beforehand. This proves the same thing the reload test was reaching for — the rules are reachable from a central entry point and none is dropped — with no module reloading and no dependence on collection order.
+- **Also amended in the same red step:** the module docstring's pinned-API paragraph (lines 23–28), which states the rules *"must register themselves at import time via explicit `register` calls … pinned by one dedicated reload test"*. The other 20-odd tests in the file are unaffected: each already calls `register(TSWAP_C2xx_RULE)` explicitly, because the autouse `unregister_all()` fixture clears the registry before every test — so self-registration was never what made them pass.
+- **Behaviour 11's tests are NOT amended.** Both [`test_fresh_interpreter_starts_with_an_empty_registry`](tests/unit/config/test_validate_registry.py:685) and [`test_importing_validate_leaves_the_registry_unchanged`](tests/unit/config/test_validate_registry.py:668) remain correct and unchanged under this decision. This is the decisive practical advantage of Option B: it invalidates one test in one uncommitted-behaviour file rather than two tests in a shipped one.
+- **Files:** `tests/unit/config/test_validate_names_groups.py` (test change only; no source change).
 
 ### Behaviour 13 — D19, the mandatory-description rule (§6 rule 6b)
 
@@ -338,6 +403,7 @@ The code table lives in one module and is rendered into the generated docs (beha
 
 - **Inputs:** CLI invocations against fixture configs.
 - **Expected outputs:**
+  - **`register_builtin_rules()` (behaviour 11a) is called exactly once, at the start of the validate command**, before any rule runs. This is the deterministic "every rule registered exactly once" guarantee the full report depends on. A test asserts the reported code set covers every rule in `BUILTIN_RULES`, and that invoking the CLI twice in one process does not raise a duplicate-id `ValueError`.
   - `tswap validate` validates `./tools.yaml`; `--config <path>` overrides; `--env-file <path>` overrides `.env`.
   - `tswap validate <tool>` restricts **reporting** to one tool, but still loads and resolves the whole file — cross-tool rules (duplicate ports, group starvation) cannot be evaluated otherwise, and a per-tool validate that misses them would be misleading. Cross-tool diagnostics implicating the named tool are reported.
   - `--all` is accepted as an explicit synonym of the default (it appears in `plan/07_CLI_AND_OPS.md` §2).
@@ -416,6 +482,7 @@ The code table lives in one module and is rendered into the generated docs (beha
 - **Expected outputs:** `make lint` exits 0 (`ruff check`, `ruff format --check`, `mypy src/` strict); import-linter passes; the full suite is green with **zero** warnings; the 206-test baseline is intact.
 - **Edge cases:**
   - `tool_swap.config` and `tool_swap.schema` must not import `tool_swap.cli`, `tool_swap.lifecycle`, `tool_swap.backend` or `tool_swap.proxy` — the config layer is a leaf that everything else depends on. **Add an import-linter contract expressing this** while there is no code to violate it, exactly the argument M0 used for its two contracts.
+  - **Importing `validate.py` has no side effects** (the registration decision above). The behaviour-11 fresh-interpreter test is the executable form of this: the CLI importing `validate` pulls in no runtime dependency and mutates no global state. A module that registers rules on import would make "import boundaries are clean" mean "and also, importing does work".
   - `tool_swap.cli` may import `config` and `schema`; `schema` may import `config.errors` but **not** `config.schema` (the compiler is usable standalone by the M5 preflight path and by the runtime's own schema module).
   - mypy strict over `yaml`/`jsonschema` boundaries needs explicit narrowing rather than `Any` leaking into typed code.
 - **Error behaviour:** n/a.
@@ -532,8 +599,9 @@ tests/unit/config/
 ├── test_origin.py                     [B9]     test_docs_generated.py          [B25]
 ├── test_resolver.py                   [B10]
 ├── test_merge_semantics.py            [B10]
-├── test_validate_registry.py          [B11]
-├── test_validate_names_groups.py      [B12]
+├── test_validate_registry.py          [B11]   (committed — NOT amended by the 11a/12a decision)
+├── test_validate_registry_builtins.py [B11a]  (new — BUILTIN_RULES + register_builtin_rules)
+├── test_validate_names_groups.py      [B12]   (committed — one test superseded by B12a)
 └── test_validate_descriptions.py      [B13]
 
 tests/unit/schema/                     (new directory — needs a .gitkeep-free real module)
@@ -567,17 +635,20 @@ graph TD
     B8 --> B10
     B9 --> B10
     B10 --> B11[11 rule registry]
-    B11 --> B12[12 names + groups]
-    B11 --> B13[13 D19 descriptions]
-    B11 --> B14[14 reserved keys]
-    B11 --> B15[15 image source]
-    B11 --> B16[16 devices ports]
-    B11 --> B17[17 mounts]
-    B11 --> B18[18 contradictions]
-    B11 --> B19[19 D9 starvation]
+    B11 --> B11a[11a BUILTIN_RULES + register_builtin_rules]
+    B11a --> B12[12 names + groups]
+    B12 --> B12a[12a retire the reload test]
+    B11a --> B13[13 D19 descriptions]
+    B11a --> B14[14 reserved keys]
+    B11a --> B15[15 image source]
+    B11a --> B16[16 devices ports]
+    B11a --> B17[17 mounts]
+    B11a --> B18[18 contradictions]
+    B11a --> B19[19 D9 starvation]
     B4 --> B20[20 schema compiler]
     B13 --> B20
-    B19 --> B21[21 tswap validate]
+    B12a --> B21[21 tswap validate]
+    B19 --> B21
     B20 --> B21
     B21 --> B22[22 tswap config show]
     B22 --> B23[23 five-line config]
@@ -587,6 +658,8 @@ graph TD
 ```
 
 Behaviours 12–19 are siblings and could be reordered or parallelised; the listed order groups related fixtures. Behaviour 20 depends only on 4 and 13, so it may be pulled earlier if the pipeline prefers to land the compiler before the long validation run.
+
+**11a and 12a (added 2026-08-18)** are *not* optional siblings. **11a must land before behaviour 12's green step**, because `register_builtin_rules()` is how behaviour 12's rules become reachable. **12a should land immediately after 12's green step** (or be folded into 12's next red) because the reload it removes is a cross-file hazard for behaviour 11's committed tests for as long as it exists.
 
 ---
 
@@ -601,6 +674,13 @@ All of these were posted to [issue #2](https://github.com/iar3-r8/tool-swap/issu
 - **A2, A3, A4, A5, A6, A7, A9, A11** — adopted as proposed, no objection raised.
 
 Subtasks: treat this section as settled fact. Do not re-litigate; do not ask again.
+
+**A13 (new, 2026-08-18) — NOT yet confirmed by the intake source.** The registration mechanism decided above (explicit `register_builtin_rules()`, no import-time self-registration) is a design choice **not** covered by Q1–Q9 or by A1–A12, and therefore not covered by the issue's "ALL CONFIRMED" comment. It is an internal-mechanism decision with no effect on the config file format, the diagnostic codes, the CLI surface, or any Definition-of-Done item, so it does not need maintainer sign-off to proceed. It is recorded here for visibility, and should be mentioned in the pull-request description rather than blocking work. The one part worth a maintainer's eye is the consequence: behaviour 12's committed reload test is superseded (behaviour 12a).
+
+Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
+
+- The synthesised `default` group carries `eviction: "lru"` as well as `max_resident: 4`. Plan line 219 mentions only `max_resident: 4`; the value matches [`GroupConfig`](src/tool_swap/config/schema.py:120)'s defaults and `plan/02_CONFIGURATION.md`'s `groups:` example, so it is consistent rather than invented.
+- `TSWAP-C999` is the internal "a rule raised" code, pinned by behaviour 11's committed tests. It is outside the §6 rule set and must be excluded from behaviour 11a's `BUILTIN_RULES` completeness comparison.
 
 | # | Assumption | Proposed default | Affects |
 |---|---|---|---|
