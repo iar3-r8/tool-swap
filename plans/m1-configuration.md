@@ -655,7 +655,237 @@ The two constants are a **known duplication**: one asserts the contents of `BUIL
   - `TSWAP-C515` — `build.context` does not exist, or `build.dockerfile` does not exist within it → error with resolved paths.
   - Validation is **static only** — the handler file is never imported. `tswap validate` must run with no Docker and none of the tool's dependencies installed (§2 *"No Docker needed — runs in CI"*), and importing a handler would pull in torch. A test asserts no import occurs (a `sys.modules` snapshot before/after).
 - **Edge cases:** a handler file that exists but is a directory; a handler path escaping the tool directory via `../` (allowed, but `TSWAP-C516` warning, since it breaks the portability that `path:` exists to provide); a class name that is a valid Python identifier but not a class cannot be checked statically and is explicitly out of scope for M1 (it is M5 preflight stage 1).
-- **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_image_source.py`.
+- **Files:** `src/tool_swap/config/schema.py` (the `image` field below), `src/tool_swap/config/resolver.py` (the five carrier fields below), `src/tool_swap/config/validate.py` (the probe + the seven rules), `tests/unit/config/test_validate_reserved.py` (the preparatory repair, item 0), `tests/unit/config/test_validate_image_source.py`.
+
+#### Confirmed contract details (2026-08-18)
+
+Seven rules, and the **first rule group in M1 that touches the filesystem**. Behaviours 11–14 established that every rule is a pure function of `ValidatedConfig`; this block pins how that property survives contact with the disk, and pins the whole data path so the RED step can be written and the GREEN step implemented without guessing. **One shipped test breaks** — [`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264) — and item 0 below is the named preparatory red sub-step that repairs it *before* behaviour 15's red.
+
+The governing property, stated once because every decision follows from it: **the rules never touch ambient state.** Not the real filesystem directly, not `~`, not the CWD, not the clock, not the environment. Every byte of disk knowledge arrives through **one injected collaborator carried on `ValidatedConfig`**, and every path is computed **lexically**. That is what keeps `validate_config` a function of its input, keeps the tests deterministic on any runner, and makes "the handler is never imported" a structural fact rather than a promise.
+
+**0. REQUIRED PREPARATORY RED SUB-STEP — position-stabilise behaviour 14's append-order test**
+
+This must land **before** behaviour 15's red step, as its own commit, and it is a test-only change with no production change.
+
+[`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264) is **tail-anchored**:
+
+```python
+assert len(BUILTIN_RULES) == 16
+assert ids[-6:] == list(_BEHAVIOUR_14_IDS)
+```
+
+Appending the seven C5xx rules breaks **both** lines. This is exactly the failure mode behaviour 13's block predicted and avoided for itself — [`test_builtin_rules_append_the_behaviour_13_codes_in_code_order`](tests/unit/config/test_validate_descriptions.py:240) is index-anchored (*"'the last four ids' would be false as soon as behaviour 14's six C4xx rules land"*) and therefore stays green under this append. Behaviour 14's file did not follow that precedent, and behaviour 15 pays for it.
+
+The repair applies behaviour 13's pattern to behaviour 14's file:
+
+```python
+first_c400 = ids.index(_BEHAVIOUR_14_IDS[0])
+assert first_c400 == len(_BEHAVIOUR_12_IDS) + len(_BEHAVIOUR_13_IDS)   # == 10
+assert ids[first_c400 : first_c400 + len(_BEHAVIOUR_14_IDS)] == list(_BEHAVIOUR_14_IDS)
+```
+
+The `len(BUILTIN_RULES) == 16` line is **removed, not updated to 23**: a total-count assertion in a per-behaviour file is the same tail-anchoring mistake wearing a different hat, and [`test_builtin_rules_is_a_tuple_of_rules_with_unique_ids`](tests/unit/config/test_validate_registry_builtins.py:116) plus [`test_builtin_rules_cover_every_rule_behaviour_landed_so_far`](tests/unit/config/test_validate_registry_builtins.py:267) already own "nothing added, nothing dropped" mechanically. Behaviour 14's file must import `_BEHAVIOUR_12_IDS` / `_BEHAVIOUR_13_IDS` or restate their lengths as a module-top constant; restating is preferred, since cross-test-file imports are their own coupling.
+
+**Sequencing (for the TDD manager):** (0) repair behaviour 14's test, suite green, commit → (1) behaviour 15 red → (2) behaviour 15 green. Step 0 is a refactor of a committed test, so it is committed on its own, exactly as behaviour 12a retired the reload test on its own.
+
+**1. Filesystem access — an injected probe carried on `ValidatedConfig` (mechanism (c), confirmed with one refinement)**
+
+The three candidates and why two lose:
+
+| Option | Verdict |
+|---|---|
+| (a) rules call `Path.exists()` directly | **Rejected.** The rule stops being a function of its input; the tests need a real tree for every case, including the "no GPU, no Docker, no deps" CI runner behaviour 15 exists to protect. |
+| (b) a probe passed to `check()` | **Rejected.** `Rule.check(config) -> list[Diagnostic]` is pinned by behaviour 11 and implemented by 16 committed rules plus the fake rules in four test files ([`FixedDiagnosticRule`](tests/unit/config/test_validate_registry.py:125), [`RaisingRule`](tests/unit/config/test_validate_registry.py:141)). Changing the signature breaks all of them for one rule group's benefit. |
+| (c) a probe carried on `ValidatedConfig` | **Chosen.** |
+
+`ValidatedConfig`'s field list is pinned by [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) — **verified line by line**: it constructs with keyword arguments, reads back the four values, and constructs a second instance with defaults. It asserts **no field count and no field list**. Its immutability twin [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334) loops over the four names and asserts each raises. **A trailing keyword-only defaulted field therefore breaks neither**, exactly as behaviour 13's and 14's trailing carriers were safe on `ResolvedTool`. Neither committed test is amended.
+
+```python
+# validate.py, above ValidatedConfig
+def _real_is_file(path: Path) -> bool: ...     # path.is_file(), OSError -> False
+def _real_is_dir(path: Path) -> bool: ...      # path.is_dir(),  OSError -> False
+
+@dataclass(frozen=True)
+class FileProbe:
+    """The ONLY filesystem contact the config layer has."""
+    is_file: Callable[[Path], bool] = _real_is_file
+    is_dir: Callable[[Path], bool] = _real_is_dir
+
+REAL_FILESYSTEM: Final[FileProbe] = FileProbe()
+
+@dataclass(frozen=True)
+class ValidatedConfig:
+    tools: dict[str, ResolvedTool]
+    raw: dict[str, object]
+    line_for: Callable[[str], int | None] = field(default=_no_line, kw_only=True)
+    path: Path = field(default=Path("tools.yaml"), kw_only=True)
+    # --- added by behaviour 15; trailing, keyword-only, defaulted ---
+    probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
+```
+
+**The refinement on the leaning note:** the field is typed `FileProbe`, **not** `Callable[[Path], bool] | None`, and its default is the real-filesystem probe object rather than `None`.
+
+- Two predicates are needed, not one. `C513` must distinguish "absent" from "present but a directory" (the pinned edge case), and `C515` checks a **directory** (`build.context`) and a **file** (`build.dockerfile`) in one rule. A single `exists` cannot express that; two separate `Callable` fields would be two trailing fields and one more thing to keep in step. One frozen `FileProbe` groups them.
+- `None`-means-real requires every call site to write `(config.probe or REAL)(p)`. A defaulted object needs no branch, so there is no unbranched path that could accidentally hit the disk.
+- **Behaviour 16's `TSWAP-C521` GPU probe should follow this shape** and become a second trailing field (`gpu_count: int | None = None`, where `None` means "unknown, skip silently" — which behaviour 16's text already requires). Pinned here so 16 does not invent a third injection style; 16 remains free to name it.
+- Unit tests inject `FileProbe(is_file=..., is_dir=...)` backed by a `set` of paths — **no `tmp_path` needed for the rule tests**, which stay pure. Behaviour 23's five-line e2e and any loader-level test use the default and a real `tmp_path` tree. Both directions are exercised.
+- `_real_is_file` / `_real_is_dir` swallow `OSError` (permission denied, a path too long, a broken symlink loop) and return `False`. A `PermissionError` escaping a rule would become a `TSWAP-C999` "rule raised" — a validator crash where the honest answer is "I could not see that file", which the existing `C513`/`C515` message already conveys.
+- `validate_config` itself is unchanged, still takes only `ValidatedConfig`, and stays pure *with respect to its input*: given the same config **including its probe**, it returns the same report. [`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719) and [`test_validate_config_ignores_the_ambient_environment`](tests/unit/config/test_validate_registry.py:760) both keep passing unchanged — they register fake rules that never read the probe.
+
+**2. Resolution root — pinned lexically, with no disk access to compute it**
+
+A tool's `handler`, `requirements`, `build.context` and `build.dockerfile` are relative to the **tool's base directory**:
+
+| The tool has… | Base directory | Why |
+|---|---|---|
+| `path: ./tools/t` | the tool directory itself | Behaviour 8: *"Relative paths inside `tool.yaml` resolve against the `tool.yaml`'s own directory, not the CWD and not the root config's directory. This is what makes a tool directory portable."* |
+| no `path:` (fully inline) | `config.path.parent` | The §3 example writes `handler: ./tools/text_embedding/handler.py:TextEmbedding` in `tools.yaml` — a path relative to the root config, matching behaviour 8's rule for `path:` itself (*"resolves against the root config file's directory, so `tswap validate` gives identical results from any CWD"*). |
+
+**(a) How the rule knows the base directory.** `ValidatedConfig.path` is the config **file**; `config.path.parent` is the root directory. That covers the inline case. The `path:` case cannot be derived by the rule — the resolver's `values` has no `path` key (`path` is not in `BUILT_IN_DEFAULTS`) and `ValidatedConfig` does not carry `LoadedConfig`. So the tool directory is **carried**, by the resolver, as a trailing carrier field (item 3). The rule computes:
+
+```python
+base = tool.base_dir if tool.base_dir is not None else config.path.parent
+```
+
+**Resolution is `base / Path(value)`, then a purely lexical normalisation — never `Path.resolve()`.** `resolve()` touches the disk (symlink resolution) and is CWD-dependent for a relative base, which would reintroduce exactly the ambient dependence item 1 removes. The normalisation is `os.path.normpath` semantics: collapse `.`, and collapse `..` against the preceding segment textually. An absolute `handler:` is honoured as-is. `~` is **not** expanded here: the loader expands `~` for `path:` only ([`_resolve_tool_path`](src/tool_swap/config/loader.py:278)), and a `handler: ~/x.py` is a portability mistake the `C513` message will show verbatim in its resolved path, which is more informative than silently expanding it. *(Pinned; if a user reports it, expansion is additive.)*
+
+**(b) `../` escape detection — `C516`, pinned to the lexical comparison, not a string check.** After the normalisation above, compare the resolved path against the base directory: the path escapes when `base` is **not** a prefix of the resolved path, segment by segment (`os.path.commonpath`-style, or equivalently `Path.is_relative_to(base)` — a pure lexical method, no I/O). A raw string check on `".." in value` is **rejected**: it fires on the legitimate `../` that cancels out (`a/../handler.py` never leaves the directory) and misses an absolute path pointing elsewhere entirely, which is the same portability loss. The comparison is on the **normalised** path so the two cases come out right. An **absolute** `handler:`/`requirements:`/`build.context:` outside `base` is a `C516` too, for the identical reason. `C516` is one WARNING **per offending path**, and it does not suppress `C513`/`C514`/`C515` — an escaping path that also does not exist yields both, since they are different problems.
+
+**(c) "the resolved absolute path tried" in the messages.** Pinned as **`str(resolved)`** — the normalised path from (a), placed in the **message** (not only the remedy), so it survives `--json`. When `base` is itself relative (a `ValidatedConfig` built by hand with the default `Path("tools.yaml")`, whose `.parent` is `.`), the rendered path is relative and that is **correct**, not a bug: the rule must not call `Path.cwd()` to absolutise it. In real runs the CLI passes an absolute config path, so real messages carry absolute paths. Tests assert `str(<the path the fake probe was keyed on>) in message`, never a hardcoded absolute string.
+
+**3. Source inventory — `image`, `build`, `handler`, and what the rule can actually see**
+
+**(a) `image` is not in the schema today.** Verified: [`ToolConfig`](src/tool_swap/config/schema.py:151) has `path` / `handler` / `requirements` / `build` / … and **no `image`**; [`ToolYamlConfig`](src/tool_swap/config/schema.py:205) has no `image` either. `plan/02` §5.2's field table lists `image` as a legitimate tool-level key (*"Pin a pre-built image of this tool instead of building it"*), so a config writing `image:` today gets a `TSWAP-C101` unknown-key error — which would make `C510`/`C511` unreachable for it, the same trap behaviour 14's `C405` fell into. The green step adds it:
+
+```python
+# ToolConfig only:
+image: str | None = None
+```
+
+**`ToolYamlConfig` does not get `image`.** §4's `tool.yaml` reference has no `image:` key — image selection there is `runtime.base_image`, an M2 concern the resolver already ignores via `_PARTIAL_BLOCKS`. Adding it would invent a config surface the spec does not describe. *(Flagged as assumption **A15**.)*
+
+**The carrier, pinned: `image` is a carrier field on `ResolvedTool`, NOT a `values` key.** This is the behaviour-13 decision applied verbatim, and the 47-key pins are why:
+
+| Route | Breaks |
+|---|---|
+| add `image` to `values` only | [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) — `set(result.values) == set(BUILT_IN_DEFAULTS)`, set equality both ways |
+| add `image` to `BUILT_IN_DEFAULTS` too | [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324) — a literal 47-name table in the test file |
+
+A carrier field breaks neither, and it is the honest modelling for the same reason as `description`: `image` has **no built-in default** (there is nothing sensible to default it to) and its *absence* is semantically load-bearing for `C510`/`C511`. `BUILT_IN_DEFAULTS` and `values` both stay at **47 keys**, unamended.
+
+**Resolver additions — five trailing carrier fields** (appended after behaviour 14's `reserved_keys`, so every existing keyword construction site stays valid, and [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99) — which asserts the four original fields and frozenness, not the absence of others — stays green):
+
+```python
+image: str | None = None                    # layered inline > tool.yaml (tool.yaml never supplies it)
+handler: str | None = None                  # layered inline > tool.yaml
+requirements: str | None = None             # inline, or tool.yaml's runtime.requirements
+build: dict[str, object] | None = None      # inline only; {"context": ..., "dockerfile": ...}
+base_dir: Path | None = None                # the tool directory; None = "no path:, use config.path.parent"
+```
+
+- All five are layered/extracted by the **same** `_winner_index_safe` helper behaviour 13 added for `description`; `None` means "no layer supplied it", which is exactly what `C511` tests for. Origins are recorded at `image` / `handler` / `requirements` / `build` / `base_dir`, and **only when a layer supplied the key**, preserving behaviour 9's `KeyError` contract.
+- `handler` is a **top-level** key of `tool.yaml` (§4: `handler: handler.py:CXRToEmbedding`) and is currently dropped: [`_flatten_tool_yaml`](src/tool_swap/config/resolver.py:358) copies only top-level keys that are in `BUILT_IN_DEFAULTS`, and `handler` is not. Extraction is additive and produces no new `TSWAP-C106` (the first loop only walks `_KNOWN_BLOCKS`).
+- `requirements` in `tool.yaml` lives at **`runtime.requirements`** (§4), inside `runtime` — a `_PARTIAL_BLOCKS` member whose unmapped keys are ignored silently. Two options, and the safe one is pinned: **extract it in the carrier pass, do NOT add `("runtime", "requirements")` to `_FLATTENING_TABLE`.** Adding it to the table would put `requirements` in `flat`, and `flat` feeds the layer whose keys are resolved into `values` — reaching a 48th key and breaking both pins. The carrier pass reads `tool_yaml["runtime"]["requirements"]` directly. As a bonus this leaves [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:71)'s local `FLATTENING_TABLE` copy untouched, so the drift hazard behaviour 14 noted is not made worse.
+- `base_dir` is set by whoever builds `ValidatedConfig` from a `LoadedConfig` (behaviour 21's CLI wiring) out of [`LoadedConfig.tool_yaml(name)`](src/tool_swap/config/loader.py:514)'s returned path — its `.parent`, which the loader's own docstring already names as *"the directory that relative paths inside `tool.yaml` resolve against"*. `resolve_tool` gains an optional `base_dir` parameter it stores verbatim; it does **not** compute one, and it never touches the filesystem. Behaviour 10's purity is preserved.
+
+**(b) Counting sources for `C510` — pinned, with the spec's own wording as evidence.** §6 rule 5 reads *"Exactly one image source: `image` XOR `build` XOR (managed → we build it)"*, and plan line 650 phrases the third as *"(managed via `handler`+`requirements`)"*. The counting rule:
+
+```
+sources = []
+if image is not None:              sources.append("image")
+if build is not None:              sources.append("build")
+if handler is not None:            sources.append("handler")     # the managed source
+```
+
+- **A tool with both `build:` and `handler:` IS a `C510`.** The XOR is three-way, and the message names both. This is the honest reading: the §3 example (c) `totalsegmentator` supplies `build.context` + `build.dockerfile` and **no `handler:`** — its comment (*"must install `tool_swap_runtime` and run the handler"*) confirms the Dockerfile owns the handler wiring in that mode, so a config-level `handler:` alongside `build:` is genuinely ambiguous about who builds the image. **Note the tension with behaviour 8's line 161**, which says *"`path:` **and** an inline `handler:` in the same entry: legal"* — that is about `path:` vs `handler:`, not `build:` vs `handler:`, and `path:` is *not* a source (see (c)). The two lines are consistent under this pinning, and line 161's own final clause defers `path:`+`build:` to this behaviour.
+- `requirements` is **not** counted. It is an *attribute* of the managed source, optional (a handler with no third-party imports needs none), and `C514` only fires when it is named. A `requirements:` with no `handler:` contributes nothing to the count and is therefore covered by `C511`, not `C510`.
+- `build` present but empty/malformed (`build: {}`) still **counts as present** — presence is the signal, and `BuildConfig` requires `context`, so a malformed one is already a `TSWAP-C105` from the schema layer. One mistake, one diagnostic.
+
+**(c) `C511`, and the honest statement of what the rule cannot see.** `path:` is **not** an image source — it is a *layer supplier*. A tool with `path:` and no inline source is legal because its `tool.yaml` supplies `handler:`.
+
+**Pinned: the rule does not special-case `path:` at all, and it does not need to.** Under item 3's carrier design the resolver has *already merged* `tool.yaml`'s `handler` into `ResolvedTool.handler`, so a `path:`-based tool arrives at the rule with `handler` set, and both `C510` and `C511` see the true, post-merge picture. This is strictly better than the "skip when `path:` is set" fallback the task suggested, and it is only available *because* `handler` is extracted from `tool.yaml` — which is why item 3's carrier list includes it.
+
+What the rule sees, stated plainly and honestly:
+
+- **Sees:** the post-resolution merge of inline + `tool.yaml` (+ `defaults:`/group/built-in, which contribute none of these five keys) for `image` / `handler` / `requirements` / `build`, and `base_dir`.
+- **Cannot see:** the raw `tool.yaml` mapping, its file path (beyond `base_dir`), its line numbers, or `LoadedConfig` in any form. `config.raw` is the **inline layer only**, so it must **not** be consulted for source presence — a `tool.yaml`-supplied `handler` is absent from `raw`, and reading `raw` would resurrect a `C511` false positive on every `path:` tool. `config.raw` stays in use only for behaviour 12's group rules.
+- **Consequence, pinned:** when `base_dir` is `None` **and** a tool's `handler` came from a `tool.yaml`, paths would resolve against the wrong root. That combination is unreachable in the real pipeline (a `tool.yaml` layer exists only when `path:` was included, which is exactly when `base_dir` is set) and is a fixture error in tests. It is not defended against with a diagnostic.
+
+**4. `C512` — the `file.py:Name` grammar, pinned exactly**
+
+Split on the **first** `:` (a Windows-style `C:\...` absolute handler is out of scope; the spec's form is `file:ClassName`). Both halves must be non-empty after stripping surrounding whitespace. Then:
+
+| Part | Rule |
+|---|---|
+| file | non-empty; **must end with `.py`** |
+| name | non-empty; `str.isidentifier()` **and** not a Python keyword (`keyword.iskeyword`) |
+
+**`.py` is REQUIRED — a decision, since the plan's bad-case list does not include it.** §4 calls the field *"Entry point: `file:ClassName`"* and every example in `plan/02` and `plan/03` writes `handler.py:Cls`. A `handler:Cls` without the extension would resolve to a file that cannot exist as a Python module, so `C513` would fire with a confusing "file not found: …/handler" message. `C512` catching it first gives the actionable answer. The `C512` message shows the expected form `file.py:ClassName` and the value found, so the fix is obvious either way. *(Flagged as assumption **A16** — a rejection the plan's case list does not enumerate.)*
+
+`str.isidentifier()` is pinned over a regex: it is the language's own definition (Unicode-correct), and a regex would be a second, drifting definition of "identifier". The keyword check is added because `handler.py:class` satisfies `isidentifier()` yet can never name a class. A **dotted** name (`handler.py:pkg.Cls`) fails `isidentifier()` and is a `C512`; nested attribute lookup is not part of the documented form.
+
+`C512` **suppresses `C513`** for that tool: an unparseable handler string has no file part to look for, and emitting both would be two diagnostics for one mistake. When the string parses, `C513` checks the file part. `C516` is likewise evaluated only for a parseable handler.
+
+The handler string is read from `tool.handler` (the carrier field of item 3) — never from `values`, never from `raw`.
+
+**5. Location contract per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour-12/13/14 form. The file is never hardcoded, `line=None` is a legal outcome, and tests assert `location.line == config.line_for(location.yaml_path)` rather than a literal line number.
+
+| Code | `yaml_path` |
+|---|---|
+| `C510` | `tools.<key>` |
+| `C511` | `tools.<key>` |
+| `C512` | `tools.<key>.handler` |
+| `C513` | `tools.<key>.handler` |
+| `C514` | `tools.<key>.requirements` |
+| `C515` (context) | `tools.<key>.build.context` |
+| `C515` (dockerfile) | `tools.<key>.build.dockerfile` |
+| `C516` | the path's own key: `tools.<key>.handler` / `.requirements` / `.build.context` / `.build.dockerfile` |
+
+`<key>` is the `tools:` **map key**, matching behaviours 12–14. These are all **dict** paths, so no list indices arise and the dotted-numeric-vs-brackets question of behaviour 13 does not apply here. A `tool.yaml`-authored `handler` resolves to `tools.<key>.handler` with `line=None` (the line map belongs to the root config); as in behaviours 13 and 14 the **remedies must be self-sufficient** and name *"the tool's `tool.yaml`, or its inline `tools.<name>` entry"* rather than pretending to know which file was authored. The resolved path in the message is what actually locates the problem for these codes.
+
+**6. Static-only, and the directory case**
+
+- **No import, ever.** The rules call only `probe.is_file` / `probe.is_dir` on computed paths. There is no `importlib`, no `exec`, no `compile`, no `read_text` — the handler file's *contents* are never opened, let alone executed. With the probe injected, a unit test's fake never touches the disk at all, so "no import" is structural.
+- **The pinned test:** snapshot `set(sys.modules)` before `validate_config`, run it against a config whose handler names a **real file on `tmp_path` that raises on import** (e.g. `raise RuntimeError("must not be imported")` at module top level, or `import definitely_not_installed_xyz`), using the **default real probe** so the file genuinely exists and `C513` does not fire. Assert: no new modules (`set(sys.modules) - before == set()`), the handler's module name is absent from `sys.modules`, and the call did not raise. Running it against a real file with the real probe is the point — a fake probe would prove nothing about importing.
+- **A handler path that exists but is a DIRECTORY → `C513` fires** (it is not a file). Pinned message direction: state that the path **"is a directory, not a file"**, alongside the same resolved path. Distinguishing it from plain absence is why `FileProbe` carries `is_dir` as well as `is_file`. Mechanically: `C513` fires when `not probe.is_file(resolved)`; the message adds the "is a directory" clause when `probe.is_dir(resolved)` is true. Same treatment for `C514`. For `C515`, `build.context` must be a **directory** (`is_dir`) — a context pointing at a file gets the mirrored message *"is a file, not a directory"* — and `build.dockerfile` must be a **file**, resolved **within the context directory** (per plan line 655, *"does not exist within it"*): `context_resolved / dockerfile`, unless `dockerfile` is absolute, in which case it is used as-is and also `C516`-checked against `base`.
+- **Out of scope, restated:** whether the named class exists, is a class, or has `load`/`predict`/`unload` is M5 preflight stage 1 (§5's *"No handler import"* boundary). `C512` checks the *shape of the string*, nothing about the code.
+
+**7. Severity**
+
+`C510`, `C511`, `C512`, `C513`, `C514`, `C515` are **`Severity.ERROR`**. `C516` is **`Severity.WARNING`** (plan line 657: the escape is *allowed*). Every `remedy` is non-empty.
+
+**8. Registration**
+
+Module-level constants `TSWAP_C510_RULE` … `TSWAP_C516_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, **no import-time self-registration**, appended to `BUILTIN_RULES` in code order after behaviour 14's six — **23 landed rules in total** (6 + 4 + 6 + 7).
+
+The green step extends **both** completeness constants, and both are required:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file).
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file).
+
+**The two-constant duplication is the known wart behaviour 14 recorded** — one asserts the contents of `BUILTIN_RULES`, the other what `register_builtin_rules()` puts in the registry, and nothing keeps them in step but discipline. Behaviour 15 **extends both and again does not fix it**; that is now the second behaviour to pay the tax, and collapsing them is worth its own step after 19 (when the constant stops growing) rather than mid-stream.
+
+**9. Shipped pins checked, one by one**
+
+- **BREAKS — [`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264)**, both its `len(BUILTIN_RULES) == 16` and its `ids[-6:]` tail assertion. Repaired by the **preparatory red sub-step, item 0**, before behaviour 15's red.
+- **Safe — [`test_builtin_rules_append_the_behaviour_13_codes_in_code_order`](tests/unit/config/test_validate_descriptions.py:240):** index-anchored at `len(_BEHAVIOUR_12_IDS)` by deliberate design. Unchanged.
+- **Safe — the position-stable C2xx/C3xx registry tests** and [`test_builtin_rules_carries_the_behaviour_12_codes_in_code_order`](tests/unit/config/test_validate_registry_builtins.py:131): the latter compares against `_EXPECTED_BUILTIN_IDS`, which the green step extends in the same commit, so it stays exact.
+- **Safe — [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311)** and [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334): verified to construct by keyword and assert per-field values only — **no field count, no field list**. A trailing keyword-only defaulted `probe` is invisible to both. Neither is amended.
+- **Safe — [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99):** asserts the four original fields and frozenness, not the absence of others.
+- **Safe — the 47-key pins**, [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) and [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324): `image` and the other four are carrier fields; neither `values` nor `BUILT_IN_DEFAULTS` gains a key. Neither is amended.
+- **Safe — every `C101` suggestion test in [`test_schema.py`](tests/unit/config/test_schema.py:1).** `image` is the only new field name, and it is added to `ToolConfig` alone, so it can only affect suggestions inside a `tools:` entry. Checked against [`nearest_alternative`](src/tool_swap/config/suggest.py:45)'s threshold (distance ≤ 0.3 × the longer name): [`test_unknown_key_names_key_path_and_nearest_alternative`](tests/unit/config/test_schema.py:316) — `batch_size` vs `image` is distance 8 against a threshold of 3.0, far outside, and `max_batch_size` still wins at distance 4. [`test_suggestion_inside_a_tool_suggests_tool_fields`](tests/unit/config/test_schema.py:412) — `titl` vs `image` is distance 5 against a threshold of 1.8; `ttl` still wins at distance 1. [`test_suggestion_inside_groups_suggests_group_fields`](tests/unit/config/test_schema.py:435) — `GroupConfig` gains nothing. [`test_unknown_key_without_close_match_lists_valid_keys`](tests/unit/config/test_schema.py:350) — `RouterConfig` gains nothing. [`test_all_unknown_keys_in_one_file_are_reported_in_a_single_run`](tests/unit/config/test_schema.py:376) — its three keys are unrelated to `image`. All unchanged.
+- **Safe — there is no "image is an unknown key" test to break.** Searched: no shipped test asserts that `image:` is rejected, so adding the field cannot contradict a committed expectation. The accept/reject boundary *does* move here (an `image:` entry goes from `C101` to accepted-and-checked), which is the point of §5.2 listing it — recorded as **A15**.
+- **Safe — [`test_all_documented_models_are_pydantic_models_forbidding_extra_keys`](tests/unit/config/test_schema.py:529):** adding a field does not change a model's `extra` setting.
+- **Safe — [`test_includes.py`](tests/unit/config/test_includes.py:1)**, including [`test_include_tool_yaml_unknown_key_loads_with_file_recorded`](tests/unit/config/test_includes.py:543): `ToolYamlConfig` remains **unreachable** (no `RootConfig` field has that type and the loader still does not schema-validate an included `tool.yaml`), and behaviour 15 does not wire it in. The new carrier extraction reads the `tool.yaml` **mapping** in `resolve_tool`, not the Pydantic model, so no loader behaviour changes.
+- **Safe — [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:71)'s local `FLATTENING_TABLE` copy:** `_FLATTENING_TABLE` is deliberately **not** extended (item 3), so the copy cannot drift further.
+- **Safe — behaviour 23's five-line config:** with no `image:`, no `build:` and a `path:` supplying `handler:` from `tool.yaml`, exactly one source is present → no `C510`, no `C511`. The fixture's `handler.py` and `requirements.txt` must exist on disk (they do, per behaviour 23's file list) so `C513`/`C514` stay silent under the real probe, and neither escapes the tool directory so `C516` stays silent.
+- **`values` stays 47 keys; `BUILT_IN_DEFAULTS` stays 47 keys.** Restated because it is the property two of the pins above enforce in opposite directions.
+
+**10. Rule/`ValidatedConfig` boundary**
+
+Every `C5xx` rule reads only `config.tools[<key>]`'s carrier fields (`image`, `handler`, `requirements`, `build`, `base_dir`), plus `config.path`, `config.line_for` and `config.probe`. No rule re-reads the filesystem outside the probe, calls the loader, imports anything, or parses `config.raw`.
 
 ### Behaviour 16 — devices, workers, ports (§6 rules 4c, 7, 8)
 
@@ -994,6 +1224,8 @@ Behaviours 12–19 are siblings and could be reordered or parallelised; the list
 
 **11a and 12a (added 2026-08-18)** are *not* optional siblings. **11a must land before behaviour 12's green step**, because `register_builtin_rules()` is how behaviour 12's rules become reachable. **12a should land immediately after 12's green step** (or be folded into 12's next red) because the reload it removes is a cross-file hazard for behaviour 11's committed tests for as long as it exists.
 
+**Behaviour 15 carries a mandatory preparatory sub-step (added 2026-08-18).** Before behaviour 15's red step, [`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264) must be position-stabilised — it is tail-anchored (`ids[-6:]`, `len(BUILTIN_RULES) == 16`) and any append breaks it. It is a test-only change, committed on its own, exactly as 12a was: **15.0 (repair, suite green, commit) → 15 red → 15 green.** See behaviour 15's contract block, item 0. The same hazard applies to every later appending behaviour (16–19), so each should check its predecessor's append-order test for tail anchoring before starting.
+
 ---
 
 ## 5. Assumptions — ALL CONFIRMED (2026-08-17)
@@ -1013,6 +1245,10 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 **A14 (new, 2026-08-18) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 13's contract block adds `inputs:` / `outputs:` / `params:` / `json_schema:` to `ToolYamlConfig` **only**, not to the inline `ToolConfig`. §5.5.1 says `params` is *"Overridable per config entry"*, and §4's *"inline overrides beat the tool.yaml"* would extend that to `inputs:`/`outputs:` by symmetry; every worked example in `plan/02` nevertheless authors all four blocks in `tool.yaml`, and behaviour 20's stated inputs are *"as authored in `tool.yaml`"*. M1 therefore reads them from `tool.yaml` alone. The narrowing is visible in exactly one place (`ToolConfig`), and widening it later is additive — the `ResolvedTool` carrier fields and the origin paths already exist, so it becomes a layering change inside `resolve_tool`, not a redesign. The user-visible consequence to confirm: in M1, writing `params:` in a `tools.yaml` entry is an unknown-key `TSWAP-C101`, not an override. `description:` **is** inline-overridable, as behaviour 13 requires.
 
 **Plan correction (2026-08-18) — `max_batch_bytes`, behaviour 14's `C405`. Not a new assumption.** Behaviour 14's `C405` bullet previously stated that `max_batch_bytes` is *"not in the schema"* while simultaneously requiring a bespoke `TSWAP-C405` diagnostic for it. The two cannot both hold: a key absent from the schema is rejected by `extra="forbid"` inside `validate_root`, which runs before any rule sees the config, so the rule could never fire. The resolution — reserve the key like `soft_ttl` and `scalar_inputs`, and reject it with `C405` — applies the mechanism the maintainer already confirmed as **A6**, and leaves the accept/reject boundary exactly where it was: `max_batch_bytes` is an error before and after, is never resolvable, never enters `BUILT_IN_DEFAULTS` or `ResolvedTool.values`, and §5.5's *"There is no `max_batch_bytes` key"* stays literally true of the config surface. Because nothing user-visible widens or narrows, this needs **no** confirmation from [issue #2](https://github.com/iar3-r8/tool-swap/issues/2) and no new `A`-number; it is recorded here, and in behaviour 14's own bullet, for visibility, and is worth one line in the PR description.
+
+**A15 (new, 2026-08-18) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 15's contract block adds `image: str | None` to the inline `ToolConfig` **only**, not to `ToolYamlConfig`. `plan/02` §5.2's field table lists `image` as a tool-level key (*"Pin a pre-built image of this tool instead of building it"*), and `TSWAP-C510`/`C511` are unimplementable without it — a config writing `image:` today is rejected by `extra="forbid"` as a `TSWAP-C101` before any rule runs, the same trap behaviour 14's `C405` fell into. **Unlike the `C405` correction, this one does move the accept/reject boundary**: `image: foo/bar:1` goes from *rejected as an unknown key* to *accepted and checked as an image source*, which is why it gets an `A`-number rather than being recorded as a plan correction. The move is toward the documented spec, not away from it, and no shipped test asserts the current rejection (verified — no `image`-as-unknown-key test exists). `ToolYamlConfig` is deliberately excluded: §4's `tool.yaml` reference has no `image:` key — image selection there is `runtime.base_image`, an M2 concern the resolver already ignores via `_PARTIAL_BLOCKS` — so adding it would invent a surface the spec does not describe. The user-visible consequence to confirm: in M1, `image:` is legal in a `tools.yaml` entry and illegal in a `tool.yaml`.
+
+**A16 (new, 2026-08-18) — NOT yet confirmed by the intake source; minor, worth one line in the PR description.** Behaviour 15's `TSWAP-C512` requires the file part of a `handler:` to end in **`.py`**. Plan line 652 enumerates four bad cases (no colon, no file, no name, bad identifier) and a missing `.py` is **not** among them, so this is a rejection the plan does not list. It is adopted because every example in `plan/02` §4 and `plan/03` writes `handler.py:Cls`, and because without it a `handler:Cls` falls through to `TSWAP-C513` with a confusing *"file not found: …/handler"* message instead of the actionable *"expected `file.py:ClassName`"*. Narrowing here is safe to relax later (relaxing would only turn a `C512` into a `C513`); the reverse would not be. The same rule also rejects a Python keyword as the class name (`handler.py:class` passes `str.isidentifier()` yet can never name a class), which sharpens the plan's *"bad identifier"* case rather than adding a new restriction.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
