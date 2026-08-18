@@ -138,6 +138,9 @@ class ToolConfig(BaseModel):
     ``tool.yaml`` > ``defaults:`` > built-ins, ``plan/02`` §4.1) and the
     semantic checks of later behaviours (e.g. ``TSWAP-C300`` for a missing
     ``description``) stay in charge of their own diagnostics.
+
+    ``description`` is inline-layerable: a key present with a blank value
+    wins over a good ``tool.yaml`` one (behaviour 10 semantics).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -154,6 +157,7 @@ class ToolConfig(BaseModel):
     max_wait_ms: int | None = None
     mounts: list[str] | None = None
     env: dict[str, Any] | None = None
+    description: str | None = None
 
 
 class ToolYamlConfig(BaseModel):
@@ -171,6 +175,12 @@ class ToolYamlConfig(BaseModel):
     version: str | None = None
     description: str | None = None
     handler: str | None = None
+    # Authoring blocks of plan/02 §4, stored as authored (not interpreted);
+    # behaviour 20 owns the inner entry shape (TSWAP-S1xx).
+    inputs: list[dict[str, Any]] | None = None
+    outputs: list[dict[str, Any]] | None = None
+    params: list[dict[str, Any]] | None = None
+    json_schema: dict[str, Any] | None = None
 
 
 class RootConfig(BaseModel):

@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, cast
 
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS, builtin_defaults
 from tool_swap.config.errors import Diagnostic, Location, Severity
@@ -49,12 +49,26 @@ class ResolvedTool:
         origins: winning and shadowed origins per dotted path.
         diagnostics: the ``TSWAP-C501`` / ``TSWAP-C503`` / ``TSWAP-C106``
             diagnostics this resolution emitted (empty when clean).
+        description: the layered (inline > ``tool.yaml``) tool description;
+            ``None`` when no layer supplied the key.
+        inputs: the ``tool.yaml`` ``inputs:`` block, deep-copied as authored
+            (behaviour 20 owns the entry shape); ``None`` when absent.
+        outputs: the ``tool.yaml`` ``outputs:`` block, same contract.
+        params: the ``tool.yaml`` ``params:`` block, same contract.
+        json_schema: the ``tool.yaml`` ``json_schema:`` block, same contract.
     """
 
     name: str
     values: dict[str, object]
     origins: OriginMap
     diagnostics: list[Diagnostic]
+    # Behaviour 13 carrier fields; outside ``values`` on purpose (plan
+    # "Why not flat keys"): authored content, not resolvable fields.
+    description: str | None = None
+    inputs: list[dict[str, object]] | None = None
+    outputs: list[dict[str, object]] | None = None
+    params: list[dict[str, object]] | None = None
+    json_schema: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -103,19 +117,28 @@ def resolve_tool(
 
     Returns:
         A frozen :class:`ResolvedTool` whose ``values`` cover exactly the
-        flat built-in fields.  All inputs are deep-copied on entry, so
+        flat built-in fields and whose carrier fields carry the authored
+        ``description`` (layered inline > ``tool.yaml``) and the
+        ``tool.yaml``-only ``inputs`` / ``outputs`` / ``params`` /
+        ``json_schema`` blocks.  All inputs are deep-copied on entry, so
         mutating a caller's dicts after the call, or one tool's result,
         can never affect another resolution.
     """
     diagnostics: list[Diagnostic] = []
+    inline_data = copy.deepcopy(inline)
     if tool_yaml is not None:
         tool_flat = _flatten_tool_yaml(tool_yaml, name, diagnostics)
+        if "description" in tool_yaml:
+            # Additive: ``description`` is not a flat built-in field, so
+            # it stays out of ``values`` and of the 47-key flattening;
+            # this only makes it visible to the description layering.
+            tool_flat["description"] = copy.deepcopy(tool_yaml["description"])
     else:
         tool_flat = {}
     group_layer = _group_layer(group)
 
     layers: list[_Layer] = [
-        _Layer(copy.deepcopy(inline), _fixed_origin(OriginLevel.INLINE, "inline")),
+        _Layer(inline_data, _fixed_origin(OriginLevel.INLINE, "inline")),
         _Layer(tool_flat, _fixed_origin(OriginLevel.TOOL_YAML, "tool.yaml")),
         _Layer(
             copy.deepcopy(defaults) if defaults is not None else {},
@@ -137,9 +160,105 @@ def resolve_tool(
             _resolve_ttl(layers, layers[2], values, origins, name, diagnostics)
         else:
             _resolve_wholesale(layers, values, origins, field)
+
+    # --- behaviour 13 carrier fields (outside ``values`` on purpose) ---
+    description_winner = _winner_index_safe(layers, "description")
+    if description_winner < 0:
+        description: str | None = None
+    else:
+        description = cast("str | None", layers[description_winner].data["description"])
+        origins.record(
+            "description",
+            layers[description_winner].origin_for("description"),
+        )
+    inputs = _tool_yaml_carrier_list(tool_yaml, "inputs")
+    outputs = _tool_yaml_carrier_list(tool_yaml, "outputs")
+    params = _tool_yaml_carrier_list(tool_yaml, "params")
+    json_schema = _tool_yaml_carrier_dict(tool_yaml, "json_schema")
+    for key, block in (
+        ("inputs", inputs),
+        ("outputs", outputs),
+        ("params", params),
+        ("json_schema", json_schema),
+    ):
+        if block is not None:
+            origins.record(key, _tool_yaml_origin())
+
     return ResolvedTool(
-        name=name, values=values, origins=origins, diagnostics=diagnostics
+        name=name,
+        values=values,
+        origins=origins,
+        diagnostics=diagnostics,
+        description=description,
+        inputs=inputs,
+        outputs=outputs,
+        params=params,
+        json_schema=json_schema,
     )
+
+
+def _winner_index_safe(layers: Sequence[_Layer], field: str) -> int:
+    """Like :func:`_winner_index`, but ``-1`` when no layer has ``field``.
+
+    Unlike :func:`_winner_index` this does not raise: the built-in layer
+    does not carry ``description``, so the no-provider case is legal and
+    must resolve to "absent" (behaviour 13).
+
+    Args:
+        layers: the layers, most specific first.
+        field: the field name.
+
+    Returns:
+        The index of the first layer containing ``field``, or ``-1``.
+    """
+    for index, layer in enumerate(layers):
+        if field in layer.data:
+            return index
+    return -1
+
+
+def _tool_yaml_origin() -> Origin:
+    """The fixed origin for a ``tool.yaml`` carrier field."""
+    return Origin(level=OriginLevel.TOOL_YAML, source="tool.yaml")
+
+
+def _tool_yaml_carrier_list(
+    tool_yaml: Mapping[str, object] | None, key: str
+) -> list[dict[str, object]] | None:
+    """Deep-copy one list-shaped ``tool.yaml`` carrier block.
+
+    Args:
+        tool_yaml: the tool's ``tool.yaml`` mapping, or ``None``.
+        key: the carrier key (``inputs`` / ``outputs`` / ``params``).
+
+    Returns:
+        A deep copy of the block's value, or ``None`` when the mapping is
+        ``None`` or does not contain the key (``None`` stays distinct
+        from ``[]``).  The value's inner shape is stored as authored;
+        behaviour 20 owns validation.
+    """
+    if tool_yaml is None or key not in tool_yaml:
+        return None
+    return cast("list[dict[str, object]]", copy.deepcopy(tool_yaml[key]))
+
+
+def _tool_yaml_carrier_dict(
+    tool_yaml: Mapping[str, object] | None, key: str
+) -> dict[str, object] | None:
+    """Deep-copy the dict-shaped ``json_schema`` carrier block.
+
+    Args:
+        tool_yaml: the tool's ``tool.yaml`` mapping, or ``None``.
+        key: the carrier key (``json_schema``).
+
+    Returns:
+        A deep copy of the block's value, or ``None`` when the mapping is
+        ``None`` or does not contain the key.  The value's inner shape is
+        stored as authored; behaviour 20 owns validation.
+    """
+    if tool_yaml is None or key not in tool_yaml:
+        return None
+    return cast("dict[str, object]", copy.deepcopy(tool_yaml[key]))
 
 
 def _fixed_origin(level: OriginLevel, source: str) -> Callable[[str], Origin]:

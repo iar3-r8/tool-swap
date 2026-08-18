@@ -18,8 +18,8 @@ from __future__ import annotations
 import copy
 import re
 import string
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final
 
@@ -625,6 +625,289 @@ TSWAP_C223_RULE: Final[Rule] = _C223Rule(
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Behaviour 13 — D19 mandatory descriptions (§6 rule 6b)
+# ---------------------------------------------------------------------------
+
+#: The pinned C300 WHY phrase (plan, behaviour 13).
+_C300_WHY: Final[str] = (
+    "the description is what an LLM agent reads to decide whether to call this tool"
+)
+
+#: The self-sufficient remedy direction shared by the C3xx rules (the
+#: ``ValidatedConfig`` carries no per-tool ``tool.yaml`` path, so the
+#: remedy must not pretend to know which file was authored).
+_C3XX_REMEDY_TARGET: Final[str] = (
+    "add it to the tool's 'tool.yaml', or its inline 'tools.<name>' entry"
+)
+
+
+def _is_blank(value: object) -> bool:
+    """Whether a description value counts as missing (plan, behaviour 13).
+
+    Missing is ``None`` or a ``str`` whose ``strip()`` is empty; any
+    non-string value (e.g. ``description: 123``) counts as PRESENT and is
+    left to the schema layer's ``TSWAP-C105``, so one mistake yields one
+    diagnostic rather than two.
+
+    Args:
+        value: the description value from a carrier field or entry.
+
+    Returns:
+        True when the value is missing (``None`` or blank string).
+    """
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _entry_label(entry: Mapping[str, object], block: str, index: int) -> str:
+    """The name an entry carries in a C301/C302/C303 message.
+
+    The entry's ``name`` is used when it is a non-empty string; otherwise
+    the entry is named positionally (``inputs[<i>]`` and friends) so the
+    message stays actionable.
+
+    Args:
+        entry: the mapping entry being checked.
+        block: the block name (``inputs`` / ``outputs`` / ``params``).
+        index: the 0-based position of the entry in the block.
+
+    Returns:
+        The entry's name, or its positional label.
+    """
+    name = entry.get("name")
+    if isinstance(name, str) and name.strip():
+        return name
+    return f"{block}[{index}]"
+
+
+def _tool_location(config: ValidatedConfig, yaml_path: str) -> Location:
+    """The behaviour-12 location form for a tool-level diagnostic.
+
+    Args:
+        config: the validated configuration.
+        yaml_path: the dotted YAML path; the same string is handed to
+            ``config.line_for`` (``line=None`` is a legal outcome).
+
+    Returns:
+        The :class:`~tool_swap.config.errors.Location` at that path.
+    """
+    return Location(
+        file=str(config.path),
+        yaml_path=yaml_path,
+        line=config.line_for(yaml_path),
+    )
+
+
+def _check_entry_descriptions(
+    rule: Rule,
+    config: ValidatedConfig,
+    tool_key: str,
+    block: str,
+    block_value: object,
+) -> list[Diagnostic]:
+    """One missing/blank ``description`` diagnostic per block entry.
+
+    Shared by C301/C302/C303.  A block whose value is not a list is
+    skipped silently, and a non-mapping entry is skipped silently:
+    malformed shapes belong to behaviour 20's ``TSWAP-S1xx``.
+
+    Args:
+        rule: the emitting rule (its ``id`` and ``severity`` are used).
+        config: the validated configuration.
+        tool_key: the ``tools:`` map key of the tool.
+        block: the block name (``inputs`` / ``outputs`` / ``params``),
+            used in the positional entry label.
+        block_value: the block's carrier value (``None`` or a list).
+
+    Returns:
+        The diagnostics, one per missing or blank entry description.
+    """
+    if not isinstance(block_value, list):
+        return []
+    findings: list[Diagnostic] = []
+    for index, entry in enumerate(block_value):
+        if not isinstance(entry, Mapping):
+            continue
+        if not _is_blank(entry.get("description")):
+            continue
+        label = _entry_label(entry, block, index)
+        yaml_path = f"tools.{tool_key}.{block}.{index}.description"
+        findings.append(
+            Diagnostic(
+                code=rule.id,
+                severity=rule.severity,
+                message=(
+                    f"Entry {label!r} in the tool's '{block}' block is "
+                    "missing a description."
+                ),
+                location=_tool_location(config, yaml_path),
+                remedy=rule.remedy,
+            )
+        )
+    return findings
+
+
+class _C300Rule(Rule):
+    """``TSWAP-C300``: a tool whose own description is missing or blank."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool whose ``description`` carrier is missing/blank.
+
+        Applies to **every** tool — there is no escape — and reads only
+        the carrier field (no filesystem, no loader, no ``raw`` parsing).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed tool, stating the pinned
+            WHY phrase and naming the key to add in the remedy.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if not _is_blank(tool.description):
+                continue
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(f"Tool {key!r} is missing a description: {_C300_WHY}."),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C301Rule(Rule):
+    """``TSWAP-C301``: an ``inputs:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``inputs`` entry whose description is missing/blank.
+
+        Absent (``None``) or empty (``[]``) blocks yield nothing; entries
+        that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed input entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "inputs", tool.inputs)
+            )
+        return findings
+
+
+class _C302Rule(Rule):
+    """``TSWAP-C302``: an ``outputs:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``outputs`` entry whose description is missing/blank.
+
+        Absent (``None``) or empty (``[]``) blocks yield nothing; entries
+        that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING diagnostic per undescribed output entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "outputs", tool.outputs)
+            )
+        return findings
+
+
+class _C303Rule(Rule):
+    """``TSWAP-C303``: a ``params:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``params`` entry whose description is missing/blank.
+
+        §5.5.1 requires ``name``, ``type`` and ``description`` on every
+        param.  Absent (``None``) or empty (``[]``) blocks yield nothing;
+        entries that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed param entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "params", tool.params)
+            )
+        return findings
+
+
+#: ``TSWAP-C300`` — a tool's own description is missing or blank (§6 rule 6b).
+TSWAP_C300_RULE: Final[Rule] = _C300Rule(
+    id="TSWAP-C300",
+    remedy=(
+        "Add a non-blank 'description' field for the tool — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C301`` — an ``inputs:`` entry is missing its description.
+TSWAP_C301_RULE: Final[Rule] = _C301Rule(
+    id="TSWAP-C301",
+    remedy=(
+        "Add a non-blank 'description' to the input entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C302`` — an ``outputs:`` entry is missing its description
+#: (WARNING; outputs are advisory, unlike inputs and params).
+TSWAP_C302_RULE: Final[Rule] = _C302Rule(
+    id="TSWAP-C302",
+    severity=Severity.WARNING,
+    remedy=(
+        "Add a non-blank 'description' to the output entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C303`` — a ``params:`` entry is missing its description.
+TSWAP_C303_RULE: Final[Rule] = _C303Rule(
+    id="TSWAP-C303",
+    remedy=(
+        "Add a non-blank 'description' to the param entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+
+#: The codes ``--allow-missing-descriptions`` downgrades (plan block 6):
+#: the three ERROR description codes.  ``TSWAP-C302`` is deliberately
+#: excluded — it is already a warning, and appending "downgraded by" to a
+#: diagnostic the flag did not change would be a lie.
+MISSING_DESCRIPTION_CODES: Final[frozenset[str]] = frozenset(
+    {"TSWAP-C300", "TSWAP-C301", "TSWAP-C303"}
+)
+
+#: The pinned downgrade banner, appended to each downgraded diagnostic's
+#: ``message`` (which is what makes it survive ``--json``).
+ALLOW_MISSING_DESCRIPTIONS_BANNER: Final[str] = (
+    "downgraded by --allow-missing-descriptions; this flag is for local "
+    "prototyping and is never permitted in CI"
+)
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -635,6 +918,10 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C221_RULE,
     TSWAP_C222_RULE,
     TSWAP_C223_RULE,
+    TSWAP_C300_RULE,
+    TSWAP_C301_RULE,
+    TSWAP_C302_RULE,
+    TSWAP_C303_RULE,
 )
 
 
@@ -711,3 +998,51 @@ def validate_config(config: ValidatedConfig) -> ConfigReport:
         except Exception as exception:
             diagnostics.append(_internal_diagnostic(rule, exception, config))
     return ConfigReport(diagnostics=tuple(sorted(diagnostics)))
+
+
+def downgrade_missing_descriptions(report: ConfigReport) -> ConfigReport:
+    """Downgrade the missing-description diagnostics of a report.
+
+    The ``--allow-missing-descriptions`` post-processor (plan block 6,
+    mechanism (a)): the rules always emit their documented severities and
+    this pure function rewrites the report, so it is unit-testable before
+    the CLI (behaviour 21) exists.
+
+    Every diagnostic whose code is in :data:`MISSING_DESCRIPTION_CODES`
+    (``C300``, ``C301``, ``C303`` — but never ``C302``, which is already a
+    warning) is returned with severity :attr:`Severity.WARNING` and the
+    pinned banner appended to its ``message`` as
+    ``f"{original} — {ALLOW_MISSING_DESCRIPTIONS_BANNER}"``, so the banner
+    is part of the diagnostic and survives ``--json``.  Every other
+    diagnostic passes through untouched and the input report is not
+    mutated.
+
+    Idempotent: a diagnostic already carrying the banner is returned
+    unchanged, so a double call (e.g. a CLI refactor calling this twice)
+    yields the same report.  ``--strict`` + ``--allow-missing-descriptions``
+    is contradictory and ``--strict`` wins: the downgrade runs first, then
+    ``--strict`` promotes warnings back to errors.
+
+    Args:
+        report: the report to downgrade (never mutated).
+
+    Returns:
+        A NEW :class:`~tool_swap.config.errors.ConfigReport` with the
+        rewritten diagnostics in the original order.
+    """
+    new_diagnostics: list[Diagnostic] = []
+    for diagnostic in report.diagnostics:
+        if diagnostic.code not in MISSING_DESCRIPTION_CODES:
+            new_diagnostics.append(diagnostic)
+            continue
+        if ALLOW_MISSING_DESCRIPTIONS_BANNER in diagnostic.message:
+            new_diagnostics.append(replace(diagnostic, severity=Severity.WARNING))
+            continue
+        new_diagnostics.append(
+            replace(
+                diagnostic,
+                severity=Severity.WARNING,
+                message=(f"{diagnostic.message} — {ALLOW_MISSING_DESCRIPTIONS_BANNER}"),
+            )
+        )
+    return ConfigReport(diagnostics=tuple(new_diagnostics))
