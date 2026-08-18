@@ -107,6 +107,13 @@ _LANDED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C301",
     "TSWAP-C302",
     "TSWAP-C303",
+    # Behaviour 14 (withdrawn/reserved keys) extends the set here.
+    "TSWAP-C400",
+    "TSWAP-C401",
+    "TSWAP-C402",
+    "TSWAP-C403",
+    "TSWAP-C404",
+    "TSWAP-C405",
 )
 
 #: The pinned C210 reason phrase (plan line 214).
