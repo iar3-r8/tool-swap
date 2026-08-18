@@ -445,9 +445,203 @@ Behaviour 20's compiler keeps its pure signatures (`compile_inputs(inputs)`, `co
   - `TSWAP-C402` — `runtime.server` set to anything outside `{bentoml, native}` → unknown-value error **listing the valid ones**.
   - `TSWAP-C403` — `scalar_inputs` present → error citing ADR-0005 (removed; every handler takes a list). Same accepted-then-rejected treatment, for the same reason.
   - `TSWAP-C404` — per-input `batchable:` present → error citing ADR-0005: batching is a property of the tool. See assumption **A1**.
-  - `TSWAP-C405` — `max_batch_bytes` present → error stating the key does not exist and naming the mitigation the spec prescribes (*"set `max_batch_size` low for large payloads"*, §5.5). This key is not in the schema, so it would otherwise be a bare unknown-key error; users coming from other batching frameworks will reach for it, and the spec has a specific answer.
+  - `TSWAP-C405` — `max_batch_bytes` present → error stating the key does not exist and naming the mitigation the spec prescribes (*"set `max_batch_size` low for large payloads"*, §5.5). **Corrected 2026-08-18** (this line previously read *"This key is not in the schema, so it would otherwise be a bare unknown-key error"*, which is unsatisfiable — see the contract block below, item 5): the key is **reserved in the schema and rejected by this rule**, so the author gets the spec's answer instead of a bare unknown-key error. Users coming from other batching frameworks will reach for it, and the spec has a specific answer.
 - **Edge cases:** `soft_ttl: null` is still present and still rejected — the key's presence is the signal, not its value.
-- **Files:** `src/tool_swap/config/schema.py` (reserved fields), `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_reserved.py`.
+- **Files:** `src/tool_swap/config/schema.py` (the reserved fields below), `src/tool_swap/config/resolver.py` (the `RESERVED_KEYS` scan + the `reserved_keys` carrier below), `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_reserved.py`.
+
+#### Confirmed contract details (2026-08-18)
+
+Six rules, three data paths, and one contradiction in the source spec to resolve. This block pins all of it, so the RED step can be written and the GREEN step implemented without guessing. **No shipped test breaks under it** — see block 8, which names every test checked.
+
+The governing property of the whole design, stated once because every decision below follows from it: **the accept/reject boundary does not move.** Every key named here is an error today (as `TSWAP-C101` or `TSWAP-C106`) and is an error after behaviour 14. What changes is *which* code fires and *what the message says*. No config that validates today stops validating; no config that fails today starts passing.
+
+**1. Schema additions ([`schema.py`](src/tool_swap/config/schema.py:1)) — the reserved fields**
+
+Three withdrawn keys become **reserved fields**, applying confirmed assumption **A6**'s mechanism (*"declared as real optional fields so `extra="forbid"` does not claim them, then rejected with dedicated codes citing the ADR"*) to all three rather than to `soft_ttl` alone:
+
+```python
+soft_ttl: Any = None
+scalar_inputs: Any = None
+max_batch_bytes: Any = None
+```
+
+Placement is **deliberate and asymmetric**, because the levels a key was legal at differ:
+
+| Reserved key | [`DefaultsConfig`](src/tool_swap/config/schema.py:73) | [`ToolConfig`](src/tool_swap/config/schema.py:134) | [`ToolYamlConfig`](src/tool_swap/config/schema.py:163) | [`GroupConfig`](src/tool_swap/config/schema.py:110) |
+|---|---|---|---|---|
+| `soft_ttl` | **yes** | **yes** | **yes** | **no** |
+| `scalar_inputs` | no | **yes** | **yes** | **no** |
+| `max_batch_bytes` | **yes** | **yes** | **yes** | **no** |
+
+- `soft_ttl` is on all three because plan line 443 says *"present at any level"*, and §5.3 lists it in the tool-level lifecycle table alongside `ttl`, which is writable in `defaults:` too.
+- `scalar_inputs` is **not** on `DefaultsConfig`: it was never a `defaults:` key ([ADR-0005](plan/adr/0005-one-uniform-batched-calling-convention.md) removed it from the per-tool authoring surface). `defaults.scalar_inputs` therefore stays a plain `TSWAP-C101` unknown key, which is the honest answer.
+- `max_batch_bytes` **is** on `DefaultsConfig`, because its live sibling `max_batch_size` is (§5.5 batching keys are `defaults:`-writable), so that is exactly where someone coming from another batching framework will write it.
+- **`GroupConfig` gets none of them, on purpose.** A misspelled or withdrawn lifecycle key inside `groups:` stays a schema-level `TSWAP-C101`. `GroupConfig`'s docstring already states the reason (*"TTL is a tool-level and `defaults:` concern, so a misspelled `ttl` inside `groups:` must not be 'corrected' to a tool field"*), and the same argument applies verbatim to `soft_ttl`. Pinned by a test asserting `groups.g1.soft_ttl` yields `C101` and **not** `C400`, so nobody "fixes" it later.
+
+**Type is `Any`, default `None`, and the value is never read.** Not `int | None`: the key's presence is the signal, not its value (plan line 449), so `soft_ttl: "forever"` must produce **one** `C400` and never a `TSWAP-C105` shape error on top of it — a reserved key has no legal value, so type-checking it would be theatre. `Any` also makes `soft_ttl: null` accepted by the schema, which is required for the null edge case to reach the rule at all.
+
+**Field descriptions (behaviour 25):** all three carry `Field(description=...)` like every other field, since behaviour 25 asserts *"every field on every model has a non-empty `Field(description=...)`"*. The description must say the key is reserved and rejected, and name the ADR — the generated `docs/configuration.md` then documents the reserved keys automatically, which is the desired outcome, not a leak. This is the **only** point at which behaviour 14 touches behaviour 25, and it is additive.
+
+**2. Presence detection — decided, and the mechanism is the same for all three**
+
+The key must be detected by **presence in the layer's raw mapping**, not by the resolved value: `None` is both the field default and a legal authored value, so a resolved `soft_ttl == None` cannot distinguish `soft_ttl: null` (must fire) from an absent key (must not fire).
+
+**Decision: the resolver scans the raw layer dicts it already deep-copies, and carries the result on a new `ResolvedTool` trailing field.** Not `model_dump`, not a sentinel:
+
+| Option | Rejected because |
+|---|---|
+| Rule re-reads `config.raw` | `raw` is the **inline layer only**; a `tool.yaml`-authored `soft_ttl` is invisible in it. Behaviour 13's block already forbids this route for exactly this reason (*"reading it would reintroduce precedence logic the resolver already owns"*) |
+| `model_dump(exclude_unset=True)` on the Pydantic models | `ValidatedConfig` carries no model instances — only `raw`, `tools`, `line_for`, `path` — and it is frozen and **not** amended here (pinned by [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311)). The models are constructed inside `validate_root` and discarded |
+| A sentinel default (`_UNSET`) on the schema fields | Changes `extra="forbid"` semantics not at all but leaks a private object into `model_dump`, into behaviour 25's generated reference, and into every `None`-check downstream. Presence is already knowable from the dict |
+| Resolver scan of the layer dicts | **Chosen.** `resolve_tool` already receives, and deep-copies, every layer as a plain dict. `"soft_ttl" in inline` is exactly the predicate the rule needs, evaluated where the layers actually are |
+
+Concretely, in [`resolver.py`](src/tool_swap/config/resolver.py:1):
+
+```python
+#: Withdrawn/reserved keys behaviour 14 rejects, mapped to the layers the
+#: schema reserves them at (mirrors the schema placement table).  Detected
+#: by PRESENCE in a layer mapping, never by value ("soft_ttl: null" is
+#: still present).
+RESERVED_KEYS: Final[dict[str, frozenset[str]]] = {
+    "soft_ttl": frozenset({"inline", "tool.yaml", "defaults"}),
+    "scalar_inputs": frozenset({"inline", "tool.yaml"}),
+    "max_batch_bytes": frozenset({"inline", "tool.yaml", "defaults"}),
+}
+
+@dataclass(frozen=True)
+class ResolvedTool:
+    ...                                # unchanged through json_schema
+    # --- added by behaviour 14; outside `values` on purpose ---
+    reserved_keys: tuple[tuple[str, str], ...] = ()
+```
+
+- `reserved_keys` is a tuple of `(key, layer)` pairs, where `layer` is one of the literals `"inline"`, `"tool.yaml"`, `"defaults"` — the layer label, **not** an `Origin`, because the rule renders a `yaml_path` and needs the level as a string, and because a tuple keeps `ResolvedTool` hashable-shaped and free of a mutable default.
+- **The scan is layer-scoped per key, exactly mirroring the schema placement table.** `scalar_inputs` is scanned in the inline and `tool.yaml` layers only, because that is where the schema reserves it. This is not decoration: `defaults.scalar_inputs` is a schema-level `TSWAP-C101`, and scanning for it in `defaults:` too would make one mistake produce **two** diagnostics (`C101` *and* `C403`) — the exact double-reporting behaviour 13 avoided with its non-string-description rule. One mistake, one diagnostic. Pinned by a test.
+- Order is **layer order, most specific first, then key name sorted within a layer**, so the diagnostic sequence is deterministic without the rule re-sorting.
+- The **same key present in two reserved layers yields two pairs**, and therefore two diagnostics. That is correct: an author who wrote `soft_ttl` in both `defaults:` and a tool has two places to delete it, and behaviour 21's report should name both.
+- The group layer is **not** scanned (see the `GroupConfig` decision above), and the built-in layer trivially has none.
+- The `tool.yaml` layer is scanned in its **raw, pre-flattening form** — the mapping `resolve_tool` receives — not the flattened `tool_flat` dict, because a reserved key is a top-level `tool.yaml` key that [`_flatten_tool_yaml`](src/tool_swap/config/resolver.py:318) drops (it is in neither `_KNOWN_BLOCKS` nor `BUILT_IN_DEFAULTS`). Scanning the flattened form would silently detect nothing.
+- Populated by a small pure helper over the same layer inputs the function already deep-copies, before the `values` loop. It emits **no diagnostic of its own** — the resolver stays sentinel-only (plan line 195), and every `C4xx` is a rule.
+
+**A trailing defaulted field is safe** for exactly the reasons behaviour 13's block established: every construction site in the suite passes the four original fields by keyword, and [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99) asserts presence and frozenness, not absence of others. `values` stays **exactly 47 keys**; `BUILT_IN_DEFAULTS` stays **exactly 47 keys**. Both are re-asserted by behaviour 14's own tests, because a reserved key resembles a field closely enough that a future reader might add it to the defaults table.
+
+**3. `runtime.server` — where it is writable, and what the rule reads**
+
+Today [`DefaultsConfig`](src/tool_swap/config/schema.py:92) has the flat `runtime_server: str = "bentoml"`, which is one of the 47 `BUILT_IN_DEFAULTS` keys and is pinned literally in [`test_defaults.py`](tests/unit/config/test_defaults.py:153) and in [`test_schema.py`](tests/unit/config/test_schema.py:155)'s reference-config fixture. §5.4/§5.5 nevertheless document the authoring spelling as a **block**: `runtime: { server: ... }` in `tool.yaml` (§4's reference `tool.yaml` writes `runtime.server: bentoml` under a `runtime:` block).
+
+**Decision: both spellings exist, and behaviour 14 adds the block *only* to the flattening table — it introduces no new resolvable field.**
+
+- `defaults.runtime_server` and inline `runtime_server` stay exactly as they are. The 47-key set does not change.
+- `_FLATTENING_TABLE` in [`resolver.py`](src/tool_swap/config/resolver.py:27) gains one entry: `("runtime", "server"): "runtime_server"`. `runtime` joins `_KNOWN_BLOCKS` as a consequence, which is derived from the table and needs no separate edit.
+- **The rule reads `tool.values["runtime_server"]` and nothing else.** One resolved value, one diagnostic, regardless of which spelling the author used — which is the entire point of resolving before validating.
+
+This is additive and cannot change an existing diagnostic: `runtime` is not in `_KNOWN_BLOCKS` today, so [`_flatten_tool_yaml`](src/tool_swap/config/resolver.py:318)'s first loop skips the whole block and its second loop skips it too (`runtime` is not in `BUILT_IN_DEFAULTS`) — a `tool.yaml` `runtime:` block is **silently dropped today and emits no `TSWAP-C106`**. After the change, `runtime.server` flattens and any *other* key under `runtime:` (`base_image`, `accelerator`, `requirements`, `system_packages`, `pre_install`, `post_install` — all six from §4's reference `tool.yaml`) becomes a `TSWAP-C106`. **That is a real behaviour change and it is not wanted here**: those keys are M2 image-build concerns that M1 does not own.
+
+**Resolution: `runtime` is added to a new `_PARTIAL_BLOCKS` set** — blocks that flatten their mapped keys and **silently ignore** their unmapped ones, rather than emitting `C106`. `batching`, `resources` and `lifecycle` keep the strict `C106` behaviour they have today, so [`test_unmapped_nested_key_is_c106_error_naming_the_key`](tests/unit/config/test_merge_semantics.py:278) is untouched. A test pins that `runtime.base_image` produces **no** diagnostic, and that `runtime.server` flattens. If a future milestone wants those six keys validated, it promotes `runtime` out of `_PARTIAL_BLOCKS` in one line.
+
+**Version source for the `C401` message.** The message names the current version, read from [`tool_swap.__version__`](src/tool_swap/__init__.py:7) (`"0.1.0"`) — the package's single public version string. **Not** `schema.py`'s private `_CURRENT_VERSION`, which is a duplicate of the same literal that happens to live in another module; `validate.py` importing a private name from `schema.py` for a message string would create a second source of truth for the version. `pyproject.toml` is not read at runtime.
+
+**4. `C403` / `C404` / `C405` — detection source per code**
+
+| Code | Key | Detected from | Why |
+|---|---|---|---|
+| `C400` | `soft_ttl` | `tool.reserved_keys` | Presence across inline / `tool.yaml` / `defaults:` |
+| `C401` | `runtime.server == "native"` | `tool.values["runtime_server"]` | Resolved value; both spellings converge |
+| `C402` | `runtime.server` outside `{bentoml, native}` | `tool.values["runtime_server"]` | Same |
+| `C403` | `scalar_inputs` | `tool.reserved_keys` | Same mechanism as `C400` |
+| `C404` | per-entry `batchable:` | `tool.inputs` (behaviour 13's carrier) | Already the as-authored `list[dict[str, Any]]`; the rule scans entries |
+| `C405` | `max_batch_bytes` | `tool.reserved_keys` | Same mechanism as `C400` — see block 5 |
+
+**`C404` scanning contract**, mirroring behaviour 13's robustness rules so the two rules cannot disagree about what an entry is:
+
+- The rule iterates `tool.inputs` when it is a list; a non-list block is skipped silently, and a non-mapping entry is skipped silently (malformed shapes are behaviour 20's `TSWAP-S1xx`).
+- `batchable` fires on the **key being present in the entry**, whatever its value — `batchable: false` is as withdrawn as `batchable: true`. Same presence-not-value rule as `C400`, for the same reason.
+- One diagnostic **per offending entry**, named by the behaviour-13 convention: the entry's `name` when it is a non-empty string, else the positional label `inputs[<i>]`. The two rules must produce the same label for the same entry, so `C404` reuses behaviour 13's existing `_entry_label` helper rather than growing a second one.
+- `outputs:` and `params:` are **not** scanned. `batchable` was only ever an `inputs:` flag ([ADR-0005](plan/adr/0005-one-uniform-batched-calling-convention.md): *"The `batchable: true` flag per input"*), and a `batchable` under `params:` is a different mistake with no spec answer. Pinned by a test, so the scope is a decision rather than an omission.
+
+**5. The `C405` asymmetry — resolved, and it is a plan correction**
+
+Plan line 448 says of `max_batch_bytes`: *"This key is not in the schema, so it would otherwise be a bare unknown-key error."* That sentence is **internally inconsistent with the rest of the same bullet**, and the inconsistency is resolved here rather than papered over.
+
+- If the key is genuinely absent from the schema, `extra="forbid"` rejects it during `validate_root` — which runs in the **loader/schema layer, before any rule sees the config**. A `C4xx` rule reading `ValidatedConfig` could then never fire, because the resolver would never be reached with that key present. The bullet's own requirement (*"users … will reach for it, and the spec has a specific answer"*) would be unsatisfiable.
+- The same bullet demands a bespoke, actionable message. The only mechanism in this codebase that produces one is the reserve-then-reject mechanism confirmed as **A6** and already prescribed for `soft_ttl` and `scalar_inputs` in the two neighbouring bullets.
+
+**Resolution: `max_batch_bytes` is a reserved schema field, exactly like `soft_ttl` and `scalar_inputs`, and `C405` fires from `reserved_keys` like the other two.** The plan line is corrected to: *"This key is reserved in the schema and rejected by this rule, so the author gets the spec's answer instead of a bare unknown-key error."*
+
+The sentence's *intent* — that `max_batch_bytes` is not a real config key and never becomes one — is preserved exactly: it is reserved-and-rejected, never resolved, never in `BUILT_IN_DEFAULTS`, never in `values`, and §5.5's *"There is no `max_batch_bytes` key"* remains literally true of the config surface. Only the implementation sentence changes.
+
+**This is not a widening of the spec**, so it does **not** need a new assumption. `max_batch_bytes` is an error before and after; the accept/reject boundary is unmoved (see the governing property above), and the mechanism is the one the maintainer already confirmed as A6. It is recorded as a **plan correction** in §5's assumption list for visibility, and is worth one line in the PR description — not a blocking question for [issue #2](https://github.com/iar3-r8/tool-swap/issues/2).
+
+**6. Location contract per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour-12/13 form. The file is never hardcoded, `line=None` is a legal outcome, and tests assert `location.line == config.line_for(location.yaml_path)` rather than a literal line number.
+
+| Code | `yaml_path` |
+|---|---|
+| `C400` (inline layer) | `tools.<key>.soft_ttl` |
+| `C400` (`defaults:` layer) | `defaults.soft_ttl` |
+| `C400` (`tool.yaml` layer) | `tools.<key>.soft_ttl` |
+| `C401` / `C402` | `tools.<key>.runtime_server` |
+| `C403` | `tools.<key>.scalar_inputs` (never `defaults.scalar_inputs` — that spelling is a `C101`, per the placement table) |
+| `C404` | `tools.<key>.inputs.<i>.batchable` |
+| `C405` | `tools.<key>.max_batch_bytes` / `defaults.max_batch_bytes` |
+
+- `<key>` is the `tools:` **map key**, matching behaviours 12 and 13.
+- `<i>` is the 0-based entry index, in the loader's **dotted-numeric** convention (`inputs.0.batchable`), not `inputs[0]` — behaviour 13's block pins why the two conventions differ and which one `Location.yaml_path` follows. As there, `line_for` returns `None` for a list-indexed path today; teaching it to walk list indices remains a separate, later, loader-only change.
+- A `tool.yaml`-authored key resolves to `yaml_path = tools.<key>.<field>` and a `line` of `None`, because the line map belongs to the root config. The **`layer` element of the `reserved_keys` pair is therefore load-bearing for the message, not for the path**: the message names the layer in words (*"written in the tool's `tool.yaml`"*), so the author is not sent to the wrong file. Same self-sufficiency requirement as behaviour 13's `C301`–`C303`.
+
+**7. Message and remedy contracts**
+
+All six rules are `Severity.ERROR`. Every `remedy` is non-empty. The pinned content per code:
+
+| Code | Message must contain | Remedy direction |
+|---|---|---|
+| `C400` | that `ttl` is the only idle timer in v1; the ADR citation string below | *"remove `soft_ttl`; use `ttl:` — it is the only idle timer in v1"* |
+| `C401` | `"not implemented in this version"`; the current version from `tool_swap.__version__`; that `bentoml` is the only implemented backend | set `runtime.server: bentoml` (or remove the key) |
+| `C402` | the offending value; the valid values `bentoml`, `native` | set it to one of the listed values |
+| `C403` | that every handler takes and returns a list; the ADR-0005 citation string | remove `scalar_inputs`; the handler already takes a list |
+| `C404` | the offending input's name/label; that batching is a property of the tool, not of an input; the ADR-0005 citation string | remove `batchable` from the input entry |
+| `C405` | that the key does not exist; the spec's mitigation *"set `max_batch_size` low for large payloads"* | remove it and set `max_batch_size` low for large payloads |
+
+**Exact ADR citation strings** (verified against the ADR files' own `# ` titles, so a citation cannot drift from a renamed ADR):
+
+```
+plan/adr/0004-hard-stop-only-in-v1.md (ADR-0004 — v1 reclaims resources by stopping containers; soft unload is deferred)
+plan/adr/0005-one-uniform-batched-calling-convention.md (ADR-0005 — One uniform calling convention: every handler takes and returns a list)
+```
+
+`C400` cites the first; `C403` and `C404` cite the second. Both go in the **message** (path *and* title, per plan line 443's *"by path and title"*), not only in the remedy, so the citation survives `--json` for the same reason behaviour 13's banner does. Each string is a module-level `Final[str]` constant in `validate.py`, referenced by the rules that need it, so the two consumers of ADR-0005 cannot drift apart.
+
+**8. Only-own-codes, and the shipped pins checked**
+
+- **A config with none of the reserved keys produces no `C4xx`.** Asserted directly, including the five-line minimal config (behaviour 23 requires zero diagnostics, and a `C4xx` firing on an empty tool would break it) and a tool whose `runtime_server` is the resolved built-in default `"bentoml"` — the commonest case in the whole suite, and the one an over-eager `C402` would break everywhere at once.
+- **`values` stays 47 keys; `BUILT_IN_DEFAULTS` stays 47 keys.** Neither [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) nor [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324) is amended; the reserved keys are never resolvable fields and `runtime_server` already exists.
+- **`extra="forbid"` elsewhere is unchanged.** [`test_all_documented_models_are_pydantic_models_forbidding_extra_keys`](tests/unit/config/test_schema.py:529) keeps passing: adding fields to a model does not change its `extra` setting.
+- **Every `C101` test in [`test_schema.py`](tests/unit/config/test_schema.py:1) was checked key by key, and none breaks.** The suggestion helper is the only place new field names could leak into an existing message, so each was checked against [`nearest_alternative`](src/tool_swap/config/suggest.py:45)'s threshold (distance ≤ 0.3 × the longer name):
+  - [`test_unknown_key_names_key_path_and_nearest_alternative`](tests/unit/config/test_schema.py:316) — `batch_size` in a tool. Candidates gain `soft_ttl` (distance 9), `scalar_inputs` (11) and `max_batch_bytes` (7, threshold 4.5). All far outside; `max_batch_size` (distance 4, threshold 4.2) still wins. Unchanged.
+  - [`test_suggestion_inside_a_tool_suggests_tool_fields`](tests/unit/config/test_schema.py:412) — `titl` → `ttl` (distance 1). `soft_ttl` is distance 5 against a threshold of 2.4. Unchanged.
+  - [`test_suggestion_inside_groups_suggests_group_fields`](tests/unit/config/test_schema.py:435) — `GroupConfig` gains no fields at all, by the block-1 decision. Unchanged, and this test is precisely why `GroupConfig` was excluded.
+  - [`test_unknown_key_without_close_match_lists_valid_keys`](tests/unit/config/test_schema.py:350) — asserts `"valid keys are"` and that `"host"` appears; it does not assert the full key list, and `RouterConfig` gains nothing regardless. Unchanged.
+  - [`test_full_reference_config_validates_with_zero_errors`](tests/unit/config/test_schema.py:250) and [`test_minimal_five_line_config_validates_with_zero_errors`](tests/unit/config/test_schema.py:262) — neither fixture writes a reserved key, and adding optional defaulted fields cannot turn a clean config dirty. Unchanged.
+  - [`test_all_unknown_keys_in_one_file_are_reported_in_a_single_run`](tests/unit/config/test_schema.py:376) — its three keys (`bogus_key`, `another_bad`, `yet_more`) are unrelated to every added name. Unchanged.
+- **`ToolYamlConfig` is still unreachable**, exactly as behaviour 13's block recorded: no `RootConfig` field has that type, and the loader deliberately does not schema-validate an included `tool.yaml` ([`test_include_tool_yaml_unknown_key_loads_with_file_recorded`](tests/unit/config/test_includes.py:543) pins that). Behaviour 14 adds the reserved fields to it for the day it *is* wired in, and does **not** wire it in. The consequence to state plainly: **a `soft_ttl` in a `tool.yaml` is caught by `C400` via the resolver's layer scan, not by the schema** — which is why the detection mechanism of block 2 is a resolver scan rather than anything Pydantic-shaped.
+- **The flattening-table addition breaks nothing**, and the reason is worth stating because it looks risky. [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:71) pins its own **local copy** named `FLATTENING_TABLE` and never imports the resolver's `_FLATTENING_TABLE`; both [`test_flattening_table_is_one_nested_key_per_flat_field`](tests/unit/config/test_merge_semantics.py:235) and [`test_flattening_maps_each_nested_key_to_its_flat_field`](tests/unit/config/test_merge_semantics.py:245) iterate that copy only. Adding `("runtime", "server")` to the source table therefore leaves both green, and the local copy may be extended in behaviour 14's own green step or left alone. *(That the two tables are unlinked is itself a latent gap — the local copy could drift from the real one and the "bijection" test would keep passing. Noted, **not** fixed here: linking them is a change to a committed test file and belongs in its own step.)*
+- **No test needs a preparatory red step.** This is the same property behaviour 13's design was chosen for, and it was the acceptance criterion for every choice above.
+
+**9. Registration**
+
+Module-level constants `TSWAP_C400_RULE`, `TSWAP_C401_RULE`, `TSWAP_C402_RULE`, `TSWAP_C403_RULE`, `TSWAP_C404_RULE`, `TSWAP_C405_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, all `Severity.ERROR`, every `remedy` non-empty. **No import-time self-registration** — all six are appended to `BUILTIN_RULES` in code order, after behaviour 13's four.
+
+The green step extends **both** completeness constants, and both are required:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file) — its comment already says *"BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER"*.
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file) — same instruction in its own comment.
+
+The two constants are a **known duplication**: one asserts the contents of `BUILTIN_RULES`, the other asserts what `register_builtin_rules()` puts in the registry, and nothing keeps them in step but discipline. Behaviour 14 **extends both and does not fix the duplication** — collapsing them touches two committed test files for no behavioural gain, and belongs in its own step if anyone wants it. Noted so the next behaviour does not rediscover it.
+
+**10. Rule/`ValidatedConfig` boundary**
+
+`ValidatedConfig` stays **frozen at its four fields** and is not amended, as in behaviour 13. Every `C4xx` rule reads only `config.tools[<key>]` — `reserved_keys`, `values["runtime_server"]`, `inputs` — plus `config.path` and `config.line_for` for the location. No rule re-reads the filesystem, calls the loader, or parses `config.raw`. `defaults:`-layer findings arrive through `reserved_keys`' layer label, which is why the pair carries one.
 
 ### Behaviour 15 — image source, handler and file existence (§6 rules 5, 6)
 
@@ -817,6 +1011,8 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 **A13 (new, 2026-08-18) — NOT yet confirmed by the intake source.** The registration mechanism decided above (explicit `register_builtin_rules()`, no import-time self-registration) is a design choice **not** covered by Q1–Q9 or by A1–A12, and therefore not covered by the issue's "ALL CONFIRMED" comment. It is an internal-mechanism decision with no effect on the config file format, the diagnostic codes, the CLI surface, or any Definition-of-Done item, so it does not need maintainer sign-off to proceed. It is recorded here for visibility, and should be mentioned in the pull-request description rather than blocking work. The one part worth a maintainer's eye is the consequence: behaviour 12's committed reload test is superseded (behaviour 12a).
 
 **A14 (new, 2026-08-18) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 13's contract block adds `inputs:` / `outputs:` / `params:` / `json_schema:` to `ToolYamlConfig` **only**, not to the inline `ToolConfig`. §5.5.1 says `params` is *"Overridable per config entry"*, and §4's *"inline overrides beat the tool.yaml"* would extend that to `inputs:`/`outputs:` by symmetry; every worked example in `plan/02` nevertheless authors all four blocks in `tool.yaml`, and behaviour 20's stated inputs are *"as authored in `tool.yaml`"*. M1 therefore reads them from `tool.yaml` alone. The narrowing is visible in exactly one place (`ToolConfig`), and widening it later is additive — the `ResolvedTool` carrier fields and the origin paths already exist, so it becomes a layering change inside `resolve_tool`, not a redesign. The user-visible consequence to confirm: in M1, writing `params:` in a `tools.yaml` entry is an unknown-key `TSWAP-C101`, not an override. `description:` **is** inline-overridable, as behaviour 13 requires.
+
+**Plan correction (2026-08-18) — `max_batch_bytes`, behaviour 14's `C405`. Not a new assumption.** Behaviour 14's `C405` bullet previously stated that `max_batch_bytes` is *"not in the schema"* while simultaneously requiring a bespoke `TSWAP-C405` diagnostic for it. The two cannot both hold: a key absent from the schema is rejected by `extra="forbid"` inside `validate_root`, which runs before any rule sees the config, so the rule could never fire. The resolution — reserve the key like `soft_ttl` and `scalar_inputs`, and reject it with `C405` — applies the mechanism the maintainer already confirmed as **A6**, and leaves the accept/reject boundary exactly where it was: `max_batch_bytes` is an error before and after, is never resolvable, never enters `BUILT_IN_DEFAULTS` or `ResolvedTool.values`, and §5.5's *"There is no `max_batch_bytes` key"* stays literally true of the config surface. Because nothing user-visible widens or narrows, this needs **no** confirmation from [issue #2](https://github.com/iar3-r8/tool-swap/issues/2) and no new `A`-number; it is recorded here, and in behaviour 14's own bullet, for visibility, and is worth one line in the PR description.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
