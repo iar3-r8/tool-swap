@@ -1095,6 +1095,192 @@ Every `C52x`/`C53x` rule reads only `config.tools[<key>].values["devices" | "wor
 - **Edge cases:** a host path containing `:` (Windows-style or otherwise) is documented as unsupported and produces `C540`; `~` on the host side expands, and the expanded form appears in `config show`; a relative host path is resolved against the config file's directory and the **absolute** result is what gets reported and validated.
 - **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_mounts.py`.
 
+#### Confirmed contract details (2026-08-19)
+
+Four rules, and the **first rule group in M1 that parses a compound string into a structure other rules and a CLI command both consume**. Behaviour 15 pinned how a rule reaches the disk; behaviour 16 pinned how a rule reaches a root block; this block pins **where a mount string is parsed, who owns the parsed view, and what "the resolved config says so" concretely means**. **No preparatory sub-step is required** (item 12 verified behaviour 16's append test is index-anchored). **Neither the resolver nor `schema.py` is touched** (items 1, 8 and 12).
+
+The governing property, stated once because four decisions follow from it: **`values` holds what the author wrote; a rule computes the interpretation and never writes it back.** Behaviour 16 item 4 already leans on this (`values["devices"]` holds `"0"` as a string precisely because nothing coerces it). Behaviour 17 is the first behaviour tempted to break it — a "normalised mounts" rewrite is the obvious design — and item 1 rejects it explicitly.
+
+**1. The parsed view lives in `validate.py` as a pure helper. `values["mounts"]` is NOT rewritten, and no carrier is added.**
+
+Three options were on the table; the third is pinned.
+
+| Option | Verdict |
+|---|---|
+| (a) The resolver rewrites `values["mounts"]` into normalised strings (`:ro` made explicit, `~` expanded, relatives absolutised) | **Rejected** |
+| (b) The resolver carries a side structure in a trailing `mounts_parsed` carrier on `ResolvedTool` | **Rejected** |
+| (c) A pure module-level parse helper in `validate.py`, called by the rules and by behaviour 22 | **PINNED** |
+
+- **(a) is rejected on three independent grounds, any one of which is sufficient.** First, it breaks the governing property: `values` would stop being the authored value and `config show`'s per-entry origin (`mounts[i]`, behaviour 9) would point at a layer that did not write the string shown. Second, **the resolver cannot do it** — normalisation needs the *config file's* directory and [`resolve_tool`](src/tool_swap/config/resolver.py:144) takes `name`, `inline`, `tool_yaml`, `defaults`, `group`, `base_dir` and nothing else; `base_dir` is the **tool** directory, which item 3 shows is the wrong root for a mount. Third, `~` expansion reads the environment, and behaviour 10 pins the resolver as *"a **pure function** of the layers — no filesystem, no environment, no clock"* (plan line 189). A rewrite would have to break that sentence.
+- **(b) is rejected because it buys nothing (a) does not.** It still needs the config directory in `resolve_tool`, still needs the environment for `~`, and additionally grows `ResolvedTool` by a field whose only consumers are four rules and one CLI command that both already hold a `ValidatedConfig`.
+- **(c) costs nothing and has a precedent.** `ValidatedConfig` already carries `path` (→ the config directory) and `probe`; the parse is a pure function of `(entry string, config directory, home)`. This is exactly [`_parse_handler`](src/tool_swap/config/validate.py:1370) — one shared parser that C512, C513 and C516 all re-run so *"the three rules cannot disagree about parseability"*. Behaviour 17 has four rules and a CLI command with the same requirement.
+
+Pinned shapes, all in `validate.py`, all public (behaviour 22 imports them):
+
+```python
+@dataclass(frozen=True)
+class ParsedMount:
+    """One parsed `host:container[:ro|rw]` entry."""
+    host: str             # as authored, after ~ expansion; may still be relative
+    container: str        # as authored
+    mode: str             # as authored, or "ro" when the entry omitted it
+    mode_defaulted: bool  # True iff the authored entry had no third part
+    resolved_host: Path   # host resolved against the config file's directory
+
+
+def parse_mount(entry: str, *, config_dir: Path, home: Path | None = None) -> ParsedMount | None:
+    """Parse one mount entry; ``None`` means unparseable (``TSWAP-C540``)."""
+```
+
+- **`mode` is the mode AS AUTHORED**, not a validated one: a `"RO"` survives into `ParsedMount.mode` and is `C541`'s to reject (item 5). Only the *absence* of a third part is filled in, and `mode_defaulted` records that it was.
+- **`parse_mount` returns `None` for exactly the `C540` cases and for nothing else** (item 5). `C541`/`C542`/`C543` all re-run it and skip on `None`, so the four rules cannot disagree — the `_parse_handler` contract, restated.
+- **Nothing mutates `config`.** The helper is pure; `validate_config`'s no-mutation pin ([`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719)) is untouched.
+
+**2. What `config show` (behaviour 22) reads, pinned so 17 and 22 cannot drift**
+
+Behaviour 22 line 1173 promises *"`mounts` shows a per-entry origin and the explicit `:ro` default made visible"*. Concretely, for tool `t` and resolved entry `i`:
+
+| Piece | Source |
+|---|---|
+| the rendered string | `parse_mount(tool.values["mounts"][i], config_dir=config.path.parent, home=config.home)` → `f"{m.resolved_host}:{m.container}:{m.mode}"` |
+| the origin | `tool.origins.winning(f"mounts[{i}]")` — already recorded by [`_resolve_mounts`](src/tool_swap/config/resolver.py:783) |
+| the defaulted-mode note | `m.mode_defaulted` |
+
+**The pinned note phrase is `mode defaulted to ro`** — a test may assert that substring. A rendered line therefore reads:
+
+```
+mounts:
+  /home/u/.cache/hf:/weights/hf:ro    # tools.yaml:114 (defaults); mode defaulted to ro
+```
+
+An **unparseable** entry (`parse_mount` → `None`) is rendered **verbatim as authored** with its origin and no note; `config show` never hides a string it could not parse, and `C540` is already reporting it.
+
+**3. Expansion and relative resolution — at rule time, against the CONFIG file's directory**
+
+- **`~` expands, unlike behaviour 15's paths, and the asymmetry is deliberate.** Behaviour 15's [`_resolved`](src/tool_swap/config/validate.py:1403) pins *"never `~` expansion … a `~` left unexpanded is a portability mistake"*. That is right for a `handler:` inside a tool directory and wrong for a mount: `plan/02` §3 line 115 and `plan/07` §5 line 209 both **author** `${HF_HOME:-~/.cache/huggingface}` as a mount, so a literal `~` there is the documented spelling, not a mistake. Plan line 1095 requires the expansion and requires the expanded form in `config show`.
+- **The environment read is INJECTED, following `probe`, not `gpu_count`.** `~` expansion reads `HOME`, and `validate_config` is pinned as *"a pure function of its input (no filesystem, no clock, no environment)"* ([`test_validate_registry.py`](tests/unit/config/test_validate_registry.py:714)'s own section heading). The seam is a **trailing, keyword-only, defaulted field** on `ValidatedConfig`:
+
+```python
+@dataclass(frozen=True)
+class ValidatedConfig:
+    ...
+    gpu_count: int | None = field(default=None, kw_only=True)
+    # --- added by behaviour 17; trailing, keyword-only, defaulted ---
+    home: Path | None = field(default=None, kw_only=True)
+```
+
+  `None` means **"the real home"** — the helper calls `Path(host).expanduser()`, exactly what the loader already does for `path:` ([`_resolve_tool_path`](src/tool_swap/config/loader.py:296)). A `Path` injected by a test replaces a **leading** `~` or `~/` literally, making every test deterministic on any machine. This mirrors `probe: FileProbe = REAL_FILESYSTEM` (a cheap, portable, stdlib ambient fact whose default IS the real answer) and deliberately **not** `gpu_count: None` (an expensive vendor fact the config layer refuses to look up). Getting this backwards would make `C543` silently wrong in production rather than silently absent.
+- **Only a LEADING `~` expands.** `/data/~backup:/x` is a literal directory name; `Path.expanduser` agrees.
+- **A relative host path resolves against `config.path.parent` — NOT against `tool.base_dir`.** `_tool_base` exists and is the tempting wrong call. A mount is a **host-machine** path handed to the Docker daemon, authored anywhere in the layer stack (`defaults:` most often), and `mounts` is the one field **concatenated across layers** — so "the layer that wrote this entry" is not a directory the rule can turn into a root without inventing per-entry base directories. One predictable root for every entry of every tool is the only honest choice, and it is what plan line 1095 says.
+- **Resolution is LEXICAL, reusing behaviour 15's helper**: `_resolved(config.path.parent, expanded_host)` — `normpath` semantics, **no** `Path.resolve()`, **no** `Path.cwd()`, no disk contact. The result is absolute because the loader resolves the config path ([`loader.py`](src/tool_swap/config/loader.py:627) `path.resolve()`) before any of this runs; the rule itself never reaches for the CWD to make it so. A hand-built `ValidatedConfig` with the default relative `Path("tools.yaml")` therefore yields a relative resolved host — accepted, and worth one test, because it is the honest consequence rather than a hidden `Path.cwd()` call.
+
+**4. `TSWAP-C540` — unparseable (ERROR)**
+
+Split the entry on `":"`. It parses iff there are **exactly 2 or 3 parts and every part is non-empty**. Anything else is `C540`, whose message shows the value found and **both** expected forms verbatim: `host:container` and `host:container:ro|rw`.
+
+| Entry | Parts | Outcome |
+|---|---|---|
+| `/h:/c` | 2 | parses, `mode="ro"`, `mode_defaulted=True` |
+| `/h:/c:ro` / `/h:/c:rw` | 3 | parses, `mode_defaulted=False` |
+| `/h` | 1 | **C540** (no colon) |
+| `""` | 1 | **C540** |
+| `:/x` | 2, empty host | **C540** |
+| `/h:` | 2, empty container | **C540** |
+| `/h:/c:` | 3, empty mode | **C540** |
+| `/h:/c:ro:extra` | 4 | **C540** |
+| `C:\data:/weights:ro` | 4 | **C540** (the Windows case at ≥4 parts) |
+| `C:\data:/weights` | 3 | **parses** → `C541` + `C542`, not `C540` (item 5) |
+
+Splitting is done on the **authored** string, before any expansion — expansion cannot introduce or remove a colon, and splitting first keeps the parse a pure function of the string.
+
+**Non-string entries and non-list `mounts` are skipped silently by all four rules.** `list[str]` on [`ToolConfig`](src/tool_swap/config/schema.py:200) and [`DefaultsConfig`](src/tool_swap/config/schema.py:107) means a `mounts: [123]` is a schema-layer `TSWAP-C105` and a `mounts: "x"` is too; re-reporting either per rule would bury the schema's message. This is behaviour 13's *"a block whose value is not a list is skipped silently"*, applied a fourth time.
+
+**5. `TSWAP-C541` — a mode outside `{ro, rw}` (ERROR), matched EXACTLY**
+
+Fires when a 3-part entry's third part is not literally `ro` or `rw`. **Case-sensitive: `:RO` is a `C541`.** The plan is silent; the pin is exact match, because every documented form in `plan/02` §5.6, §3 and `plan/07` §5 is lowercase, and a case-insensitive parser would have to decide what `config show` renders for `:RO` — either it echoes a spelling Docker docs never use, or it silently rewrites the author's string. Rejecting is one clear diagnostic with a one-character fix. *(Flagged as assumption **A18**.)* The message names the offending mode with `repr` and lists the two legal values.
+
+**The 3-part Windows case is a `C541` (plus a `C542`), NOT a `C540` — a correction to the plan's own edge-case bullet.** `C:\data:/weights` splits into exactly 3 non-empty parts, so it parses: `host="C"`, `container="\data"`, `mode="/weights"`. Line 1095 says a host path containing `:` *"produces `C540`"*, which is true only for the ≥4-part spellings in item 4's table. Rather than add a "does this look like a path?" heuristic to the mode check, `C541`'s **remedy carries the trap in one clause**: *a host path containing ':' (a Windows drive letter, for example) is not supported — mount entries are split on ':'*. That sentence is the whole value of the diagnostic for this user. *(Recorded as a plan correction below, not a new assumption: the entry is an error before and after, with a more specific message.)*
+
+**6. `TSWAP-C542` — a non-absolute container path (ERROR)**
+
+Fires when the container part does not start with `/`. Docker requires an absolute destination; `\data`, `data`, `./data` and `C:\data` all fail. Windows-style container paths are unsupported, and the message says so rather than pretending the value might work.
+
+**`C541` and `C542` are independent and BOTH may fire on one entry** — they judge different parts of the string, and suppressing either would hide half the fix. The Windows 3-part case is exactly where both fire, which is the honest picture: the mode is wrong *and* the destination is wrong, because a colon was eaten. This is the same accepted double-report behaviour 16 item 4 recorded for `C520`-and-`C105`, and it does not contradict the "one mistake, one diagnostic" discipline, which governs a rule against a rule *reading the same value*.
+
+**`C540` suppresses `C541`, `C542` and `C543` for that entry**, because nothing was parsed to judge — the [`C512`-suppresses-`C513`/`C516`](src/tool_swap/config/validate.py:1548) pattern, implemented the same way (each rule re-runs `parse_mount` and skips on `None`). Suppression is **per entry**, never per tool: a tool with one malformed and one missing-host mount reports both.
+
+**7. `TSWAP-C543` — the host path does not exist (WARNING)**
+
+Fires when `probe.is_file(m.resolved_host)` **and** `probe.is_dir(m.resolved_host)` are both false. **Either predicate satisfies existence** — a bind mount source is legitimately a directory (weights caches, `/data/ct`) or a file (a socket path, a single model file, `/var/run/docker.sock`), and requiring one over the other would warn on half of the documented examples. Never an error (§6 rule 9: the path may be created before the container starts). Not suppressed by `C541` or `C542`, which say nothing about the host side.
+
+The message names the resolved host path (`str(m.resolved_host)`, so a `~` expansion and a relative resolution are both visible). **The remedy names the host-vs-router-container trap from [`plan/07_CLI_AND_OPS.md`](plan/07_CLI_AND_OPS.md:226)**, whose source sentence is: *"If the router is itself containerised, paths in `mounts:` are **host** paths interpreted by the Docker daemon, not paths inside the router container — a classic and confusing trap."* The pinned assertable phrase, near-verbatim, is:
+
+> **`host paths interpreted by the Docker daemon, not paths inside the router container`**
+
+A test asserts that substring appears in the remedy. Without it the warning reads as "you typed the path wrong", when the actual cause is usually "the path is right, but you are reading it from inside the router".
+
+**A `defaults:`-supplied or group-supplied mount yields one diagnostic per member tool**, since `mounts` concatenates into every tool's resolved list. The remedy must therefore be **self-sufficient** (the behaviour 13/14/15/16 rule) and name every place the entry could have come from — *the tool's `mounts:`, the `defaults:` block, or its `tool.yaml`* — rather than pretending to know which layer authored it.
+
+**8. `TSWAP-C503` — ALREADY SHIPPED, and behaviour 17 does not touch it**
+
+Verified against the code, because "does it need the parsed view?" was the open question:
+
+- **It is a resolver diagnostic, not a `Rule`.** [`_duplicate_container_paths`](src/tool_swap/config/resolver.py:816) runs inside `resolve_tool` and lands in `ResolvedTool.diagnostics`. It is **not** in `BUILTIN_RULES` and must **not** be added there — that would double-report it once behaviour 21 wires resolver diagnostics into the report.
+- **It already parses.** [`_split_mount`](src/tool_swap/config/resolver.py:861) returns `(parts[0], parts[1])`, i.e. it compares the **container path**, not the raw string. So the exact case named in the task — `a:/x:ro` versus `a:/x` — **already** collides on `/x` and already warns today. **No change is needed, and none is made**; the shipped [`test_duplicate_container_path_across_layers_is_c503_warning`](tests/unit/config/test_merge_semantics.py:157) stays as committed.
+- **Its location stays exactly as B10 shipped it**: `Location(file=<the tool name>, yaml_path="mounts")` — note `file` is the tool *name*, not the config path, because `resolve_tool` has no config path. That is odd next to the `C54x` locations of item 9, and it is **deliberately left alone**: it is a shipped pin, changing it is a behaviour-21 rendering concern, and behaviour 17 does not get to quietly rewrite a landed contract.
+- **One honest wart, recorded not fixed.** `_split_mount` returns `(parts[0], parts[0])` for a colon-less entry, so two layers each writing the bare string `/data` collide on the "container path" `/data` and emit a `C503` **alongside** the two `C540`s. Two diagnostics for a mistake that is genuinely present twice, from two independent layers, with a correct message — not worth touching a shipped rule for. `parse_mount` is **not** wired into the resolver.
+
+**9. Location contract per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour 12/13/14/15/16 form. The file is never hardcoded, `line=None` is a legal outcome, and tests assert `location.line == config.line_for(location.yaml_path)` rather than a literal line number.
+
+| Code | `yaml_path` |
+|---|---|
+| `C540` | `tools.<key>.mounts.<i>` |
+| `C541` | `tools.<key>.mounts.<i>` |
+| `C542` | `tools.<key>.mounts.<i>` |
+| `C543` | `tools.<key>.mounts.<i>` |
+| `C503` | *(unchanged from B10: `file=<tool name>`, `yaml_path="mounts"`)* |
+
+`<key>` is the `tools:` **map key**; `<i>` is the **0-based** position in the **resolved, concatenated** `mounts` list, written **dotted-numeric** (`tools.t.mounts.0`) — behaviour 13's convention, re-affirmed by behaviour 16 item 7. **The bracketed `mounts[i]` spelling is an ORIGIN path and a different namespace**; brackets appear in no `yaml_path`. The two indices happen to agree (both index the resolved list), which is a convenience for behaviour 22 and not a contract either side may rely on.
+
+**10. Severity**
+
+`C540` **ERROR**; `C541` **ERROR**; `C542` **ERROR**; `C543` **WARNING**; `C503` **WARNING** (existing, unchanged). Every `remedy` is non-empty. The shape matches behaviour 16's: the warnings are *"this may be fine later or elsewhere"* judgements (the path may be created; the shadowed mount may be intended), the errors are statements that Docker cannot be handed this string at all.
+
+**11. Registration**
+
+Module-level constants `TSWAP_C540_RULE` … `TSWAP_C543_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, **no import-time self-registration**, appended to `BUILTIN_RULES` in code order after behaviour 16's seven — **34 landed rules in total** (6 + 4 + 6 + 7 + 7 + 4). The four ids in code order are `TSWAP-C540`, `TSWAP-C541`, `TSWAP-C542`, `TSWAP-C543`. **`TSWAP-C503` is NOT among them** (item 8).
+
+The green step extends **both** completeness constants, and both are required:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file).
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file).
+
+**This is the fourth behaviour to pay the two-constant tax** that behaviours 14, 15 and 16 recorded. Still not fixed here, for the reason 15 and 16 gave: collapsing them is worth its own step after 19, when the constant stops growing. The new test file restates `_BEHAVIOUR_12_IDS` … `_BEHAVIOUR_16_IDS` lengths as module-top constants and anchors behaviour 17's block **by index**, never by tail or total count.
+
+**12. Shipped pins checked, one by one**
+
+- **Safe — [`test_builtin_rules_append_the_behaviour_16_codes_in_code_order`](tests/unit/config/test_validate_resources.py:355): VERIFIED index-anchored.** It computes `first_c520 = ids.index(_BEHAVIOUR_16_IDS[0])`, asserts that index equals the sum of the four preceding block lengths, slices forward, and then checks object identity per constant; it carries **no** `len(BUILTIN_RULES)` assertion and **no** tail slice. Appending four rules after it changes nothing it measures. **No preparatory red sub-step is needed.**
+- **Safe — behaviour 13's, 14's and 15's append-order tests**, and [`test_builtin_rules_carries_the_behaviour_12_codes_in_code_order`](tests/unit/config/test_validate_registry_builtins.py:131): all index-anchored or compared against `_EXPECTED_BUILTIN_IDS`, which the green step extends in the same commit.
+- **Safe — the 47-key pins**, [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) and [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324): behaviour 17 adds **no** key to `BUILT_IN_DEFAULTS` and **no** key to `values`. `mounts` is already among the 47 ([`defaults.py`](src/tool_swap/config/defaults.py:58), `"mounts": []`). **`values` stays 47; `BUILT_IN_DEFAULTS` stays 47.**
+- **Safe — [`test_defaults.py`](tests/unit/config/test_defaults.py:95)'s literal `"mounts": []` entry and its `_MUTABLE_KEYS` deep-copy test:** behaviour 17 changes neither the default nor the copying.
+- **THE PIN THAT OPTION (a) WOULD HAVE BROKEN, and the reason item 1 chose (c).** Four shipped tests assert `values["mounts"]` holds the **authored strings, unchanged**: [`test_mounts_concatenated_in_layer_order_most_specific_last`](tests/unit/config/test_merge_semantics.py:119) (`== ["/h1:/data/a:ro", ...]`), [`test_mounts_empty_in_some_layers_concatenates_rest`](tests/unit/config/test_merge_semantics.py:142), [`test_duplicate_container_path_across_layers_is_c503_warning`](tests/unit/config/test_merge_semantics.py:157) and [`test_distinct_container_paths_produce_no_c503`](tests/unit/config/test_merge_semantics.py:177). A normalising rewrite would break **all four** and force a red step that edits shipped, correct tests to accommodate a design choice. Under the pinned design **none of them is touched**.
+- **Safe — [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99):** `ResolvedTool` gains no carrier (item 1 rejected option (b)), so it is not touched.
+- **Safe — [`test_resolver.py`](tests/unit/config/test_resolver.py:374)'s deep-copy test** (`inline["mounts"].append(...)` after the call): the resolver is unchanged.
+- **Safe — [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) and [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334):** re-verified line by line for `home` (item 3). The first constructs with keyword arguments and asserts **no field count and no field list**; the second loops over the four names `("tools", "raw", "line_for", "path")`. A trailing keyword-only defaulted field is invisible to both, exactly as `probe` and `gpu_count` were. **Neither is amended.**
+- **Safe — [`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719):** its `raw` fixture literally contains `{"mounts": ["/a:/b:ro"]}`, but the rules read `tool.values`, not `raw`, its two rules are fakes, and `parse_mount` is pure. Untouched.
+- **Safe — [`test_validate_config_ignores_the_ambient_environment`](tests/unit/config/test_validate_registry.py:760):** `home` is data carried on the input. The **default** `home=None` does consult `$HOME` via `expanduser`, which is why every behaviour-17 test injects a `home` — but this shipped test registers a fixed-diagnostic fake rule and never parses a mount, so it is unaffected. Behaviour 17's own purity test injects `home` and asserts two identical reports across an `os.environ["HOME"]` change.
+- **Safe — [`test_schema.py`](tests/unit/config/test_schema.py:250)'s `FULL_REFERENCE_CONFIG` and its `mounts:` entries:** behaviour 17 adds no schema field and no schema diagnostic; `validate_root` is untouched. The rules are a separate layer this test does not run.
+- **Safe — [`test_suggest.py`](tests/unit/config/test_suggest.py:63)'s `mount`→`mounts` case:** no key is added or renamed.
+- **Safe — [`test_origin.py`](tests/unit/config/test_origin.py:334)'s `mounts[0]`/`mounts[1]` per-index origins:** the bracketed origin namespace is unchanged (item 9), and behaviour 22 consumes it as-is.
+- **Safe — behaviour 23's five-line config:** it declares no `mounts` and inherits `[]`, so all four rules stay silent and `C503` cannot fire.
+- **Watch, not a break — behaviour 24's `tools.example.yaml`:** line 1204 already records that a mount to a non-existent host path trips `C543` under `--strict`. Item 7's "file OR directory" rule slightly widens what satisfies it, which can only help. No committed test exists yet.
+
+**13. Rule/`ValidatedConfig` boundary**
+
+Every `C54x` rule reads only `config.tools[<key>].values["mounts"]`, `config.path`, `config.line_for`, `config.probe` and `config.home`. **No rule reads `config.raw`** (mounts are per-tool and fully resolved), none re-reads the filesystem outside the probe, none calls `os.environ`, `Path.cwd()` or `Path.resolve()`, none calls the loader, and none imports anything.
+
 ### Behaviour 18 — contradictions (§6 rule 11)
 
 - **Inputs:** `keep_warm: true` with `autostart: false`; other contradictory pairs.
@@ -1433,6 +1619,12 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 **A17 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 16's contract block adds `workers: int | None` and `expose_host_port: bool | int | None` to the inline `ToolConfig` **only** — not to `ToolYamlConfig`, and `expose_host_port` not to `DefaultsConfig` either (`workers` is already there). This is the **same trap and the same resolution as A15**: `plan/02` §5.5's field table lists `workers` as a tool-level key and §5.2 lists `expose_host_port` (*"bool | int, `false`, Publish for debugging; `true` picks from `backend.port_range`"*), yet neither is a field of `ToolConfig` today, so a tool writing either is rejected by `extra="forbid"` as a `TSWAP-C101` before any rule runs — which makes `TSWAP-C523`, `TSWAP-C530` and `TSWAP-C531` unreachable for an inline tool. **It moves the accept/reject boundary** (both keys go from *rejected as unknown* to *accepted and checked*), which is why it takes an `A`-number rather than being a plan correction. The move is toward the documented spec, and no shipped test asserts the current rejection (verified — `test_schema.py` writes neither key inside a `tools:` entry). Two deliberate exclusions: `DefaultsConfig` does **not** gain `expose_host_port`, because a defaults-level published port collides across every tool by construction and would make `C530` fire on every multi-tool config — the key is inherently per-tool; and `ToolYamlConfig` gains neither, following A14/A15, since §4's reference authors neither and `batching.workers` would additionally need a `_FLATTENING_TABLE` entry. The user-visible consequence to confirm: in M1, `workers:` and `expose_host_port:` are legal in a `tools.yaml` tool entry, `workers:` remains legal in `defaults:`, `expose_host_port:` remains illegal in `defaults:`, and both remain illegal in a `tool.yaml`.
 
 **Behaviour 16 note (2026-08-19) — `TSWAP-C521` never fires in production in M1. Not an assumption; a consequence recorded for visibility.** The GPU count reaches the rules as `ValidatedConfig.gpu_count: int | None = None`, and **nothing in M1 populates it**: counting GPUs needs `pynvml` or an `nvidia-smi` subprocess, and the config layer must acquire neither (§2 — `tswap validate` runs in CI with no Docker and no GPU). `None` means "unknown", the rule is skipped silently, and `C521` is exercised only where a test injects a count. A real count would come from **M5 preflight** (which already owns host-facing checks and is where these rules get *moved*, guardrail 13), or from the **CLI at behaviour 21** if wired sooner; M1 pins the seam only and places no obligation on behaviour 21. This satisfies §6 rule 7 honestly — a validator that cannot see the host says nothing about it — and adding a count later is one keyword argument at one construction site.
+
+**A18 (new, 2026-08-19) — NOT yet confirmed by the intake source; minor, worth one line in the PR description.** Behaviour 17's `TSWAP-C541` matches the mount mode **case-sensitively**: `/h:/c:RO` is an error, not a synonym for `:ro`. `plan/02` §5.6 writes the grammar as `host:container[:ro|rw]` and is silent on case, so this is a decision the spec does not make. Lowercase-only is adopted because every documented form in `plan/02` §3, §5.6 and `plan/07` §5 is lowercase, and because accepting `:RO` would force behaviour 22 to choose between echoing a spelling no Docker documentation uses and silently rewriting the author's string — whereas rejecting it is one diagnostic with a one-character fix. Narrowing here is safe to relax later (relaxing turns a `C541` into acceptance); the reverse would break configs that had already been accepted. **No shipped test asserts either behaviour** (verified — no committed test writes a non-lowercase mode). The user-visible consequence to confirm: in M1, `:RO`, `:Rw` and `:READONLY` are all `TSWAP-C541`.
+
+**Plan correction (2026-08-19) — behaviour 17's Windows-path edge case. Not a new assumption.** Plan line 1095 states that a host path containing `:` *"is documented as unsupported and produces `C540`"*. That is true only for spellings that split into **four or more** parts (`C:\data:/weights:ro`); the three-part spelling `C:\data:/weights` parses cleanly as `host="C"`, `container="\data"`, `mode="/weights"` and therefore yields `TSWAP-C541` (bad mode) **and** `TSWAP-C542` (non-absolute container path) instead. Detecting it as `C540` would require a "does this look like a drive letter?" heuristic inside a parser whose whole virtue is that it is a colon count. Nothing user-visible widens or narrows — the entry is an error before and after, with a **more** specific message — so this needs **no** confirmation from [issue #2](https://github.com/iar3-r8/tool-swap/issues/2) and no new `A`-number. The trap is carried in `C541`'s remedy instead, which states that mount entries are split on `:` and that a host path containing one is unsupported. Recorded here and in behaviour 17's block, item 5, for visibility.
+
+**Behaviour 17 note (2026-08-19) — `TSWAP-C503` is a resolver diagnostic, not a rule, and behaviour 17 does not modify it. Not an assumption; a verification recorded for visibility.** Pinning behaviour 17 raised the question of whether `C503` compares raw mount strings (in which case `a:/x:ro` and `a:/x` would not collide) or parsed container paths. Verified against the shipped code: [`_split_mount`](src/tool_swap/config/resolver.py:861) already splits on `:` and [`_duplicate_container_paths`](src/tool_swap/config/resolver.py:816) keys on `parts[1]`, so those two entries **already** collide on `/x` and already warn today. **No shipped rule is modified and no shipped test changes.** Two consequences are recorded rather than fixed: `C503`'s location carries `file=<the tool name>` (the resolver has no config path), which is inconsistent with the `C54x` locations but is a landed pin behaviour 17 must not quietly rewrite; and a colon-less entry counts as its own container path, so two layers each writing a bare `/data` produce a `C503` alongside two `C540`s — two diagnostics for a mistake genuinely made twice, each with a correct message.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
