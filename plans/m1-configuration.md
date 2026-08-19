@@ -1829,7 +1829,7 @@ This is the same class of decision as **A1** (which declined a DoD clause on ADR
   - `description` is copied verbatim into each property; a missing one is an error via behaviour 13's `C301`, and the compiler additionally refuses to emit a property with no description (`TSWAP-S120`) so the two paths cannot disagree (corpus 12).
   - `json_schema:` present → returned **untouched**, byte-for-byte equal to the parsed input, with **no** `additionalProperties` injected and no `$schema` added (corpus 10). *"Passed through untouched"* is taken literally; a test asserts deep equality including key order.
   - `json_schema:` and `inputs:` both present → `TSWAP-S130` error naming both and requiring one (they are alternatives, per §8.4's "escape hatch" framing).
-  - `compile_outputs(outputs)` produces the same shape for the output schema; outputs are never `required`-bearing and a missing description is a warning (behaviour 13's `C302`).
+  - `compile_outputs(outputs)` produces the same shape for the output schema; outputs are never `required`-bearing and a missing description is a warning (behaviour 13's `C302`) — on the compiler side too: `TSWAP-S120` is emitted at **WARNING** severity from `compile_outputs` and the property is still emitted, without a `description` key (contract block, item 8).
   - `validate_against_metaschema(schema)` checks every compiled schema — including a passed-through `json_schema:` — against the 2020-12 meta-schema using `jsonschema` (corpus 11). §8.5: *"Emitting an invalid schema is worse than emitting none."* An invalid raw block → `TSWAP-S140` quoting the meta-schema validator's own path and message, which is the one place a library's error text is genuinely the most actionable thing available.
 - **Edge cases:**
   - Empty `inputs: []` → a valid object schema with no properties and `additionalProperties: false` (a no-argument tool is legal).
@@ -1838,9 +1838,328 @@ This is the same class of decision as **A1** (which declined a DoD clause on ADR
   - A name colliding between `inputs:` and `params:` → `TSWAP-S101` (§6 rule 1d), naming both and stating the deciding question from §5.5.1: *does this value change what the batched forward pass computes?*
   - A property name that is not a valid identifier is **allowed** (JSON Schema permits any string key) but warns (`TSWAP-S102`), since handlers receive inputs as keyword arguments (§3 of `plan/03_TOOL_AUTHORING.md`) and a non-identifier name cannot be one.
   - `type:` outside the six supported values → `TSWAP-S103` listing them and pointing at `json_schema:` for anything richer (enums, ranges, `oneOf`).
-  - **No `x-batchable` is emitted** and a per-input `batchable:` key is rejected — see assumption **A1** and behaviour 14's `C404`.
+  - **No `x-batchable` is emitted** and a per-input `batchable:` key is rejected — see assumption **A1** and behaviour 14's `C404`. **The rejection is `C404`'s alone, at the config layer**: the compiler *ignores* a `batchable` key in an entry and emits no `S1xx` for it, because two codes for one mistake is the defect behaviour 19 item 0 retired `C611` to avoid (contract block, item 5).
 - **Error behaviour:** all compiler diagnostics use the `TSWAP-S1xx` block and are surfaced through the same `ConfigReport`, so `tswap validate` reports config and schema problems in one pass rather than in two commands.
 - **Files:** `src/tool_swap/schema/compile.py` (new), `tests/unit/schema/test_compile.py`, `tests/unit/schema/test_compile_snapshots.py`, `tests/unit/schema/test_metaschema.py`.
+
+#### Confirmed contract details (2026-08-19)
+
+The **first non-config behaviour in M1**: it ships in `tool_swap.schema`, registers no `Rule`, touches no Pydantic model, and adds no `ValidatedConfig` field. Everything it reads arrives through behaviour 13's landed carrier fields on [`ResolvedTool`](src/tool_swap/config/resolver.py:122), so this block pins **pure functions over plain data** and nothing else. **No shipped test breaks under it** — item 15 names every test checked. `jsonschema>=4.21` is already a declared dependency ([`pyproject.toml`](pyproject.toml:29)), so there is no manifest change and behaviour 1's [`test_dependencies.py`](tests/unit/config/test_dependencies.py:41) is untouched.
+
+The governing property, stated once because every decision below follows from it: **the compiler is TOTAL and never raises.** It is handed data that no schema layer has validated (the carriers are stored *as authored*, [`resolver.py`](src/tool_swap/config/resolver.py:378) deep-copies and casts without inspecting), and behaviour 21 must report every problem in **one pass**. A function that raised on the first malformed entry could not do that, and a `TSWAP-C999` escaping the compiler would be the same class of defect behaviour 13 designed its skip-silently rule to prevent.
+
+**1. The §8.4 worked example — the executable spec for the snapshot (corpus 7)**
+
+Authored, exactly as [`plan/04_API_CONTRACT.md`](plan/04_API_CONTRACT.md:459) §8.4 writes it:
+
+```yaml
+inputs:
+  - name: path
+    type: string
+    required: true
+    description: Path to a DICOM chest X-ray image to embed.
+    semantic: dicom_path
+```
+
+`compile_inputs` returns **exactly** this dict, and the snapshot test asserts it by `==` **and** asserts `list(schema) == ["$schema", "type", "properties", "required", "additionalProperties"]`:
+
+```python
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "Path to a DICOM chest X-ray image to embed.",
+            "x-semantic": "dicom_path",
+        }
+    },
+    "required": ["path"],
+    "additionalProperties": false,   # Python: False
+}
+```
+
+Two deliberate departures from the §8.4 JSON block, both already decided and neither new:
+
+- **`required: ["path"]`, not `["paths"]`** — assumption **A4**, confirmed 2026-08-17. The spec's worked example is internally inconsistent (`name: path`, `required: ["paths"]`); the snapshot asserts the self-consistent form and the typo is not reproduced.
+- **`$schema` is emitted**, though §8.4's JSON omits it. Plan line 1824 requires it and §8.5 requires the output to be meta-schema-validatable on its own terms; §8.4's block is an abbreviation for the prose, not a byte-level target. Not an assumption — the ledger already pinned it.
+
+The matching **outputs** snapshot is [`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md:214) §4's block, which is also the only place the authored `items:` spelling appears:
+
+```yaml
+outputs:
+  - name: embedding
+    type: array
+    items: number
+    description: Embedding vector of shape (768,) per input image.
+```
+
+```python
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "embedding": {
+            "type": "array",
+            "items": {"type": "number"},
+            "description": "Embedding vector of shape (768,) per input image.",
+        }
+    },
+    "additionalProperties": False,
+}
+```
+
+**No `required` key, ever** (item 8).
+
+**2. The exact output shape, and where key order is pinned**
+
+| Position | Key | Always? |
+|---|---|---|
+| 1 | `$schema` | always, `JSON_SCHEMA_2020_12` |
+| 2 | `type` | always, `"object"` |
+| 3 | `properties` | **always**, `{}` when there are no entries |
+| 4 | `required` | **inputs only, and omitted entirely when empty** — never `[]` |
+| 5 | `additionalProperties` | **always `False`** (§8.5 — a typo'd input name must be a 422) |
+
+- **Property order inside `properties` = declaration order.** Pinned, not incidental: it is what makes the snapshot readable and what keeps `/tools` output stable in M3.
+- **Key order inside one property: `type`, `items` (arrays only), `description`, `x-semantic` (only when `semantic:` was authored).** `items` sits next to `type` because it completes the type — the spelling [`plan/02`](plan/02_CONFIGURATION.md:238) §4 already uses in its `json_schema:` comment (`{ type: array, items: { type: string }, description: … }`).
+- **Key order is pinned for the COMPILED output as well as the pass-through.** Corpus 10 only demands key order of the pass-through, but pinning it on both costs one extra assertion and buys a genuinely stable artefact: the compiled schema is serialised into `/tools` in M3 and into `?format=tools` in M9, and `json.dumps` preserves insertion order — an unpinned order would make those snapshots flap on an unrelated refactor. Python dicts are insertion-ordered by language guarantee, so this is a property of the construction code, not of a sort call: **build the dict in the pinned order and never re-key it.**
+
+**3. The API — signatures, and the total, never-raising return contract**
+
+```python
+JSON_SCHEMA_2020_12: Final[str] = "https://json-schema.org/draft/2020-12/schema"
+SUPPORTED_TYPES: Final[tuple[str, ...]] = (
+    "string", "number", "integer", "boolean", "array", "object",
+)
+
+def compile_inputs(
+    inputs: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any] | None, list[SchemaDiagnostic]]: ...
+
+def compile_outputs(
+    outputs: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any] | None, list[SchemaDiagnostic]]: ...
+
+def compile_tool_schema(
+    *,
+    inputs: list[dict[str, Any]] | None = None,
+    outputs: list[dict[str, Any]] | None = None,
+    params: list[dict[str, Any]] | None = None,
+    json_schema: dict[str, Any] | None = None,
+) -> CompiledSchemas: ...
+
+def validate_against_metaschema(
+    schema: dict[str, Any],
+) -> list[SchemaDiagnostic]: ...
+```
+
+**Decision: `(schema, diagnostics)` tuples — the compiler NEVER raises a typed exception.** The three options and why this one:
+
+| Option | Rejected because |
+|---|---|
+| Raise `SchemaCompileError` on the first problem | Behaviour 21 must report **every** problem in one pass (plan line 1934: *"config and schema problems in one pass rather than in two commands"*). First-error-wins would make `tswap validate` a game of whack-a-mole on a five-input tool, and it would make S100/S101/S103 mutually invisible. |
+| Return only the schema, collect diagnostics in a passed-in mutable accumulator | Not a pure function; the caller owns a mutable that outlives the call; untestable without constructing the accumulator. |
+| **Return `(schema, diagnostics)`** | **Chosen.** Pure, total, trivially testable (`schema, diags = compile_inputs(...)`), and it is the shape behaviour 13's `downgrade_missing_descriptions` already established for "pure function, report-shaped output". |
+
+- **Never raises for any input.** Not for a non-list `inputs`, not for a non-dict entry, not for a missing `name`, not for `None`. A test asserts this over a hostile corpus (`"oops"`, `[None]`, `[[]]`, `[{"name": None}]`, `[{}]`, `42`). The one exception is a genuine programming error inside the compiler itself, which is `TSWAP-C999`'s job at behaviour 21's boundary and not something the compiler catches for itself.
+- **The schema half is `None` when compilation could not produce a meaningful schema**, i.e. when the input block is absent (item 13) **or** when any ERROR-severity diagnostic was produced. It is a dict whenever the diagnostics are all WARNING-severity. This is §8.5's rule made mechanical: *"Emitting an invalid schema is worse than emitting none."* A caller can therefore write `if schema is not None: publish(schema)` without inspecting severities.
+- **Diagnostic order = detection order**, which is: block-level checks first (`S130`), then per-entry checks in declaration order, then cross-entry checks (`S100`, `S101`). Pinned so the tests can assert a list rather than a set.
+
+**4. `semantic:` → `x-semantic`, carried verbatim**
+
+- `semantic: dicom_path` → the property gains `x-semantic: "dicom_path"`. The value is copied **verbatim and never interpreted** (§8.3: *"Never interpreted by the router; carried for humans and agents"*). Any string passes: `eeg_edf`, `nifti_path`, `banana`. There is **no vocabulary check** and a test asserts an unknown value survives unchanged — inventing a closed list here would re-create R8's `ModalityType` enum, which is the exact coupling **D13** removed.
+- The compiler emits the literal key `x-semantic`; the authored key is `semantic`. A test asserts `"semantic"` is **not** a key of any compiled property (the authored spelling must not leak into the schema) and that `x-semantic` is present.
+- **`semantic:` absent → no `x-semantic` key at all.** Not `None`, not `""`.
+- **A non-string `semantic` value → `TSWAP-S102`? No — `TSWAP-S103`? No.** It gets its **own** code, **`TSWAP-S104` (ERROR)**: *"input 'path': semantic must be a string, got int"*. Rationale: it is neither a name problem (`S102`) nor a type-vocabulary problem (`S103`), and silently emitting `x-semantic: 5` would put a non-string in a schema that `?format=tools` strips but `/tools` publishes. `S104` is a **new code not in the ledger's S1xx list** — flagged as **A21**, item 16.
+
+**5. `x-batchable` is never emitted, and `batchable:` is C404's alone**
+
+- **Test target, stated so the red step can copy it:** for every compiled property of every corpus case, `assert "x-batchable" not in prop`, and additionally `assert not any(k.startswith("x-") and k != "x-semantic" for k in prop)` — the stronger form, which is what [`plan/10_TESTING_STRATEGY.md`](plan/10_TESTING_STRATEGY.md:139) actually asks for (*"`x-semantic` is the only `x-*` keyword the compiler emits (`x-batchable` is gone with the per-input flag)"*).
+- **A `batchable` key in an entry is IGNORED by the compiler.** It produces **no** `S1xx` diagnostic, and it is not copied into the property (it is not one of the six recognised entry keys, item 6a). The pure-function contract, decided honestly rather than by symmetry:
+  - [`TSWAP-C404`](src/tool_swap/config/validate.py:1262) is **landed** and scans `tool.inputs` — the *same* carrier list the compiler is handed. Every `batchable:` that reaches the compiler has therefore **already** been reported as an ERROR by the config layer.
+  - Emitting a second code for it would be exactly the defect behaviour 19's item 0 retired `C611` to avoid: *two codes for one mistake*, doubling under behaviour 21's summary line and behaviour 24's `--strict`.
+  - The compiler is nonetheless not *silent by accident*: an ignored unknown entry key is the general rule (item 6a), and `batchable` is simply an instance of it. A test pins the specific case anyway (`compile_inputs([{...,"batchable": True}])` → schema compiles, diagnostics contain no `S1xx` mentioning batchable, `"x-batchable"` absent) so a future refactor cannot quietly start emitting it.
+
+**6. The entry shape, and what happens to a malformed one**
+
+A recognised entry is a mapping whose keys come from: **`name`, `type`, `required`, `description`, `semantic`, `items`**. That set is the one behaviour 13's contract block already named ([plan line 315](plans/m1-configuration.md:315)) and it is closed for *interpretation*, not for *acceptance*:
+
+**6a. Unknown entry keys are ignored, not rejected.** `{"name": "p", "type": "string", "description": "d", "default": 0.5}` compiles to a property with no `default`, and emits nothing. Rationale: the entry blocks live in `tool.yaml`, which the loader deliberately does **not** schema-validate ([`test_include_tool_yaml_unknown_key_loads_with_file_recorded`](tests/unit/config/test_includes.py:543) pins that), so the compiler is not the unknown-key police for a surface nobody else guards either; and `params:` entries legitimately carry `default:` (§5.5.1), so a shared "unknown key" error would need a per-block exception list on day one. **Recorded as a deliberate narrowing, and the one place a `default:` on an `inputs:` entry is silently dropped** — worth a line in behaviour 25's docs.
+
+**6b. Malformed entries, exhaustively:**
+
+| Entry | Outcome | Code |
+|---|---|---|
+| `inputs` is not a list (`"oops"`, `{...}`, `42`) | no schema, one diagnostic naming the actual type | **`TSWAP-S105`** ERROR (new — **A21**) |
+| entry is not a mapping (`"paths"`, `None`, `[]`) | that entry is skipped; the others still compile | **`TSWAP-S105`** ERROR, naming `inputs[<i>]` |
+| `name` missing, or not a non-empty string | entry skipped | **`TSWAP-S106`** ERROR (new — **A21**), *"inputs[0]: every entry needs a non-empty string 'name'"* |
+| `type` missing | entry skipped | **`TSWAP-S103`** ERROR — the same code as a *wrong* type, whose message already lists the six; a missing type and a bogus type are the same question (*"which of the six is it?"*) with the same answer |
+| `type` present but not a string | entry skipped | **`TSWAP-S103`** ERROR |
+| `type` outside the six | entry skipped | **`TSWAP-S103`** ERROR (item 11) |
+| `description` missing/blank | **property still skipped** for inputs (item 8) | **`TSWAP-S120`** |
+| `required` present but not a bool | property emitted; the name is **not** added to `required` | **`TSWAP-S107`** ERROR (new — **A21**) |
+
+*Skipped* means: the entry contributes **no** property, and (for inputs) no `required` member. Because any ERROR forces the schema half to `None` (item 3), a skipped entry can never produce a quietly-incomplete published schema.
+
+`S105`/`S106`/`S107` are three codes the ledger's S1xx list does not contain. They exist because item 3's totality guarantee has to land *somewhere*: without them the compiler would either raise (rejected) or silently drop malformed entries (worse — the author gets a schema missing an input with no explanation). See **A21**, item 16. The alternative of folding all three into one `TSWAP-S105` "malformed entry" code was considered and rejected: the three messages have three different remedies, and behaviour 25's troubleshooting table maps code→cause→fix one-to-one.
+
+**7. The pass-through, the dispatcher, and `S130`**
+
+**`compile_tool_schema(...)` is the single entry point behaviour 21 calls.** It returns a small frozen carrier:
+
+```python
+@dataclass(frozen=True)
+class CompiledSchemas:
+    """The compiled input/output schemas for one tool, plus every diagnostic."""
+
+    inputs: dict[str, Any] | None
+    outputs: dict[str, Any] | None
+    diagnostics: tuple[SchemaDiagnostic, ...]
+```
+
+- **The caller does NOT dispatch.** Behaviour 21 hands over `tool.inputs`, `tool.outputs`, `tool.params`, `tool.json_schema` from the carrier fields and receives one `CompiledSchemas` per tool. Putting the `json_schema`-vs-`inputs` decision in the CLI would duplicate it in M3's `/tools` and in M5's preflight, and `S130` would then have to be detected in each of them.
+- **Dispatch rule inside `compile_tool_schema`:**
+  1. `json_schema` is not `None` **and** `inputs` is not `None` → **`TSWAP-S130`** ERROR naming both keys; `inputs=None` is returned (no schema at all — the author must choose).
+  2. `json_schema` is not `None` (and `inputs` is `None`) → the pass-through becomes the **input** schema. `outputs` is compiled normally in the same call; `json_schema:` describes per-request **inputs** only ([`plan/02`](plan/02_CONFIGURATION.md:231) §4's comment says so explicitly).
+  3. otherwise → `compile_inputs(inputs)`.
+  4. `outputs` always goes through `compile_outputs`, independent of the branch above. `params` is read **only** for the `S101` collision check (item 10) and produces no schema — §5.5.1: static params are *"NOT part of the agent-visible tool definition"*.
+- **The pass-through returns a `copy.deepcopy` of the block, not the same object.** *"Untouched"* is about **content**, not identity. Aliasing would let a downstream projection (`?format=tools` strips `x-*` in M9) mutate the `ResolvedTool` carrier in place, and `ResolvedTool` is frozen precisely to prevent that class of bug; the resolver itself already deep-copies on entry ([`_tool_yaml_carrier_dict`](src/tool_swap/config/resolver.py:398)) for the same reason. `copy.deepcopy` **preserves dict insertion order**, so the byte-for-byte/key-order assertion holds. The test pins both halves: `compiled == raw` (deep equality), `list(compiled) == list(raw)` recursively (key order), and `compiled is not raw` (no aliasing) plus `compiled["properties"] is not raw["properties"]` (deep, not shallow).
+- **Nothing is injected into a passed-through block**: no `$schema`, no `additionalProperties`, no `type`. A test asserts a `json_schema:` **without** `additionalProperties` comes back without it — the one documented exception to corpus 9, already recorded in the corpus table ([line 1950](plans/m1-configuration.md:1950)).
+- **`TSWAP-S130`'s message names both keys and the file they live in:** *"'json_schema:' and 'inputs:' are alternatives; this tool declares both. Use `inputs:` for the simple form, or `json_schema:` for enums, ranges, nested objects and oneOf — not both."* Remedy: *"remove one of them from the tool's tool.yaml"*.
+
+**8. `compile_outputs` — same shape minus `required`, and `S120` is a WARNING there**
+
+- **No `required` key is ever emitted for outputs**, not even when an output entry writes `required: true`. Pinned as an assertion (`assert "required" not in schema`) on every output corpus case, including one whose entry carries `required: true` — the key is **ignored** (item 6a's unknown-key rule; `required` is meaningful only on the input side). Rationale: `required` on an output schema would assert something about the handler's return value that nothing in v1 checks, and §8.4's projection consumes only the input schema.
+- **`additionalProperties: false` IS emitted for outputs**, same as inputs. §8.5 states the rule without restricting it to inputs, and an output schema that permits arbitrary extra keys documents nothing.
+- **A missing/blank description on an OUTPUT: the property IS emitted, without a `description` key, and `S120` is a WARNING.** This is the one place inputs and outputs diverge, and the divergence is deliberate:
+  - Behaviour 13 already pins the severity split: [`C301`](src/tool_swap/config/validate.py:975) (inputs) is ERROR, [`C302`](src/tool_swap/config/validate.py:985) is **WARNING** — *"outputs are advisory, unlike inputs and params"*, in the shipped docstring.
+  - Corpus 12's *"asserted to agree"* is an **input-side** claim (the corpus row reads *"Missing `description` fails validation — 13 (config) + 20 (`S120`, compiler)"*, and `C301` is the input rule). The agreement test therefore pins: for the same entry list, `C301` fires **iff** input-side `S120` fires. There is no corpus item asking `C302` and output-side `S120` to agree on *severity*, only that neither is silent.
+  - Refusing to emit a description-less **output** property would make a WARNING behave like an ERROR — the schema half would go to `None` under item 3 — and a tool would lose its whole output schema over an advisory omission. That contradicts `C302`'s severity directly.
+  - **So:** input-side `S120` = **ERROR**, property skipped, schema → `None`. Output-side `S120` = **WARNING**, property emitted without `description`, schema still returned. Same code, two severities, chosen because the code names one *finding* (*"a property has no description"*) whose *consequence* differs by block — exactly the `C301`/`C302` split, mirrored. A test pins both halves side by side so the asymmetry is deliberate in the record and not discovered later.
+- A **blank** description (`""`, `"   "`, `"\n"`) counts as missing, reusing behaviour 13's pinned blankness rule ([plan line 373](plans/m1-configuration.md:373)) verbatim. A **non-string** description (`42`) counts as **present** at the config layer (same line) — but the compiler cannot put an int in a `description` keyword and stay meta-schema-valid, so it emits **`TSWAP-S108`** ERROR (new — **A21**) and skips the property, rather than emitting an invalid schema for `validate_against_metaschema` to catch a step later with a worse message.
+
+**9. `validate_against_metaschema(schema) -> list[SchemaDiagnostic]`**
+
+```python
+def validate_against_metaschema(schema: dict[str, Any]) -> list[SchemaDiagnostic]:
+    """Check one schema against the JSON Schema 2020-12 meta-schema."""
+```
+
+- **Returns a list, empty when valid.** Not `bool` (throws away the message §8.5 says is the most actionable thing available), not `(ok, error)` (redundant — `not diagnostics` *is* `ok`), and it does not raise. Same shape as the compiler halves, so behaviour 21 concatenates lists and never branches on return type.
+- **Uses `jsonschema.Draft202012Validator(Draft202012Validator.META_SCHEMA).iter_errors(schema)`, not `check_schema`.** [`check_schema`](.venv/lib/python3.11/site-packages/jsonschema/validators.py:307) raises `SchemaError` on the **first** problem; `iter_errors` yields **all** of them, which is the same one-pass argument as item 3. A raw `json_schema:` block with two independent mistakes must report two `S140`s, not one.
+- **One `TSWAP-S140` ERROR per yielded error.** Each message quotes the validator's own text and its location, taken from the two attributes `jsonschema` provides: [`error.json_path`](.venv/lib/python3.11/site-packages/jsonschema/exceptions.py:153) (the `$.properties.path.type` form) and `error.message`. Shape: *"the schema is not valid JSON Schema 2020-12 at `$.properties.path.type`: 5 is not of type 'string', 'array'"*. `json_path` is preferred over `absolute_path` because it is already a printable string; the test asserts **both** the path fragment and a distinctive substring of the library's message appear, without pinning the library's full wording (which would break on a `jsonschema` upgrade).
+- **WHO emits `S140`:** this pure function *reports* it; **behaviour 21 surfaces** it, exactly as with every other `S1xx`. `compile_tool_schema` does **not** call it internally — the meta-schema check is a separate, explicitly-invoked step, so a caller that only wants a compiled dict does not pay for it, and the corpus-11 test can call it directly on hand-written schemas. Behaviour 21's order is pinned here so 21 has nothing to decide: **compile first, then meta-schema-validate whatever schema halves came back non-`None`** (compiled *and* passed-through, per plan line 1833 — *"including a passed-through `json_schema:`"*). A `None` half is not validated; there is nothing to validate.
+
+**10. `TSWAP-S102` — the non-identifier property name**
+
+- **Check: `str.isidentifier()`**, plus a keyword check (`keyword.iskeyword`), on the entry's `name`.
+- **Unicode is ACCEPTED**, because `str.isidentifier()` accepts it and Python identifiers genuinely are unicode: `def predict(*, café)` is legal Python 3, so `name: café` produces a keyword argument that works. Pinning ASCII would reject a name the handler contract actually supports. A test pins `"café".isidentifier() is True` → no `S102`.
+- **Severity: WARNING, and the property IS emitted.** JSON Schema permits any string key (§8.3's whole premise), so the schema is valid; what breaks is the handler call, since [`plan/03`](plan/03_TOOL_AUTHORING.md:191) §3's `predict(self, **inputs)` receives inputs as **keyword arguments** and `**{"my-input": 1}` cannot bind to a parameter. That is a real defect but not a schema defect, and M5 preflight — which can import the handler — is where it becomes an error. Warning here, error there, is the same escalation `C543` uses for host paths.
+- Message names the offending name and the reason: *"input name 'my-input' is not a valid Python identifier; handlers receive inputs as keyword arguments, so this input can never be passed"*. Remedy: *"rename it to a valid identifier, e.g. 'my_input'"*.
+- A **Python keyword** (`class`, `return`, `lambda`) passes `isidentifier()` but can never be a keyword argument either, so it warns under the same code — the identical sharpening **A16** applied to `handler:` class names.
+
+**11. `TSWAP-S103` — the six types**
+
+- The six, exactly and in this order (the order [`plan/02`](plan/02_CONFIGURATION.md:210) §4's comment writes them): **`string`, `number`, `integer`, `boolean`, `array`, `object`**. Pinned as `SUPPORTED_TYPES` so the test imports the tuple rather than re-typing it.
+- Message lists all six **and points at the escape hatch**, in that direction: *"input 'threshold': type 'enum' is not supported; the simple form accepts string, number, integer, boolean, array, object. For enums, ranges, oneOf or nested objects use the raw `json_schema:` block."* The direction matters — the author who wrote `type: enum` wants the richer form, and §8.4 frames `json_schema:` as exactly that escape hatch. Remedy: *"use one of the six types, or move this tool to a `json_schema:` block"*.
+- `null` is **not** among the six and is not special-cased: `type: null` is an `S103`. Optionality is expressed by omitting the name from `required`, which is what `required: false` already does.
+
+**12. `array` and `items`**
+
+- **`type: array` REQUIRES `items:`.** Missing → **`TSWAP-S109`** ERROR (new — **A21**), entry skipped: *"input 'tags': type 'array' requires an 'items:' declaring the element type"*. It is **not** folded into `S103` (the type *is* one of the six — the message would then list six types at an author who picked a correct one) and not into `S110` (which is specifically about nesting depth). Emitting a bare `{"type": "array"}` instead was rejected: it is meta-schema-valid but describes nothing, and §8.5's *"emitting an invalid schema is worse than emitting none"* argument extends to a vacuous one.
+- **Authored form: `items: number`** — a bare type name, as [`plan/02`](plan/02_CONFIGURATION.md:217) §4 writes it — compiles to `items: {"type": "number"}`. **Also accepted: `items: {type: number}`**, the mapping form, compiling to the same thing; §4 uses the bare form and §4's `json_schema:` comment uses the mapping form, so both spellings appear in the spec and rejecting either would be arbitrary.
+- **The element type must itself be one of the six** → otherwise `TSWAP-S103`, message naming the *element* (*"input 'tags': items type 'enum' is not supported…"*).
+- **Nesting beyond one level → `TSWAP-S110`** ERROR, entry skipped: an `items` mapping that itself carries an `items` key (`items: {type: array, items: number}`), or an `items` mapping whose `type` is `object` with nested `properties`. Message directs to the escape hatch: *"input 'matrix': nested arrays are not supported by the simple `inputs:` form; use a raw `json_schema:` block"*.
+- **`items` on a NON-array type is ignored**, per item 6a's unknown-key rule (`{"type": "string", "items": "number"}` compiles to `{"type": "string", ...}` with no `items`). Pinned by a test so the ignore is deliberate.
+
+**13. Empty and absent**
+
+- **`inputs: []` → a valid schema with `properties: {}`** — the key is **present and empty**, not omitted. Both are meta-schema-valid; `properties: {}` is chosen because item 2 pins a fixed five-key order and a conditionally-absent key would make the compiled shape vary by content, which is exactly what the key-order pin exists to prevent. It also lets every consumer write `schema["properties"]` without a `.get`. `required` is **omitted** (it would be empty) and `additionalProperties: False` is present — a no-argument tool is legal and its schema says *"this tool takes an object with no properties, and rejects any you send"*, which is precisely true.
+- **`inputs: None` (absent) → `(None, [])`.** No schema, no diagnostics. The tool is schema-less, which §4 permits ("Optional but STRONGLY recommended") and `/tools` will report in M3.
+- **A test pins the three-way distinction explicitly:** `compile_inputs(None)[0] is None`, `compile_inputs([])[0] == {"$schema": ..., "type": "object", "properties": {}, "additionalProperties": False}`, and `compile_inputs(None)[0] != compile_inputs([])[0]` — the *"`None` ≠ `{}`"* pin of plan line 1836, made concrete. Note `None ≠ {}` is trivially true in Python; the assertion that carries meaning is that the **empty-list** case produces a **populated** schema dict, never `{}` and never `None`.
+
+**14. The diagnostic carrier — `SchemaDiagnostic`, its own type, and why**
+
+```python
+class SchemaSeverity(Enum):
+    ERROR = "error"
+    WARNING = "warning"
+
+@dataclass(frozen=True)
+class SchemaDiagnostic:
+    """One problem found while compiling or meta-validating a schema."""
+
+    code: str
+    severity: SchemaSeverity
+    message: str
+    remedy: str
+    entry_index: int | None = None   # 0-based index in the authored block
+    block: str | None = None         # "inputs" / "outputs" / "json_schema"
+```
+
+**Decision: the schema package defines its OWN diagnostic type, and behaviour 21 converts.** The importlinter citation, read honestly:
+
+- [`.importlinter`](.importlinter:1) as shipped contains **two contracts, both `forbidden`, both about `tool_swap` ↔ `tool_swap_runtime`**. There is **no** contract today constraining `tool_swap.schema` → `tool_swap.config`, so importing `config.errors` from `compile.py` would **not** fail `lint-imports` as the repo stands. That is the honest reading and it is stated first.
+- **But behaviour 26 is already committed to adding one**, and it already pins the direction: plan line 1929 reads *"`schema` may import `config.errors` but **not** `config.schema`"*, and line 2018 lists the new contract as *"`config`/`schema` are leaves"*. So `config.errors` is *permitted* by the contract behaviour 26 will write.
+- **The decision is nonetheless to define `SchemaDiagnostic` separately**, for reasons that are about the code rather than the linter:
+  1. [`Diagnostic`](src/tool_swap/config/errors.py:59) requires a `Location` with a mandatory `file: str`. **The compiler does not know the file.** It is handed a list, not a path; `ResolvedTool` carries no `tool.yaml` path (behaviour 13's block records that deferral explicitly at [line 406](plans/m1-configuration.md:406)); and `ValidatedConfig.path` is the *root* config, not the `tool.yaml` where `inputs:` actually lives. Constructing a `Location(file=...)` inside the compiler would mean inventing a filename, which is the exact defect `C503` is already recorded as carrying ([line 2145](plans/m1-configuration.md:2145)) and which behaviour 17 was told not to repeat.
+  2. `entry_index` + `block` are what the compiler *does* know, and they are precisely what behaviour 21 needs to build a `yaml_path` of the shipped dotted-numeric form — `tools.<key>.inputs.<i>` — matching behaviour 13's table ([line 388](plans/m1-configuration.md:388)). Converting *up* (compiler facts → located `Diagnostic`) is easy; converting *down* is impossible.
+  3. It keeps the compiler usable by the two callers M1 does not build: M5 preflight and the runtime's own schema module (plan line 1929's stated reason for the boundary).
+- **`SchemaDiagnostic.code` reuses the shipped `TSWAP-[CS]\d{3}` regex** so the S-codes are valid `Diagnostic` codes on conversion, and `remedy` is mandatory and non-empty for the same reason `Diagnostic`'s is. **The conversion function is behaviour 21's**, named here so it is not re-invented: `to_diagnostic(sd, *, file, yaml_path, line) -> Diagnostic`, living in `cli/validate.py` alongside the tool loop that knows those three values.
+- **`SchemaSeverity` is a separate enum, not `config.errors.Severity`**, for the same decoupling reason; behaviour 21's conversion maps them one-to-one. This is one enum of two members and the duplication is accepted deliberately.
+
+**15. Where the constants live, and the S1xx table**
+
+**Module-level constants in `compile.py`**, following [`validate.py`](src/tool_swap/config/validate.py:975)'s `TSWAP_C301_RULE` precedent. The tests import them; a bare string literal in both the source and the test is how a typo'd code ships. Names are the code with underscores:
+
+```python
+TSWAP_S100: Final[str] = "TSWAP-S100"
+```
+
+| Code | Severity | Fires when | Effect on the schema half |
+|---|---|---|---|
+| `S100` | ERROR | two entries share a `name` | both skipped → `None` |
+| `S101` | ERROR | a name appears in both `inputs:` and `params:` (§6 rule 1d) | schema → `None` |
+| `S102` | **WARNING** | `name` is not a Python identifier, or is a keyword | property **emitted** |
+| `S103` | ERROR | `type` missing, non-string, or outside the six (also for an `items` element type) | entry skipped → `None` |
+| `S104` | ERROR | `semantic` present but not a string | entry skipped → `None` |
+| `S105` | ERROR | the block is not a list, or an entry is not a mapping | entry skipped → `None` |
+| `S106` | ERROR | `name` missing or not a non-empty string | entry skipped → `None` |
+| `S107` | ERROR | `required` present but not a bool | property emitted, name not in `required` → `None` |
+| `S108` | ERROR | `description` present but not a string | entry skipped → `None` |
+| `S109` | ERROR | `type: array` with no `items` | entry skipped → `None` |
+| `S110` | ERROR | `items` nested beyond one level | entry skipped → `None` |
+| `S120` | ERROR *(inputs)* / **WARNING** *(outputs)* | `description` missing or blank | inputs: entry skipped → `None`. outputs: property emitted without `description` |
+| `S130` | ERROR | `json_schema:` and `inputs:` both present | inputs half → `None` |
+| `S140` | ERROR | the schema fails the 2020-12 meta-schema | n/a (reported by `validate_against_metaschema`) |
+
+`S101`'s message states the deciding question from §5.5.1 verbatim, as plan line 1838 requires: *"…does this value change what the batched forward pass computes? If yes it is an input; if no it is a param."*
+
+`S101` is the one check that needs `params`, which is why it lives in `compile_tool_schema` (which has both lists) rather than in `compile_inputs` (which has one). `compile_inputs` called alone therefore **cannot** emit `S101` — pinned, so a test does not go looking for it there.
+
+**16. Shipped-test survey, the red step, and assumption A21**
+
+**Nothing shipped breaks. Two files must be touched by the RED step, and neither is a behavioural change:**
+
+1. **[`tests/unit/test_repo_layout.py`](tests/unit/test_repo_layout.py:50) — `TEST_DIRS` must gain `tests/unit/schema`.** The plan already warned of this at [line 2060](plans/m1-configuration.md:2060); it is now checked and confirmed. The list does **not** currently contain `tests/unit/schema`, so as things stand nothing fails — the directory simply is not asserted to exist. Adding the entry is a **one-line test-data change in the red step**, and it makes `test_test_directory_exists` and `test_test_directory_no_init` cover the new directory. Note the second of those: **`tests/unit/schema/` must NOT get an `__init__.py`** (every leaf test dir is asserted to lack one), and it needs no `.gitkeep` either, since it lands with three real test modules in the same commit.
+2. **Nothing else.** Verified individually:
+   - **[`test_dependencies.py`](tests/unit/config/test_dependencies.py:41)** — `jsonschema` is already in both dependency lists and already asserted importable. Behaviour 20 adds no dependency and changes no manifest. **Safe.**
+   - **[`test_no_import_error_shims_in_src`](tests/unit/config/test_dependencies.py:241)** — bans `except ImportError` anywhere in `src/`. `compile.py` must therefore import `jsonschema` **unconditionally** at module top level, with no availability guard. **Constraint on the green step, not a break.**
+   - **[`test_src_tool_swap_package_docstring`](tests/unit/test_repo_layout.py:109)** — [`src/tool_swap/schema/__init__.py`](src/tool_swap/schema/__init__.py:1) already exists with a 79-character docstring and already passes. Line 1999's *"gains re-exports + docstring"* is satisfied for the docstring half; **adding re-exports is optional** and, if done, must keep the docstring. **Safe.**
+   - **[`test_imports.py`](tests/unit/test_imports.py:303)** — runs `lint-imports` on the real repo. `compile.py` importing `jsonschema` (a third party) and `dataclasses`/`copy`/`keyword` (stdlib) violates neither shipped contract, and it imports **no** `tool_swap.config` module under item 14's decision. **Safe, and item 14 keeps it safe under behaviour 26's future contract too.**
+   - **[`test_validate_descriptions.py`](tests/unit/config/test_validate_descriptions.py:460)'s `C301` suite** — behaviour 20 adds no rule, registers nothing, and does not import `validate.py`. Corpus 12's agreement test is **new**, lives in `tests/unit/schema/test_compile.py`, and *reads* `TSWAP_C301_RULE` rather than modifying it. **Safe.**
+   - **`filterwarnings = ["error"]`** ([`pyproject.toml`](pyproject.toml:73)) — `jsonschema` emits a `DeprecationWarning` from [`validator_for`](.venv/lib/python3.11/site-packages/jsonschema/validators.py:1401) when a schema carries a `$schema` the library does not know. Our compiled output always carries the **known** 2020-12 URI, and `validate_against_metaschema` constructs `Draft202012Validator` **explicitly** rather than going through `jsonschema.validate`/`validator_for`, so that path is never taken. A **passed-through `json_schema:` block with an unknown `$schema` is the risk case**, and constructing the validator explicitly is precisely what avoids it. Pinned as a test: a raw block with `$schema: "http://example.invalid/schema"` produces `S140`s (or none) and **no warning**. This is the same discipline **A7** applied when it banned `warnings.warn`.
+
+**The RED step, concretely:** create `tests/unit/schema/` with the three modules, add `"tests/unit/schema"` to `TEST_DIRS`, and write the tests against the API above. `compile.py` does not exist yet, so every test in the three new files fails at import — the correct red. `test_repo_layout.py`'s two new parametrised cases pass immediately (the directory exists once the test files are written), which is expected: that entry is bookkeeping, not the behaviour under test.
+
+**A21 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 20's ledger lists **eight** S1xx codes (`S100`, `S101`, `S102`, `S103`, `S110`, `S120`, `S130`, `S140`). This block adds **six** more — `S104` (non-string `semantic`), `S105` (non-list block / non-mapping entry), `S106` (missing or non-string `name`), `S107` (non-bool `required`), `S108` (non-string `description`), `S109` (`array` without `items`) — bringing the compiler to **fourteen** codes.
+
+They are not new *policy*: every one of them is a malformed-entry case the ledger's eight simply do not cover, and the ledger could not have covered them, because the decision that makes them necessary is item 3's — **the compiler is total and never raises**. Given totality, each malformed shape must produce *some* diagnostic; the only alternatives are raising (rejected: behaviour 21 needs one pass) or silently dropping the entry (rejected: the author gets a schema missing an input with no explanation, which is the exact silent-ignore defect [`00_CONTEXT_AND_MOTIVATION.md`](plan/00_CONTEXT_AND_MOTIVATION.md) §2.6 records as an R8 failure). Six codes rather than one catch-all `S105` was chosen because behaviour 25's troubleshooting table maps code → cause → fix one-to-one, and *"malformed entry"* is not a fix.
+
+**Nothing user-visible widens or narrows** in the config-acceptance sense: these blocks are stored as-authored by a `tool.yaml` the loader deliberately does not schema-validate, so today they produce **no** diagnostic at all and the tool silently ends up with a wrong or absent schema. Every one of the six turns silence into a message. **No shipped test asserts the current silence** (verified: no committed test calls a compiler that does not exist, and [`test_validate_descriptions.py`](tests/unit/config/test_validate_descriptions.py:595) pins only that the *description rules* skip malformed entries — which they still will, since `C301` and the compiler are separate layers reading the same list). The consequences to confirm: a `tool.yaml` whose `inputs:` entry is malformed now produces a `TSWAP-S1xx` error from `tswap validate` instead of a silently schema-less tool; and behaviour 25's troubleshooting table must list fourteen S-codes, not eight.
+
+Two further details are pinned by this block rather than by the spec, flagged for the same visibility and **not** taking `A`-numbers because nothing user-visible turns on them: an **unknown key inside an entry is ignored** rather than rejected (item 6a — the notable instance is that a `default:` written on an `inputs:` entry is silently dropped), and **`x-semantic` values are never vocabulary-checked** (item 4 — `semantic: banana` compiles).
 
 ### Behaviour 21 — `tswap validate`
 
@@ -1950,7 +2269,7 @@ The issue's 12-item corpus maps onto the ledger as follows. Every item is covere
 | 9 | `additionalProperties: false` always emitted | **20** | Except in a raw `json_schema:` pass-through, where "untouched" wins |
 | 10 | Raw `json_schema:` passes through | **20** | Deep-equality assertion including key order |
 | 11 | Compiled output validates against the meta-schema | **20** | Applied to compiled **and** passed-through schemas |
-| 12 | Missing `description` fails validation | **13** (config) + **20** (`S120`, compiler) | Both paths, asserted to agree |
+| 12 | Missing `description` fails validation | **13** (config) + **20** (`S120`, compiler) | Both paths, asserted to agree **on the input side** (`C301` ERROR ⇔ input-side `S120` ERROR). On the output side both fire but as WARNINGs, and `S120` still emits the property — behaviour 20's contract block, item 8 |
 
 ### §6 rule → behaviour map (corpus item 6, exhaustive)
 
@@ -2047,7 +2366,8 @@ tests/unit/config/
 ├── test_validate_names_groups.py      [B12]   (committed — one test superseded by B12a)
 └── test_validate_descriptions.py      [B13]
 
-tests/unit/schema/                     (new directory — needs a .gitkeep-free real module)
+tests/unit/schema/                     (new directory — no __init__.py, no .gitkeep;
+│                                       lands with three real modules in one commit)
 ├── test_compile.py                    [B20]
 ├── test_compile_snapshots.py          [B20]
 └── test_metaschema.py                 [B20]
@@ -2057,7 +2377,7 @@ tests/unit/cli/
 └── test_config_show_cli.py            [B22]
 ```
 
-Note: [`tests/unit/test_repo_layout.py`](tests/unit/test_repo_layout.py:50) enumerates the expected test directories and asserts the leaf test dirs have **no** `__init__.py`. Adding `tests/unit/schema/` may require updating that list — check it in behaviour 20 rather than discovering it as a surprise failure.
+Note: [`tests/unit/test_repo_layout.py`](tests/unit/test_repo_layout.py:50) enumerates the expected test directories and asserts the leaf test dirs have **no** `__init__.py`. **Checked 2026-08-19 (behaviour 20's contract block, item 16): `TEST_DIRS` does not list `tests/unit/schema`, so nothing fails today; behaviour 20's RED step adds the one-line entry**, which then asserts the directory exists and carries no `__init__.py`. No other shipped test is affected.
 
 ---
 
@@ -2160,6 +2480,8 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 
 **Behaviour 19 therefore ships three rules, not four, and `BUILTIN_RULES` reaches 41 rather than 42.** This is the same class of decision as **A1**, which declined a DoD clause on ADR grounds and took an `A`-number for it; here the specification the DoD points at wins over the DoD's paraphrase of it. **A2 is not involved** — behaviour 19's bullets previously cited it twice for this phrasing, and both citations were wrong (A2 is about corpus item 6's coverage claim and the two ADR-withdrawn rules 1b and 4b); the mis-citations are struck in place and A2 itself is unchanged. **No shipped test is affected**: `C611` was never implemented, `C223` is not touched, and no committed test asserts anything about same-device groups. The user-visible consequences to confirm: a `tools.yaml` whose `gpu0` group holds four tools on `devices: [0]` produces **no** warning; an orphan group produces **one** warning (`TSWAP-C223`), not two; and no diagnostic will ever carry the code `TSWAP-C611`.
 
+**A21 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 20's contract block adds **six** `TSWAP-S1xx` codes to the eight the ledger lists, for fourteen in total. The full argument is in that block, item 16; in summary: the compiler is pinned **total and never-raising** (so behaviour 21 can report every config *and* schema problem in one pass), and totality means every malformed `inputs:`/`outputs:` entry must produce *some* diagnostic. The ledger's eight cover the well-formed-but-wrong cases (duplicate names, bad types, nesting, missing descriptions); the six new ones cover the malformed-shape cases (`S104`–`S109`), which today produce **no** diagnostic at all because `tool.yaml` is deliberately not schema-validated by the loader. Every one turns silence into a message, so nothing that validates today stops validating. Six codes rather than one catch-all were chosen because behaviour 25's troubleshooting table is code → cause → fix, one-to-one. The user-visible consequences to confirm: a malformed `inputs:` entry now yields a `TSWAP-S1xx` error rather than a silently schema-less tool, and the troubleshooting table lists fourteen S-codes.
+
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
 - The synthesised `default` group carries `eviction: "lru"` as well as `max_resident: 4`. Plan line 219 mentions only `max_resident: 4`; the value matches [`GroupConfig`](src/tool_swap/config/schema.py:120)'s defaults and `plan/02_CONFIGURATION.md`'s `groups:` example, so it is consistent rather than invented.
@@ -2180,6 +2502,7 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A11** | Where group-supplied `devices` sit in precedence | §4.1 lists four levels and does not place the group. Assumed **between `defaults:` and built-in** | 10 |
 | **A12** | Secret redaction in `config show` | Not in the spec. Proposed: redact `auth_token` and `env` keys matching `TOKEN\|SECRET\|KEY\|PASSWORD`, with `--show-secrets` to opt out, because this output is what users paste into issues | 22 |
 | **A20** | The DoD's D9 line: *"no members or all members share the same device"* | **Narrowed to the §6 rules it points at.** *No members* → the already-shipped `C223`, so **`C611` is withdrawn and never allocated**; *all members on one device* → **no diagnostic** (it is the documented intent of `groups:`), with the device dimension covered by `C612`'s two-or-more-groups overlap; D9 proper → `C610`. Behaviour 19 ships **three** rules, total **41** | 19; DoD |
+| **A21** | Behaviour 20's ledger lists **eight** S1xx codes | **Six more are added** (`S104` non-string `semantic`, `S105` non-list block / non-mapping entry, `S106` bad `name`, `S107` non-bool `required`, `S108` non-string `description`, `S109` `array` without `items`), for **fourteen**. They are the consequence of the compiler being **total and never raising**: each malformed entry must yield a message rather than silence. Turns silence into a diagnostic; narrows nothing | 20, 25 |
 
 ### Scope boundaries recorded deliberately
 
