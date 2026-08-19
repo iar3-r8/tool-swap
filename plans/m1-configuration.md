@@ -1552,11 +1552,270 @@ Every `C60x` rule reads only `config.tools[<key>].values[...]`, `config.tools[<k
 - **Inputs:** groups configured to starve.
 - **Expected outputs / error behaviour:**
   - `TSWAP-C610` — **every** member of a group is `keep_warm` while `max_resident < member count` → **WARNING** (D9). The message names the group, the member count, `max_resident`, and both remedies: raise `max_resident` to the member count, or set `eviction: none` if pinning was the intent. It must explain the mechanism — *"`keep_warm` exempts a tool from TTL but not from eviction, so this group can never satisfy all its members"* — because the symptom (tools restarting forever) does not point at the cause.
-  - `TSWAP-C611` — a group with **no members** → warning naming the group (the issue's DoD phrases D9 as covering both no-members and all-same-device; see assumption **A2**).
+  - ~~`TSWAP-C611` — a group with **no members** → warning naming the group.~~ **WITHDRAWN before implementation (2026-08-19); the code is never allocated.** Its predicate is already shipped as behaviour 12's `TSWAP-C223`. *(The original bullet cited **A2**; that citation was wrong — the source of the no-members/all-same-device phrasing is the issue's own DoD line, and the resolution is **A20**. See the contract block, items 0 and 6.)*
   - `TSWAP-C612` — total `max_resident` across groups sharing a device exceeds... nothing checkable in v1, so this is a **warning** only, per §6 rule 12's *"only a warning — we do not model VRAM in v1"*: it fires when two or more groups declare overlapping `devices` and their combined `max_resident` exceeds the larger group's, naming the shared device index.
   - `TSWAP-C613` — a group with `max_resident` greater than its member count → warning (harmless, but usually a stale config).
-- **Edge cases:** a **partially** keep-warm group does not warn under C610 (the spec says *every* member); a single-member group with `max_resident: 1` and `keep_warm` does not warn; a group whose members are all on the same device is only interesting if that means starvation, so its severity and phrasing follow the A2 resolution.
+- **Edge cases:** a **partially** keep-warm group does not warn under C610 (the spec says *every* member); a single-member group with `max_resident: 1` and `keep_warm` does not warn; a group whose members are all on the same device **fires no code at any severity** — that is the documented intent of `groups:`, and the device dimension is covered by C612's two-or-more-groups reading (resolved under **A20**, not A2 as this bullet previously said).
 - **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_groups_starvation.py`.
+
+#### Confirmed contract details (2026-08-19)
+
+**Three** rules, not four, and the **first rule group in M1 whose subject is a group rather than a tool**. Behaviour 16 pinned how a rule reads a root block; behaviour 17 pinned how a rule reaches the disk; behaviour 18 pinned how a rule reads the origin map; this block pins **how a rule sees a group together with all of its members**, which is the one thing none of the preceding thirty-eight rules needed. **No preparatory sub-step is required** (item 10 verified behaviour 18's append test is index-anchored, discharging the instruction at plan line 1850). **Behaviour 19 is a PURE-RULE behaviour**: it touches `validate.py` and its own test file and nothing else — no schema field, no resolver change, no `ValidatedConfig` field, no `BUILT_IN_DEFAULTS` key. It is the first behaviour since 13 for which that is true, and it is why item 12 records no accept/reject boundary move.
+
+The headline correction, stated first because the deliverable count depends on it: **`TSWAP-C611` is withdrawn and its code is never allocated.** Its predicate — *a group with no members* — is **already shipped** as behaviour 12's [`TSWAP-C223`](src/tool_swap/config/validate.py:638).
+
+**0. `TSWAP-C611` is a duplicate of the shipped `TSWAP-C223`, and is retired**
+
+[`_C223Rule`](src/tool_swap/config/validate.py:638) fires on *"a group defined but referenced by no tool"*, where a tool "references" a group when its resolved `group` equals the group name. A group with **no members** is precisely a group no tool references: the two predicates are the same predicate written twice. Shipping `C611` would emit **two WARNINGs with two codes for one mistake**, in a milestone whose stated purpose is diagnostics a stranger can act on, and would double-report under behaviour 21's summary line and behaviour 24's `--strict`.
+
+`C223` is additionally the *better* of the two, so there is nothing to salvage: it carries a suppression clause `C611` was never specified to have — when **no** defined group is referenced at all, it stays silent, because a hand-written `groups:` block that omits `default` is a `C220` typo cascade rather than five orphans. A `C611` without that clause would be a regression on a config `C223` already handles well.
+
+- **`TSWAP-C611` is never allocated**, so the code is not reused later and behaviour 25's troubleshooting table must not list it. The gap between `C610` and `C612` is deliberate and is recorded here so nobody "tidies" the numbering.
+- **Nothing user-visible changes.** An orphan group warns before and after, at the same severity (`WARNING`), the same location (`groups`), naming the same group. Only a code number that was never emitted disappears. This is therefore a **plan correction**, on the `max_batch_bytes` precedent, and needs no `A`-number of its own — but see item 6, where the *reason* `C611` was written into the ledger does need one.
+- **Behaviour 19's `C611` bullet above is superseded by this item.** Its cross-reference to **A2** is a mis-citation (item 6).
+
+**1. Data access — `group_members(config)`, the load-bearing decision**
+
+The three rules are cross-tool and cross-group: each must see a group *and* every member's resolved values. Pinned as a **public module-level helper in `validate.py`**, the option (b) of the three considered:
+
+```python
+def group_members(config: ValidatedConfig) -> dict[str, list[ResolvedTool]]:
+    """Every effective group mapped to its member tools (behaviour 19)."""
+```
+
+- **Key set** = exactly `effective_groups(config.raw).keys()`, in that mapping's iteration order. A group with no members maps to `[]`.
+- **Members** = the tools of `config.tools` whose [`_effective_group`](src/tool_swap/config/validate.py:383) equals the key, in `config.tools` iteration order (config-declaration order).
+- **Excluded from every group**, and this is pinned rather than incidental: a tool whose `group` value is not a string (`_effective_group` returns `None` — a schema-level problem `TSWAP-C105` owns) and a tool naming a group absent from the block (a dangling reference [`TSWAP-C220`](src/tool_swap/config/validate.py:505) owns). Neither becomes a member of anything, and neither inflates or deflates another group's count.
+- **Pure.** No filesystem, no environment, no clock, no mutation of `config` or of anything reachable from it; `effective_groups` already deep-copies.
+
+**Where each datum actually lives, pinned against the shipped code so the RED step needs no guessing:**
+
+| Datum | Where it lives | How a rule reads it |
+|---|---|---|
+| *which group is tool X in* | `tool.values["group"]` — a resolvable field with the built-in default `"default"` ([`defaults.py`](src/tool_swap/config/defaults.py:31)), so it is **always** present | [`_effective_group(tool)`](src/tool_swap/config/validate.py:383) (shipped, private, unchanged) |
+| *a group's members* | nowhere — it is derived | `group_members(config)[name]` |
+| `max_resident` | the **raw** `groups:` block only | `_group_max_resident(block)` (item 2) |
+| `eviction` | the **raw** `groups:` block only | not read by any B19 rule; it appears in `C610`'s remedy as prose |
+| a group's `devices` | the **raw** `groups:` block **and**, separately, each member's `values["devices"]` | `C612` reads the **raw block**, never member values (item 4) |
+
+**Why `max_resident` and `eviction` are raw-only, verified in the shipped resolver:** [`_group_layer`](src/tool_swap/config/resolver.py:436) keeps a group key only `if key in BUILT_IN_DEFAULTS`. `max_resident` and `eviction` are in **no** `BUILT_IN_DEFAULTS` slot — they are group-level, not tool-level — so they are dropped without a diagnostic and **never reach any `ResolvedTool.values`**. `devices` **is** a tool field, so it alone flows both ways, which is exactly the trap item 4 addresses. There is no route to a group's capacity other than `config.raw`.
+
+**Why a module helper and not the alternatives:**
+
+- **(a) each rule groups `config.tools` itself** is rejected: three rules re-deriving "who is a member" is the drift [`_parse_handler`](src/tool_swap/config/validate.py:1377) and [`effective_port_range`](src/tool_swap/config/validate.py:357) exist to prevent. `C610` and `C613` compare against **the same count** and must not be able to disagree about it.
+- **(c) a carrier on `ResolvedTool`** is rejected on modelling grounds: membership is a property of the *set* of tools, and [`resolve_tool`](src/tool_swap/config/resolver.py:157) sees one tool at a time and could not compute it.
+- **A `ValidatedConfig` field is rejected**, following behaviour 18: the value is derivable from `raw` and `tools`, both already carried, so a field would be cached state with an invalidation question and would break [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) for nothing.
+- **The signature takes the whole `ValidatedConfig`, unlike `effective_groups(raw)`.** The asymmetry is deliberate and worth one line: `effective_groups` is a function of `raw` alone, while membership needs `raw` **and** `tools`. Passing both separately would let a caller pair one config's groups with another's tools.
+- **Public, and unit-tested directly**, on the `effective_groups` precedent ([`test_effective_groups_synthesises_default_when_groups_key_absent`](tests/unit/config/test_validate_names_groups.py:252)). The membership rules above are worth their own tests independent of the three rules that consume them.
+
+**2. `_group_max_resident` — the shared capacity reader, and the default**
+
+Private helper, used by all three rules so they cannot disagree:
+
+```python
+def _group_max_resident(block: object) -> int | None:
+    """A group's effective max_resident, or None when it must be skipped."""
+```
+
+- **Absent key → the schema default, `4`**, read as `int(GroupConfig.model_fields["max_resident"].default)` — *never* a literal — exactly as [`_SYNTHESISED_DEFAULT_GROUP`](src/tool_swap/config/validate.py:321) already does, so the two cannot drift. **A group that omits `max_resident` is checked, not skipped**, because Pydantic genuinely applies `4` at runtime: the starvation is real, and `groups: {gpu0: {devices: [0]}}` is the commonest hand-written shape. Skipping it would make the rule silent where it matters most.
+- **`None` (skip the group silently) for:** a non-dict block; a `bool` (`bool`-before-`int`, the shipped `C221`/`C530` pattern); a non-`int`; and any value `< 1`. The last is [`TSWAP-C221`](src/tool_swap/config/validate.py:551)'s error, already reported, and a second warning about a capacity the author must change anyway is noise.
+- **Consequence, stated so no test asserts otherwise:** with every skipped case removed, every `max_resident` a B19 rule sees is an `int >= 1`.
+
+**3. The synthesised `default` group — checked by `C610`, NOT by `C613`**
+
+When `raw` has no `"groups"` key, `effective_groups` synthesises `{"default": {"max_resident": 4, "eviction": "lru"}}`. Whether the rules judge that synthetic group is decided **per rule**, because the two answers are different:
+
+| Rule | Judges the synthesised `default`? | Why |
+|---|---|---|
+| `C610` | **Yes** | Five keep-warm tools against a capacity of four genuinely starve, whoever wrote the four. D9's teeth would be pulled entirely by exempting the commonest config shape, and the remedy is still actionable (*add a `groups:` block raising `default`'s `max_resident`*) |
+| `C612` | Moot — **can never fire** | The synthesised block declares no `devices`, so it cannot participate in an overlap. No special case is written |
+| `C613` | **No** | Excess capacity is *"harmless, but usually a stale config"* — and "stale" is a claim about something **the author wrote**. `4` is *our* number; warning that our default exceeds their one tool is warning about nothing |
+
+`C613`'s exemption is **required, not chosen**: plan line 1632 (behaviour 23) states that *"with `groups:` absent, the synthesised `default` group must not warn"*, and behaviour 23 asserts zero errors **and zero warnings** on the five-line config. Under the unexempted reading, one tool against `max_resident: 4` fires `C613` and behaviour 23 fails on the golden path. **Implemented as: `C613` returns `[]` when `"groups" not in config.raw`** — one guard, checked against `raw` directly rather than by sniffing the synthesised values, so it cannot be confused with a hand-written block that happens to say `4`.
+
+**A hand-written `groups: {default: {max_resident: 4}}` with one tool DOES fire `C613`**, and that is the point of the distinction: the author wrote the `4`.
+
+**4. `TSWAP-C610` — universal keep-warm against insufficient capacity (WARNING)**
+
+Fires for a group when **all four** hold, evaluated in this order:
+
+1. `_group_max_resident(block)` returns an `int` (item 2 — a skipped group is silent);
+2. the group has **at least one** member (`members != []`) — a memberless group is `C223`'s business, and `all()` over an empty list is vacuously `True`, which is exactly the bug this clause prevents;
+3. **every** member resolves `keep_warm` to `True`;
+4. `max_resident < len(members)`.
+
+**"Every member" is pinned as `all(tool.values.get("keep_warm") is True for tool in members)`** — identity against the `True` singleton, the shipped [`_C600Rule`](src/tool_swap/config/validate.py:2828) pattern, never truthiness. The consequences follow directly and are each worth a test:
+
+| Group shape | `C610`? |
+|---|---|
+| 3 members, all `keep_warm: true`, `max_resident: 2` | **fires** |
+| 3 members, two `keep_warm: true`, one with no `keep_warm` anywhere | **no** — the third resolves to the built-in `False`, so the group is only *partially* keep-warm |
+| 3 members, all `keep_warm: true`, `max_resident: 3` | **no** — `3 < 3` is false; the group exactly fits |
+| 1 member, `keep_warm: true`, `max_resident: 1` | **no** — the plan's own edge case, and it falls out of clause 4 with no special case |
+| 0 members | **no** — clause 2; `C223` reports it |
+| 2 members, all `keep_warm: true`, `max_resident: 0` | **no** — `C221` already errors (item 2) |
+
+**A missing member value resolves to the built-in `False` and therefore breaks "every".** This is not a special case in the rule: `keep_warm` is a resolvable field with the built-in default `False`, so `values["keep_warm"]` is *always* present and is `False` for any tool that did not ask for it. **`_effective_group` and `keep_warm` are read layer-blind** — a `defaults: {keep_warm: true}` makes every tool in every group keep-warm, and that config starves exactly as hard as an inline one. No origin is consulted anywhere in behaviour 19, which is why item 1's table has no origin column and why `C610` carries no origin phrase (contrast behaviour 18, whose whole message *is* the origin map): the group's arithmetic is true regardless of who wrote it.
+
+**The message.** Names the group, the member count, and `max_resident`, and **must contain this exact sentence**, pinned verbatim from plan line 1554 and asserted as a substring:
+
+```
+keep_warm exempts a tool from TTL but not from eviction, so this group can never satisfy all its members
+```
+
+The sentence is a **module-level constant** `_C610_MECHANISM: Final[str]`, so the test imports it rather than restating it — the [`_URLS_REASON`](src/tool_swap/config/validate.py:304) / [`_C300_WHY`](src/tool_swap/config/validate.py:745) precedent. Note the deliberate wording change from the spec's own §6 rule 13 (*"the group"*): **"this group"**, because the message names a specific group. The full shape:
+
+```
+C610: Group 'gpu0' has 3 members and every one of them sets keep_warm:
+      true, but max_resident is 2; keep_warm exempts a tool from TTL but
+      not from eviction, so this group can never satisfy all its members
+```
+
+**BOTH remedies, in the `remedy` field, not the message**, following every shipped rule:
+
+```
+Raise the group's max_resident to 3 so every keep-warm member fits, or
+set eviction: none on the group if pinning these tools was the intent.
+```
+
+The member count is interpolated into the remedy, which forces `remedy` to be **per-diagnostic rather than `self.remedy`** — the [`_C220Rule`](src/tool_swap/config/validate.py:505) precedent (it interpolates the nearest-group suggestion). `Rule.remedy` still holds a non-empty generic fallback so the constructor's invariant holds and behaviour 25's table has something to print.
+
+**5. `TSWAP-C612` — overlapping devices with combined capacity above the larger group's (WARNING)**
+
+The **only** rule in behaviour 19 whose subject is a *pair* of groups. Per §6 rule 12 it is warning-only — *"we do not model VRAM in v1"* — and the message must say so, so nobody reads it as an arithmetic guarantee.
+
+**Operands.** A group participates when **both** hold: `_group_max_resident` returns an `int`, **and** its **raw block** declares `devices` as a list of usable device indices. Pinned precisely:
+
+- **`devices` is read from the raw group block, NEVER from member values.** The trap is real and is why this is stated first: group `devices` **do** flow into each member's `values["devices"]` through [`_group_layer`](src/tool_swap/config/resolver.py:436), and a tool may also override them inline. Reading member values would make `C612` fire on *tools* that happen to share a device — a per-tool fact §6 rule 12 does not describe (it says *"across groups sharing a device"*) and one that would double-report against behaviour 16's `C523`. **`C612` is a statement about the `groups:` block alone.**
+- **The index set** is `{i for i in devices if _is_device_index(i)}` — reusing the shipped [`_is_device_index`](src/tool_swap/config/validate.py:1911) (`int`, not `bool`), so a malformed entry is skipped here and reported by [`TSWAP-C520`](src/tool_swap/config/validate.py:1958) where it belongs. A group whose `devices` is absent, not a list, empty, or entirely unusable does not participate.
+- **`GroupConfig.devices` defaults to `None`, not `[]`** ([`schema.py`](src/tool_swap/config/schema.py:139)), and there is no synthesis: a group that omits `devices` simply does not participate. Contrast `max_resident`, which does default. The asymmetry is the schema's, not ours.
+
+**The inequality, pinned exactly.** For **each device index** shared by two or more participating groups, with `S` the set of groups declaring it:
+
+```
+sum(max_resident of g for g in S)  >  max(max_resident of g for g in S)
+```
+
+Strictly greater, **per shared device index**, over the summed total against the **largest single** member of that same set.
+
+| Groups sharing device 0 | Combined | Larger | Fires? |
+|---|---|---|---|
+| A `max_resident: 4`, B `max_resident: 6` | 10 | 6 | **yes** — the plan's worked example |
+| A `4`, B `4` | 8 | 4 | **yes** — the pinned identical-value edge |
+| A `1`, B `1` | 2 | 1 | **yes** |
+| A `1` alone | — | — | no — one group is not an overlap |
+| A `4`, B `6`, C `2` (all on device 0) | 12 | 6 | **yes**, once, naming all three |
+
+**The inequality is satisfied by any two participating groups**, since every `max_resident` is `>= 1` after item 2's filter: `a + b > max(a, b)` whenever both are positive. **This is deliberate and is recorded so nobody reads the comparison as dead code.** It is written as the plan specifies rather than collapsed to *"two or more groups share a device"* for three reasons: the plan states it as an inequality and a contract block pins the plan; it is the honest expression of the *reason* (the device can hold `max(a, b)` under the strictest single group's own rule, and the config permits `a + b`); and it is the clause that keeps working if `max_resident: 0` ever becomes legal. **A test asserts the equivalence explicitly** — that every two-group overlap fires — so the behaviour is pinned rather than accidental.
+
+**One diagnostic per shared device index**, not per pair: three groups on device 0 produce one diagnostic naming all three, and two groups sharing devices 0 **and** 1 produce **two** diagnostics, one per index. Each names its own index, because each is its own contended piece of hardware. Ordering is by ascending device index, then by group name, so output is deterministic (behaviour 21 renders it).
+
+```
+C612: Groups 'gpu0' and 'gpu1' both declare device 0, and their combined
+      max_resident is 10 against the larger group's 6; tool-swap does not
+      model VRAM in v1, so this is not checked further
+```
+
+Remedy: *"Give each group its own device, or lower the groups' max_resident so their combined total fits what device 0 can actually hold; tool-swap cannot verify VRAM capacity in v1."*
+
+**6. `TSWAP-C613` — `max_resident` above the member count (WARNING), and the A2 correction**
+
+Fires when `_group_max_resident` returns an `int`, `raw` **has** a `groups:` key (item 3), and `max_resident > len(members)`. **A memberless group does not fire `C613`** even though `4 > 0`: it is `C223`'s finding, and reporting a stale capacity for a group that has no members is the less useful of the two facts. Members are counted, not de-duplicated — `config.tools` keys are already unique ([`TSWAP-C211`](src/tool_swap/config/validate.py:460) owns duplicates).
+
+**The message direction is "you probably shrank this group and forgot", not "this is wrong":**
+
+```
+C613: Group 'gpu0' has max_resident 4 but only 2 members, so 2 slots can
+      never be used; this is harmless, but usually means the group lost
+      members and max_resident was not updated
+```
+
+Remedy: *"Lower the group's max_resident to 2 to match its members, or add the missing tools to the group if members were removed by mistake; nothing breaks either way."* The closing clause is deliberate: `C613` is the only diagnostic in M1 that reports a config which is **entirely correct**, and under behaviour 21's `--strict` it becomes an error, so the text must make the harmlessness unmissable.
+
+**`C610` and `C613` are mutually exclusive by construction** — one needs `max_resident < count`, the other `max_resident > count`, and `==` fires neither. No suppression logic is needed, and a test pins that no group ever produces both.
+
+**Assumption A2 is NOT the source of behaviour 19's "no members / all same device" phrasing, and the ledger's two cross-references to it are corrected here.**
+
+Read verbatim, **A2** (§5, table row) is: *"'every §6 rule' → Read as every rule not withdrawn by an accepted ADR: **1b** (ADR-0005) and **4b** (ADR-0004) get no test, recorded as deliberate. Affects: 11; corpus 6."* It is about **corpus item 6's coverage claim** and names two withdrawn rules. It says nothing about groups, members or devices, and behaviour 19 is not in its "Affects" column. **A2 was confirmed on 2026-08-17 and stands unchanged; behaviour 19's `C611` bullet and its edge-case bullet simply cite the wrong assumption**, and both citations are struck.
+
+The real source of *"no members or all members share the same device"* is **the issue's own Definition-of-Done line**: *"D9 (group-starvation): warning emitted when a group has no members or all members share the same device."* That line **disagrees with the specification it points at**. `plan/02` §6 rule 13 defines D9 as *"every member of a group is `keep_warm` while `max_resident` is smaller than the member count"* and §6 rule 12 covers the device dimension as *"total `max_resident` across groups sharing a device"*. Neither mentions memberless groups, and **neither makes "all members on the same device" a diagnosis at all** — a group with `devices: [0]` and four members is the *documented, intended* shape (`plan/02` §3's `gpu0` and §7's worked example both ship it, and `plan/02` line 125 comments it as *"only one model on this GPU at a time → true swapping"*). The DoD's second clause, read literally, **warns on the specification's own reference configuration**.
+
+**The pinned resolution, expressed across the three codes:**
+
+| DoD clause | Where it lands | Severity |
+|---|---|---|
+| *"a group has no members"* | **already shipped** as `TSWAP-C223` (item 0). Behaviour 19 adds nothing | WARNING |
+| *"all members share the same device"* | **maps to `C612`, narrowed to its §6 rule 12 meaning**: the interesting case is not one group on one device — that is the design — but **two or more groups** on one device, where nothing bounds the combined residency. A single group whose members all share a device fires **nothing, at any severity** | WARNING when two groups overlap; **silent** otherwise |
+| D9 proper (§6 rule 13) | `TSWAP-C610` | WARNING |
+
+**"A group whose members are all on the same device" therefore fires no code**, and this is the behaviour-19 edge case answered explicitly, discharging the *"its severity and phrasing follow the A2 resolution"* bullet above. The reason in one line: **a group is the mechanism by which tools share a device safely** — that is what `max_resident` is for — so warning about it would warn about the feature working. A test asserts silence on `plan/02` §7's four-tool two-GPU example, which is the shape most likely to attract a well-meaning "improvement" later.
+
+**This narrowing takes a new `A`-number: A20 (item 12)**, because it declines a Definition-of-Done clause as literally written. That is exactly the situation **A1** is in, and A1 took an `A`-number for it.
+
+**7. Locations — group-level, and the `groups.<name>` form**
+
+| Code | `yaml_path` |
+|---|---|
+| `C610` | `groups.<name>.max_resident` |
+| `C612` | `groups` |
+| `C613` | `groups.<name>.max_resident` |
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<the path above>, line=config.line_for(<the same path>))` — behaviour 12's shipped form, built inline exactly as [`_C221Rule`](src/tool_swap/config/validate.py:584) does, and **never** through `_tool_location` (which is a per-tool helper; these are group findings).
+
+- **`C610` and `C613` locate at `groups.<name>.max_resident`, not at `groups.<name>`.** `max_resident` is the number in the message, the number in the first remedy, and the line the author will edit. It is the same reasoning behaviour 18 used to put its cross-field codes at `keep_warm`: locate at the field the reader most likely wrote. It is deliberately **not** located at any member tool's `keep_warm`, even though `C610`'s predicate reads every member: the finding belongs to the group, and picking one of three members would be arbitrary and non-deterministic.
+- **`C610` locates at `max_resident` even when the key is absent** (item 2's default). `line_for` then returns `None` and behaviour 2's `Location` rendering falls back to file plus YAML path — the accepted behaviour behaviour 18 item 7 already pinned (*"a location may point at a line the author did not write"*). The path still names the key to add.
+- **`C612` locates at bare `groups`**, following [`_C223Rule`](src/tool_swap/config/validate.py:679), which is the shipped precedent for *"this finding belongs to no single group"*. Choosing either overlapping group would be arbitrary; the shared device index in the message carries the specificity.
+- **`line_for` needs no change.** All three paths are dict-only — `groups` → `<name>` → `max_resident` — so the list-index limitation behaviour 13 recorded ([`line_for`](src/tool_swap/config/loader.py:494) bails at the first non-dict) never applies. Tests assert `location.line == config.line_for(location.yaml_path)`, never a hardcoded line.
+
+**8. Severities**
+
+`C610` **WARNING**; `C612` **WARNING**; `C613` **WARNING**. `C611` is not allocated (item 0). Every `remedy` is non-empty. **Behaviour 19 is the only rule group in M1 that is entirely warnings**, and correctly so: all three describe configurations the router will happily run. The errors in this space were landed by behaviour 12 — `C220` (undefined group), `C221` (`max_resident < 1`), `C222` (bad eviction) — and behaviour 19 deliberately adds none, per §6 rule 12's *"only a warning — we do not model VRAM in v1"*.
+
+**9. Registration — THREE rules, and the total is 41**
+
+Module-level constants `TSWAP_C610_RULE`, `TSWAP_C612_RULE`, `TSWAP_C613_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, **no import-time self-registration**, appended to `BUILTIN_RULES` in code order after behaviour 18's four — **41 landed rules in total** (6 + 4 + 6 + 7 + 7 + 4 + 4 + 3), **not 42**. The three ids in code order are `TSWAP-C610`, `TSWAP-C612`, `TSWAP-C613`.
+
+Behaviour 19's green step extends **both** constants — the known duplication behaviours 14, 15, 16, 17 and 18 each recorded and each declined to fix:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file).
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file).
+
+Both carry comments reading *"BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER"*. **Behaviour 19 is the last behaviour those comments describe**, and its green step must update the comment text along with the ids, since a stale instruction pointing at a finished range is how the next reader is misled.
+
+**9a. The two-constant collapse is a SEPARATE step AFTER behaviour 19 — numbered 19b — and is NOT part of 19's green**
+
+Plan line 868 (behaviour 15's block) states it precisely: *"collapsing them is worth its own step after 19 (when the constant stops growing) rather than mid-stream."* Behaviour 19 is where the constant stops growing, so the step is now due. It is pinned as **19b** so the next manager action is unambiguous:
+
+- **Not inside 19's green**, for the reason that has held since behaviour 14: the collapse edits **two committed test files** for **zero behavioural gain**, and folding it into a green step would mix "make the red test pass" with "refactor the suite" in one commit — the one thing the red/green discipline exists to prevent. It would also make 19's green diff unreviewable against 19's red.
+- **Not the first action of behaviour 20** either. Behaviour 20 is the schema compiler; it touches `src/tool_swap/schema/compile.py` and `tests/unit/schema/`, shares no file with the registry, and pinning the collapse there would attach a config-layer refactor to a compiler behaviour for no reason other than adjacency.
+- **19b is test-only, exactly like 12a and 15.0** — the two precedents this repository already has for a standalone suite-repair step. Sequence: **19 red → 19 green → 19b (collapse, suite green, its own commit)**. It ships with the same PR and needs no new source code.
+- **Shape (recorded so 19b needs no re-derivation, not as a binding design):** one constant survives. `_EXPECTED_BUILTIN_IDS` in [`test_validate_registry_builtins.py`](tests/unit/config/test_validate_registry_builtins.py:74) is the natural survivor — behaviour 11a's file owns `BUILTIN_RULES` — and [`test_validate_names_groups.py`](tests/unit/config/test_validate_names_groups.py:98) imports it in place of its local `_LANDED_BUILTIN_IDS`. Both assertions that consume them ([line 168](tests/unit/config/test_validate_registry_builtins.py:168) and [line 336](tests/unit/config/test_validate_names_groups.py:336)) keep their current shape. A test-file-to-test-file import is a mild smell and is accepted here as strictly better than two hand-maintained copies of a 41-element tuple.
+- **The per-behaviour `_BEHAVIOUR_NN_IDS` tuples are NOT collapsed** and are not in 19b's scope. They are small, local, and each is the anchor its own file's index-anchored append test needs.
+
+**10. Behaviour 18's append test: VERIFIED index-anchored. No preparatory sub-step is required.**
+
+Plan line 1850 instructs behaviour 19 to run this check. Done: [`test_c6xx_rules_are_appended_to_builtin_rules_after_behaviour_17`](tests/unit/config/test_validate_contradictions.py:1118) computes `first_c540 = ids.index(_BEHAVIOUR_17_IDS[0])`, asserts that index equals the sum of the five preceding block lengths, slices **forward** by four from `first_c540 + len(_BEHAVIOUR_17_IDS)`, and checks object identity per constant. It carries **no** `len(BUILTIN_RULES)` assertion, **no** tail slice such as `ids[-4:]`, and no total count — verified additionally by grepping the whole suite for `len(BUILTIN_RULES)`, `ids[-` and `BUILTIN_RULES[-`: **zero hits anywhere**. Appending three rules after it changes nothing any shipped test measures.
+
+**Behaviour 19's own append test must follow the same index-anchored shape** — `ids.index(_BEHAVIOUR_18_IDS[0])`, compare against the sum of the six preceding block lengths, slice forward by three — even though no behaviour will append after it. The habit is cheap and B19 is not certainly the end of the codebase's life.
+
+**11. Shipped-test survey: NOTHING BREAKS, and behaviour 12's group tests are the ones checked hardest**
+
+- **Safe — every behaviour-12 group test.** `group_members` is a **new** function; [`effective_groups`](src/tool_swap/config/validate.py:330) and [`_effective_group`](src/tool_swap/config/validate.py:383) are **called, not modified**, and neither gains a parameter. Checked individually: [`test_effective_groups_synthesises_default_when_groups_key_absent`](tests/unit/config/test_validate_names_groups.py:252), [`test_effective_groups_returns_groups_block_unchanged_and_deep_copied`](tests/unit/config/test_validate_names_groups.py:271) (the deep-copy/no-aliasing pin — `group_members` never mutates the block it reads), [`test_c223_warns_on_group_referenced_by_no_tool`](tests/unit/config/test_validate_names_groups.py:670) and [`test_c223_is_silent_when_every_defined_group_is_referenced`](tests/unit/config/test_validate_names_groups.py:698). **`C223` is not touched at all** — item 0 withdraws `C611` precisely so it need not be. Each behaviour-12 test registers only the rules it exercises (the file's autouse `unregister_all` fixture), so three new `BUILTIN_RULES` entries cannot leak into any of them.
+- **Safe — [`test_all_six_rules_together_report_every_problem_in_one_run`](tests/unit/config/test_validate_names_groups.py:880).** It registers behaviour 12's six rules **explicitly and only those**, then asserts `{C210, C220, C221, C222, C223} <= codes`. A **subset** assertion, so even a leaked B19 diagnostic could not fail it — and none can, since the B19 rules are never registered there. Its fixture is nonetheless the exact shape `C613` would judge (`gpu0: {max_resident: 2}`, `orphan: {max_resident: 1}`), which is why it was checked line by line.
+- **Safe — no shipped test pins `max_resident` or `eviction` as resolved tool VALUES,** because they cannot be: [`_group_layer`](src/tool_swap/config/resolver.py:436) filters on `BUILT_IN_DEFAULTS` and neither key is in it (item 1). The values pinned by [`_valid_group_block`](tests/unit/config/test_validate_names_groups.py:224) and by [`_SYNTHESISED_DEFAULT`](tests/unit/config/test_validate_names_groups.py:150) are **raw-block literals inside the test file**, asserted against `effective_groups`' output only. Behaviour 19 changes neither the schema default (`4`/`"lru"`) nor the synthesis, and reads the same schema field the synthesis reads.
+- **Safe — the 47-key pins**, [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) and [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324): behaviour 19 adds **no** key to `BUILT_IN_DEFAULTS` and **no** key to `values`. `group`, `keep_warm` and `devices` are all already among the 47. **`values` stays 47.**
+- **Safe — [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) and [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334):** `ValidatedConfig` gains **no field** (item 1), matching behaviour 18 and unlike 15/16/17.
+- **Safe — [`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719) and [`test_validate_config_ignores_the_ambient_environment`](tests/unit/config/test_validate_registry.py:760):** the three rules read only `config.raw`, `config.tools[*].values`, `config.path` and `config.line_for`. **None reads `origins`** (item 4 — layer-blind), none reads `probe`, `home` or `gpu_count`, none touches the filesystem, `os.environ` or the clock, and none mutates anything. Note this is the **first** behaviour since 16 to read `config.raw` again, which is legitimate: `raw` is the only home the `groups:` block has.
+- **Safe — [`test_schema.py`](tests/unit/config/test_schema.py:250)'s `FULL_REFERENCE_CONFIG` and [`test_suggestion_inside_groups_suggests_group_fields`](tests/unit/config/test_schema.py:435):** behaviour 19 adds **no schema field to any model** — `GroupConfig` in particular gains nothing, keeping behaviour 14's block-1 decision and this suggestion test intact — and adds no schema diagnostic. `validate_root` is untouched. The rules are a separate layer these tests do not run.
+- **Safe — [`test_validate_resources.py`](tests/unit/config/test_validate_resources.py:1) and `C520`/`C522`/`C523`:** `C612` reads raw group `devices` while those rules read `tool.values["devices"]` (item 5). Different inputs, no shared helper beyond the pure [`_is_device_index`](src/tool_swap/config/validate.py:1911), which is read-only and unmodified.
+- **Safe — behaviour 23's five-line config, and it is the constraint that shaped item 3.** No `groups:` key → `C612` cannot fire (no `devices`), `C613` is exempted by the `"groups" not in raw` guard, and `C610` needs a keep-warm member the config does not have. **Zero warnings on the golden path**, as plan line 1632 requires.
+- **Watch, not a break — behaviour 24's `tools.example.yaml`.** It is the one place all three rules can bite under `--strict`, and it has no committed test yet. If the fixture follows `plan/02` §3 (`default: 4`, `gpu0: 1` + `devices: [0]`, `gpu1: 1` + `devices: [1]`, `cpu: 8`), then: **`C612` is silent** (no two groups share an index); **`C613` fires** on `cpu` (`max_resident: 8`, one member) and on `default` (`4`, zero or few members) — a hand-written block, so item 3's exemption does not apply; and `C223` may fire on `default`. **Behaviour 24 must size its groups to their members** — `cpu: {max_resident: 1}` with one member, and either give `default` a member or omit it. Recorded here so behaviour 24 does not discover it as a CI failure, exactly as behaviour 18's block did for `C601`.
+
+**12. Assumption A20, and the two-code deviation from the ledger**
+
+**A20 (new) — the Definition-of-Done's D9 phrasing is narrowed, and one planned code is withdrawn.** Both are visible deviations from the issue as written and belong in the PR description; see item 6 for the full argument and item 0 for the duplicate. In summary: the DoD line *"D9 (group-starvation): warning emitted when a group has no members or all members share the same device"* is implemented as — *no members* → the **already-shipped** `TSWAP-C223` (so `TSWAP-C611` is withdrawn before implementation and its code is never allocated); *all members share the same device* → **no diagnostic**, because a group whose members share a device is the documented intent of `groups:` and `plan/02` §3 and §7 both ship that shape, with the device dimension covered instead by `TSWAP-C612` in its `plan/02` §6 rule 12 meaning (**two or more groups** overlapping on a device index); and D9 proper — §6 rule 13's *"every member keep_warm while `max_resident` < member count"* — implemented as `TSWAP-C610`. **Behaviour 19 therefore ships three rules, not four, and `BUILTIN_RULES` reaches 41.** The user-visible consequence to confirm: a `tools.yaml` whose `gpu0` group holds four tools on `devices: [0]` produces **no** warning; an orphan group produces **one** warning (`C223`), not two.
+
+This is the same class of decision as **A1** (which declined a DoD clause on ADR grounds) and is resolved the same way: the specification the DoD points at wins over the DoD's paraphrase of it, and the deviation is recorded rather than silently taken. **A2 is untouched by all of this** — item 6 corrects two mis-citations of it in behaviour 19's bullets and adds nothing to it.
 
 ### Behaviour 20 — the schema compiler: `inputs:`/`outputs:` → JSON Schema 2020-12
 
@@ -1714,8 +1973,8 @@ The issue's 12-item corpus maps onto the ledger as follows. Every item is covere
 | 9 | Mount host paths exist (warn); mount strings parse | 17 | error + warning |
 | 10 | Unresolvable env var names the variable | 5 | error |
 | 11 | `keep_warm` + `autostart: false` | 18 | error |
-| 12 | Combined `max_resident` on a shared device | 19 | warning |
-| 13 | D9 group starvation | 19 | warning |
+| 12 | Combined `max_resident` on a shared device | 19 | warning (`C612`) |
+| 13 | D9 group starvation | 19 | warning (`C610`); the DoD's extra "no members" clause is the shipped `C223` and its "all same device" clause fires nothing — assumption **A20** |
 
 ---
 
@@ -1847,7 +2106,9 @@ Behaviours 12–19 are siblings and could be reordered or parallelised; the list
 
 **Behaviour 15 carries a mandatory preparatory sub-step (added 2026-08-18).** Before behaviour 15's red step, [`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264) must be position-stabilised — it is tail-anchored (`ids[-6:]`, `len(BUILTIN_RULES) == 16`) and any append breaks it. It is a test-only change, committed on its own, exactly as 12a was: **15.0 (repair, suite green, commit) → 15 red → 15 green.** See behaviour 15's contract block, item 0. The same hazard applies to every later appending behaviour (16–19), so each should check its predecessor's append-order test for tail anchoring before starting.
 
-**Behaviours 16, 17 and 18 need NO such sub-step (verified 2026-08-19).** Each predecessor's append-order test was checked and is index-anchored: behaviour 16's block verified 15's, behaviour 17's verified 16's, and behaviour 18's block item 10 verifies [`test_builtin_rules_append_the_behaviour_17_codes_in_code_order`](tests/unit/config/test_validate_mounts.py:1234) — it computes `ids.index(_BEHAVIOUR_17_IDS[0])`, compares against the sum of the five preceding block lengths, and carries no tail slice and no `len(BUILTIN_RULES)` assertion. **Behaviour 19 must run the same check against behaviour 18's own append test.**
+**Behaviours 16, 17, 18 and 19 need NO such sub-step (verified 2026-08-19).** Each predecessor's append-order test was checked and is index-anchored: behaviour 16's block verified 15's, behaviour 17's verified 16's, behaviour 18's block item 10 verified [`test_builtin_rules_append_the_behaviour_17_codes_in_code_order`](tests/unit/config/test_validate_mounts.py:1234), and **behaviour 19's block item 10 has now run the same check against behaviour 18's** [`test_c6xx_rules_are_appended_to_builtin_rules_after_behaviour_17`](tests/unit/config/test_validate_contradictions.py:1118) — index-anchored, forward-sliced, with no tail slice and no `len(BUILTIN_RULES)` assertion (a suite-wide grep for `len(BUILTIN_RULES)`, `ids[-` and `BUILTIN_RULES[-` returns zero hits). The plan-line-1848 hazard is discharged for the whole 15–19 range.
+
+**Behaviour 19b — collapse the two builtin-id constants (added 2026-08-19). Test-only, its own commit, immediately after 19's green.** Behaviour 19 is the last rule-growth behaviour, so `_EXPECTED_BUILTIN_IDS` / `_LANDED_BUILTIN_IDS` stop growing there and the duplication behaviours 14–18 each recorded is finally worth collapsing. It is **not** part of 19's green (a refactor of two committed test files must not ride inside a make-the-red-test-pass commit) and **not** the first action of behaviour 20 (which shares no file with the registry). Sequence: **19 red → 19 green → 19b → 20.** Precedents: 12a and 15.0. Full shape in behaviour 19's contract block, item 9a.
 
 ---
 
@@ -1891,6 +2152,14 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 
 **No shipped test asserts any of the current rejections** (verified: [`test_schema.py`](tests/unit/config/test_schema.py:227)'s `FULL_REFERENCE_CONFIG` writes neither `autostart` nor `max_concurrent` inside a `tools:` entry, and no committed test writes a `batching: {enabled: ...}` block at all). **No shipped test pins the current `batching.enabled: false` outcome either**, so point 2's value change is unobserved by the suite. The user-visible consequences to confirm: in M1, `autostart:` and `max_concurrent:` are legal in a `tools.yaml` tool entry; `autostart:` remains legal in `defaults:` and `max_concurrent:` remains illegal there; both remain illegal in a `tool.yaml`; and `batching: {enabled: false}` is legal in a `tool.yaml`, forcing `max_batch_size: 1` regardless of any authored value, while an inline `batching:` stays a `TSWAP-C101`.
 
+**A20 (new, 2026-08-19) — NOT yet confirmed by the intake source; the most user-visible deviation in the milestone, and it needs a line of its own in the PR description.** Behaviour 19's contract block narrows the Definition-of-Done's D9 line and withdraws one planned diagnostic code. The DoD reads *"D9 (group-starvation): warning emitted when a group has no members or all members share the same device"*, and **that sentence disagrees with the specification it points at**. `plan/02` §6 rule 13 defines D9 as *"every member of a group is `keep_warm` while `max_resident` is smaller than the member count"*; §6 rule 12 covers the device dimension as *"total `max_resident` across groups sharing a device"*. Neither mentions memberless groups, and neither makes "all members on the same device" a diagnosis. The resolution, in three parts:
+
+1. **"A group has no members" is already shipped, so `TSWAP-C611` is withdrawn before implementation and its code is never allocated.** Behaviour 12's [`TSWAP-C223`](src/tool_swap/config/validate.py:638) fires on *"a group defined but referenced by no tool"* — the same predicate written twice. Shipping both would emit **two WARNINGs with two codes for one mistake**, doubling under behaviour 21's summary and behaviour 24's `--strict`. `C223` is also the better rule: it carries a suppression clause `C611` was never specified to have (silent when *no* defined group is referenced, because that is a `C220` typo cascade). **Nothing user-visible changes** — an orphan group warns before and after, same severity, same location, same group named — so this half is a plan correction rather than a widening. The `C610`→`C612` numbering gap is deliberate; behaviour 25's troubleshooting table must not list `C611`.
+2. **"All members share the same device" fires no code, at any severity.** A group with `devices: [0]` and four members is the documented, intended shape: `plan/02` §3 ships `gpu0` exactly so, commenting it *"only one model on this GPU at a time → true swapping"*, and §7's worked example ships four tools across two such groups. **A group is the mechanism by which tools share a device safely** — that is what `max_resident` is for — so warning about it would warn about the feature working, and the DoD clause read literally warns on the specification's own reference configuration. The device dimension is instead covered by `TSWAP-C612` in its §6 rule 12 meaning: **two or more groups** whose `devices` lists overlap, with combined `max_resident` above the larger group's, warning-only because *"we do not model VRAM in v1"*.
+3. **D9 proper is `TSWAP-C610`**, implementing §6 rule 13 unchanged.
+
+**Behaviour 19 therefore ships three rules, not four, and `BUILTIN_RULES` reaches 41 rather than 42.** This is the same class of decision as **A1**, which declined a DoD clause on ADR grounds and took an `A`-number for it; here the specification the DoD points at wins over the DoD's paraphrase of it. **A2 is not involved** — behaviour 19's bullets previously cited it twice for this phrasing, and both citations were wrong (A2 is about corpus item 6's coverage claim and the two ADR-withdrawn rules 1b and 4b); the mis-citations are struck in place and A2 itself is unchanged. **No shipped test is affected**: `C611` was never implemented, `C223` is not touched, and no committed test asserts anything about same-device groups. The user-visible consequences to confirm: a `tools.yaml` whose `gpu0` group holds four tools on `devices: [0]` produces **no** warning; an orphan group produces **one** warning (`TSWAP-C223`), not two; and no diagnostic will ever carry the code `TSWAP-C611`.
+
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
 - The synthesised `default` group carries `eviction: "lru"` as well as `max_resident: 4`. Plan line 219 mentions only `max_resident: 4`; the value matches [`GroupConfig`](src/tool_swap/config/schema.py:120)'s defaults and `plan/02_CONFIGURATION.md`'s `groups:` example, so it is consistent rather than invented.
@@ -1910,6 +2179,7 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A10** | POSIX `:-` substitutes on unset **or empty** | We treat **empty-but-set as set**, so `TSWAP_TOKEN=""` means "explicitly no token" and does not resurrect a default. Documented and pinned by a test | 5 |
 | **A11** | Where group-supplied `devices` sit in precedence | §4.1 lists four levels and does not place the group. Assumed **between `defaults:` and built-in** | 10 |
 | **A12** | Secret redaction in `config show` | Not in the spec. Proposed: redact `auth_token` and `env` keys matching `TOKEN\|SECRET\|KEY\|PASSWORD`, with `--show-secrets` to opt out, because this output is what users paste into issues | 22 |
+| **A20** | The DoD's D9 line: *"no members or all members share the same device"* | **Narrowed to the §6 rules it points at.** *No members* → the already-shipped `C223`, so **`C611` is withdrawn and never allocated**; *all members on one device* → **no diagnostic** (it is the documented intent of `groups:`), with the device dimension covered by `C612`'s two-or-more-groups overlap; D9 proper → `C610`. Behaviour 19 ships **three** rules, total **41** | 19; DoD |
 
 ### Scope boundaries recorded deliberately
 
@@ -1931,7 +2201,7 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | Resolver precedence with origin tracking | 9, 10 |
 | Missing env var with no default fails actionably | 5 |
 | D19 descriptions: tool/input error, output warning | 13 |
-| D9 group-starvation warning | 19 |
+| D9 group-starvation warning | 19 (`C610`); the DoD's "no members" clause is behaviour 12's shipped `C223` and its "all members share the same device" clause is declined — assumption **A20** |
 | Schema compiler: snapshot, `x-*`, `additionalProperties: false`, raw pass-through, meta-schema | 20 |
 | `tswap validate` gives an actionable message for every malformed example | 12–19 (rules), 21 (rendering + exit codes) |
 | `tswap config show` prints resolved config with origins | 22 |
