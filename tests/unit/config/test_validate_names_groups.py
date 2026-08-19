@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Final
 
 import pytest
+from tests.unit.config.test_validate_registry_builtins import _EXPECTED_BUILTIN_IDS
 from tool_swap.config.errors import Diagnostic, Severity
 from tool_swap.config.origin import OriginMap
 from tool_swap.config.resolver import ResolvedTool
@@ -86,69 +87,6 @@ _BEHAVIOUR_12_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C221",
     "TSWAP-C222",
     "TSWAP-C223",
-)
-
-#: Every builtin rule id landed so far, in code order — the six
-#: behaviour-12 ids plus behaviour 13's four (C300-C303; plan line 437:
-#: "appended to ``BUILTIN_RULES`` in code order").  Mirrors
-#: ``_EXPECTED_BUILTIN_IDS`` in ``test_validate_registry_builtins.py``
-#: (behaviour 11a): BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER — add
-#: each behaviour's codes here, in code order, when that behaviour's
-#: rules land in ``BUILTIN_RULES``, so the next extension is one place.
-_LANDED_BUILTIN_IDS: Final[tuple[str, ...]] = (
-    "TSWAP-C210",
-    "TSWAP-C211",
-    "TSWAP-C220",
-    "TSWAP-C221",
-    "TSWAP-C222",
-    "TSWAP-C223",
-    # Behaviour 13 (D19 mandatory descriptions) extends the set here.
-    "TSWAP-C300",
-    "TSWAP-C301",
-    "TSWAP-C302",
-    "TSWAP-C303",
-    # Behaviour 14 (withdrawn/reserved keys) extends the set here.
-    "TSWAP-C400",
-    "TSWAP-C401",
-    "TSWAP-C402",
-    "TSWAP-C403",
-    "TSWAP-C404",
-    "TSWAP-C405",
-    # Behaviour 15 (image source, handler, file existence) extends the
-    # set here.
-    "TSWAP-C510",
-    "TSWAP-C511",
-    "TSWAP-C512",
-    "TSWAP-C513",
-    "TSWAP-C514",
-    "TSWAP-C515",
-    "TSWAP-C516",
-    # Behaviour 16 (devices, workers, ports) extends the set here.
-    "TSWAP-C520",
-    "TSWAP-C521",
-    "TSWAP-C522",
-    "TSWAP-C523",
-    "TSWAP-C530",
-    "TSWAP-C531",
-    "TSWAP-C532",
-    # Behaviour 17 (mounts) extends the set here.
-    "TSWAP-C540",
-    "TSWAP-C541",
-    "TSWAP-C542",
-    "TSWAP-C543",
-    # Behaviour 18 (contradictions) extends the set here.
-    "TSWAP-C600",
-    "TSWAP-C601",
-    "TSWAP-C602",
-    "TSWAP-C603",
-    # Behaviour 19 (D9 group starvation, group capacity) extends the
-    # set here.  NOTE: TSWAP-C611 was WITHDRAWN before implementation
-    # (2026-08-19, A20/item 0) - its predicate already ships as
-    # TSWAP-C223 - so the numbering intentionally jumps C610 -> C612
-    # and the gap stays.
-    "TSWAP-C610",
-    "TSWAP-C612",
-    "TSWAP-C613",
 )
 
 #: The pinned C210 reason phrase (plan line 214).
@@ -326,10 +264,11 @@ def test_register_builtin_rules_registers_every_builtin_rule() -> None:
     in ``BUILTIN_RULES`` and registered by the explicit, idempotent
     ``register_builtin_rules()``.
 
-    The expected list is the module-top constant ``_LANDED_BUILTIN_IDS``
-    (mirroring ``_EXPECTED_BUILTIN_IDS`` in
-    ``test_validate_registry_builtins.py``); behaviours 14-19 extend that
-    constant as their rules land, so the next extension is one place.
+    The expected list is ``_EXPECTED_BUILTIN_IDS``, imported from
+    ``test_validate_registry_builtins.py`` — behaviour 11a's file owns
+    ``BUILTIN_RULES`` and is the single source of truth for the landed
+    ids (behaviour 19b collapsed the two formerly-duplicated constants;
+    the constant is FINAL, behaviours 20+ add no rules).
 
     Arrangement: the registry cleared by the autouse fixture, with no
     builtin ids registered.
@@ -341,7 +280,7 @@ def test_register_builtin_rules_registers_every_builtin_rule() -> None:
 
     register_builtin_rules()
 
-    assert registered_rule_ids() == list(_LANDED_BUILTIN_IDS)
+    assert registered_rule_ids() == list(_EXPECTED_BUILTIN_IDS)
 
 
 def test_behaviour_12_rule_objects_carry_expected_ids_and_severities() -> None:

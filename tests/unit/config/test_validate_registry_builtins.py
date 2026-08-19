@@ -67,10 +67,12 @@ from tool_swap.config.validate import (  # noqa: E501  (names absent in RED step
 #: it is not a rule id, it is the code ``validate_config`` emits for a
 #: failing rule.
 #:
-#: BEHAVIOURS 14-19 EXTEND THIS CONSTANT FURTHER: add each behaviour's
-#: codes here (in code order) when that behaviour's rules land in
-#: ``BUILTIN_RULES`` — the completeness test below then enforces "no
-#: silent drop" mechanically.
+#: This constant is FINAL: behaviour 19 (C610/C612/C613) was the last
+#: rule-growth behaviour, so behaviours 20+ append nothing to it.  It is
+#: the single source of truth for the landed builtin ids —
+#: ``test_validate_names_groups.py`` imports it (behaviour 19b collapsed
+#: the two formerly-duplicated constants, plan item 9a) — and the
+#: completeness test below still enforces "no silent drop" mechanically.
 _EXPECTED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C210",
     "TSWAP-C211",
