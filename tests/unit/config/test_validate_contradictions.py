@@ -1136,13 +1136,13 @@ def test_c6xx_rules_are_appended_to_builtin_rules_after_behaviour_17() -> None:
         + len(_BEHAVIOUR_15_IDS)
         + len(_BEHAVIOUR_16_IDS)
     )
-    first_c600 = ids.index(_BEHAVIOUR_17_IDS[0])
+    first_c540 = ids.index(_BEHAVIOUR_17_IDS[0])
 
-    assert first_c600 == preceding + len(_BEHAVIOUR_17_IDS)
-    assert ids[first_c600 + len(_BEHAVIOUR_17_IDS) : first_c600 + len(_BEHAVIOUR_17_IDS) + 4] == list(
+    assert first_c540 == preceding
+    assert ids[first_c540 + len(_BEHAVIOUR_17_IDS) : first_c540 + len(_BEHAVIOUR_17_IDS) + 4] == list(
         _BEHAVIOUR_18_IDS
     )
-    base = first_c600 + len(_BEHAVIOUR_17_IDS)
+    base = first_c540 + len(_BEHAVIOUR_17_IDS)
     assert BUILTIN_RULES[base] is TSWAP_C600_RULE
     assert BUILTIN_RULES[base + 1] is TSWAP_C601_RULE
     assert BUILTIN_RULES[base + 2] is TSWAP_C602_RULE
@@ -1291,7 +1291,7 @@ def test_batching_enabled_false_overrides_authored_max_batch_size_to_one() -> No
     )
 
     assert result.values["max_batch_size"] == 1
-    assert result.diagnostics == ()
+    assert result.diagnostics == []
 
 
 def test_batching_enabled_false_overrides_authored_max_batch_size_at_any_layer() -> None:
