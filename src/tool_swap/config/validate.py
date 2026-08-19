@@ -3058,6 +3058,325 @@ TSWAP_C603_RULE: Final[Rule] = _C603Rule(
 )
 
 
+# ---------------------------------------------------------------------------
+# Behaviour 19 — D9 group starvation, and group capacity (§6 rules 12, 13)
+# ---------------------------------------------------------------------------
+
+#: The pinned C610 mechanism sentence (plan, behaviour 19, item 4).
+_C610_MECHANISM: Final[str] = (
+    "keep_warm exempts a tool from TTL but not from eviction, so "
+    "this group can never satisfy all its members"
+)
+
+
+def group_members(config: ValidatedConfig) -> dict[str, list[ResolvedTool]]:
+    """Every effective group mapped to its member tools (behaviour 19).
+
+    Pure helper: no mutation of ``config`` or anything reachable from
+    it (``effective_groups`` already deep-copies).  A tool whose
+    ``group`` value is not a string, and a tool naming a group absent
+    from the effective block, are a member of NOTHING — neither
+    inflates nor deflates another group's count.  A memberless group
+    still appears, mapped to a fresh empty list.
+
+    Args:
+        config: the validated configuration whose raw ``groups:`` block
+            and resolved ``tools`` are cross-referenced.
+
+    Returns:
+        Effective group name (in :func:`effective_groups` iteration
+        order) -> its member tools (in ``config.tools`` order); every
+        member list is fresh per call, holding the original tool
+        objects.
+    """
+    groups = effective_groups(config.raw)
+    members: dict[str, list[ResolvedTool]] = {name: [] for name in groups}
+    for tool in config.tools.values():
+        group = _effective_group(tool)
+        if group is not None and group in members:
+            members[group].append(tool)
+    return members
+
+
+def _group_max_resident(block: object) -> int | None:
+    """A group's effective ``max_resident``, or ``None`` to skip it.
+
+    An absent key means the schema default, read from
+    :class:`~tool_swap.config.schema.GroupConfig`'s field default (never
+    a literal, so the two cannot drift) — NOT a skip: Pydantic
+    genuinely applies it at runtime, so the starvation is real.
+    ``None`` answers a non-dict block, a ``bool`` (``bool``-before-
+    ``int``), a non-``int`` and any value below 1 (the last is
+    ``TSWAP-C221``'s error, already reported).  With every skipped case
+    removed, every value returned is an ``int >= 1``.
+
+    Args:
+        block: one raw ``groups:`` entry, as authored.
+
+    Returns:
+        The group's effective capacity, or ``None`` when a B19 rule
+        must skip the group silently.
+    """
+    if not isinstance(block, dict):
+        return None
+    if "max_resident" not in block:
+        return int(GroupConfig.model_fields["max_resident"].default)
+    value = block["max_resident"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+class _C610Rule(Rule):
+    """``TSWAP-C610``: every member keep_warm while ``max_resident`` < count."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on a group whose keep-warm members can never all fit.
+
+        Fires when the group's effective ``max_resident`` is an int, the
+        group has at least one member (``all()`` over an empty list is
+        vacuously true; a memberless group is ``TSWAP-C223``'s), EVERY
+        member resolves ``keep_warm`` to ``True`` (identity against the
+        singleton, the ``_C600Rule`` pattern, never truthiness), and
+        ``max_resident < len(members)``.  Layer-blind: a
+        ``defaults:``-level ``keep_warm`` starves exactly like an inline
+        one, and no origin is consulted.  The synthesised ``default``
+        group IS judged.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per starving group, located at
+            ``groups.<name>.max_resident`` (``line`` is ``None`` when the
+            key was never written).
+        """
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, members in group_members(config).items():
+            capacity = _group_max_resident(groups[group_name])
+            if capacity is None or not members:
+                continue
+            if not all(tool.values.get("keep_warm") is True for tool in members):
+                continue
+            if capacity >= len(members):
+                continue
+            message = (
+                f"Group {group_name!r} has {len(members)} members and "
+                "every one of them sets keep_warm: true, but "
+                f"max_resident is {capacity}; {_C610_MECHANISM}"
+            )
+            yaml_path = f"groups.{group_name}.max_resident"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=(
+                        f"Raise the group's max_resident to {len(members)} "
+                        "so every keep-warm member fits, or set "
+                        "eviction: none on the group if pinning these "
+                        "tools was the intent."
+                    ),
+                )
+            )
+        return findings
+
+
+class _C612Rule(Rule):
+    """``TSWAP-C612``: two or more groups sharing a device index."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when groups sharing a device index would exceed it together.
+
+        A group participates when its effective ``max_resident`` is an
+        int and its RAW block declares ``devices`` as a list of usable
+        indices (``_is_device_index``; a malformed entry is
+        ``TSWAP-C520``'s and simply does not participate).  ``devices``
+        is read from the raw block, NEVER from member
+        ``values["devices"]``: group devices flow into member values
+        through the resolver, and reading them would fire on tools and
+        double-report against ``TSWAP-C523``/``TSWAP-C530``.  This rule
+        is a statement about the ``groups:`` block alone.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING per shared device index (ordered by ascending
+            index, then group name), located at the bare ``groups``
+            block, naming every participating group, its combined
+            capacity and the larger group's.
+        """
+        groups = effective_groups(config.raw)
+        shared: dict[int, list[str]] = {}
+        capacities: dict[str, int] = {}
+        for group_name, block in groups.items():
+            capacity = _group_max_resident(block)
+            if capacity is None:
+                continue
+            devices = block.get("devices")
+            if not isinstance(devices, list):
+                continue
+            indices: set[int] = {i for i in devices if _is_device_index(i)}
+            if not indices:
+                continue
+            capacities[group_name] = capacity
+            for index in indices:
+                shared.setdefault(index, []).append(group_name)
+        findings: list[Diagnostic] = []
+        for index in sorted(shared):
+            names = sorted(shared[index])
+            if len(names) < 2:
+                continue
+            total = sum(capacities[name] for name in names)
+            largest = max(capacities[name] for name in names)
+            # Every capacity is >= 1, so this inequality always holds
+            # for any two-group overlap; it is kept as the plan's
+            # stated comparison, not collapsed, so it survives a future
+            # legal 0.
+            if total <= largest:
+                continue
+            if len(names) == 2:
+                declared = (
+                    f"Groups {names[0]!r} and {names[1]!r} both declare device {index}"
+                )
+            else:
+                listed = (
+                    ", ".join(repr(name) for name in names[:-1]) + f" and {names[-1]!r}"
+                )
+                declared = f"Groups {listed} all declare device {index}"
+            message = (
+                f"{declared}, and their combined max_resident is {total} "
+                f"against the larger group's {largest}; tool-swap does "
+                "not model VRAM in v1, so this is not checked further"
+            )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path="groups",
+                        line=config.line_for("groups"),
+                    ),
+                    remedy=(
+                        "Give each group its own device, or lower the "
+                        "groups' max_resident so their combined total "
+                        f"fits what device {index} can actually hold; "
+                        "tool-swap cannot verify VRAM capacity in v1."
+                    ),
+                )
+            )
+        return findings
+
+
+class _C613Rule(Rule):
+    """``TSWAP-C613``: ``max_resident`` above the member count."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on a group with unused capacity (usually a stale config).
+
+        Fires when ``raw`` HAS a ``groups:`` key — the synthesised
+        ``default`` group is exempt, because warning that OUR default
+        exceeds the author's one tool would warn about nothing and break
+        behaviour 23's zero-warnings golden path — and the group's
+        effective ``max_resident`` exceeds its member count.  A
+        memberless group does not fire: it is ``TSWAP-C223``'s finding.
+        Mutually exclusive with ``_C610Rule`` by construction (``>`` vs
+        ``<``; ``==`` fires neither).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per stale group, located at
+            ``groups.<name>.max_resident``.
+        """
+        if "groups" not in config.raw:
+            return []
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, members in group_members(config).items():
+            capacity = _group_max_resident(groups[group_name])
+            if capacity is None or not members:
+                continue
+            if capacity <= len(members):
+                continue
+            message = (
+                f"Group {group_name!r} has max_resident {capacity} but "
+                f"only {len(members)} members, so "
+                f"{capacity - len(members)} slots can never be used; "
+                "this is harmless, but usually means the group lost "
+                "members and max_resident was not updated"
+            )
+            yaml_path = f"groups.{group_name}.max_resident"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=(
+                        f"Lower the group's max_resident to {len(members)} "
+                        "to match its members, or add the missing tools "
+                        "to the group if members were removed by "
+                        "mistake; nothing breaks either way."
+                    ),
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C610`` — every member keep_warm while max_resident is below
+#: the member count (§6 rule 13, WARNING; TSWAP-C611 was withdrawn,
+#: item 0 / A20).
+TSWAP_C610_RULE: Final[Rule] = _C610Rule(
+    id="TSWAP-C610",
+    severity=Severity.WARNING,
+    remedy=(
+        "Raise the group's max_resident to its keep-warm member count, "
+        "or set eviction: none on the group if pinning these tools was "
+        "the intent"
+    ),
+)
+
+#: ``TSWAP-C612`` — two or more groups sharing a device index (§6 rule
+#: 12, WARNING; VRAM is not modelled in v1).
+TSWAP_C612_RULE: Final[Rule] = _C612Rule(
+    id="TSWAP-C612",
+    severity=Severity.WARNING,
+    remedy=(
+        "Give each group its own device, or lower the groups' "
+        "max_resident so their combined total fits the device; "
+        "tool-swap cannot verify VRAM capacity in v1"
+    ),
+)
+
+#: ``TSWAP-C613`` — max_resident above the member count (§6 rule 13,
+#: WARNING; harmless, usually a stale config).
+TSWAP_C613_RULE: Final[Rule] = _C613Rule(
+    id="TSWAP-C613",
+    severity=Severity.WARNING,
+    remedy=(
+        "Lower the group's max_resident to its member count, or add the "
+        "missing tools to the group; nothing breaks either way"
+    ),
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -3100,6 +3419,9 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C601_RULE,
     TSWAP_C602_RULE,
     TSWAP_C603_RULE,
+    TSWAP_C610_RULE,
+    TSWAP_C612_RULE,
+    TSWAP_C613_RULE,
 )
 
 
