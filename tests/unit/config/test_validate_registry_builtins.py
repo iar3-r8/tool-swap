@@ -90,6 +90,15 @@ _EXPECTED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C403",
     "TSWAP-C404",
     "TSWAP-C405",
+    # Behaviour 15 (image source, handler, file existence) extends the
+    # set here.
+    "TSWAP-C510",
+    "TSWAP-C511",
+    "TSWAP-C512",
+    "TSWAP-C513",
+    "TSWAP-C514",
+    "TSWAP-C515",
+    "TSWAP-C516",
 )
 
 
