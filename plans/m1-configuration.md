@@ -900,7 +900,187 @@ Every `C5xx` rule reads only `config.tools[<key>]`'s carrier fields (`image`, `h
   - `expose_host_port: true` (auto-allocate from the range) participates in **neither** check — nothing is allocated at validate time (D21: normal operation publishes nothing). Asserted, so a future implementation does not start allocating during validation.
   - `TSWAP-C532` — `backend.port_range` inverted or malformed → error.
 - **Edge cases:** `devices: []` (CPU) with `workers: 4` → no warning; `expose_host_port: 0` → error (0 means "pick one" to Docker, and we do not support that spelling).
-- **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_resources.py`.
+- **Files:** `src/tool_swap/config/schema.py` (the two inline fields below), `src/tool_swap/config/validate.py` (the `gpu_count` seam + the seven rules), `tests/unit/config/test_validate_resources.py`.
+
+#### Confirmed contract details (2026-08-19)
+
+Seven rules, and the **first rule group in M1 that reads a root-level block other than `groups:`**. Behaviour 15 pinned how a rule reaches the *disk*; this block pins how a rule reaches **`backend:`**, and pins the data path for every one of `devices` / `workers` / `expose_host_port` / `port_range` so the RED step needs no guessing. **No preparatory sub-step is required** (item 10 verified behaviour 15's append-order test is index-anchored). **The resolver is not touched at all** (item 2(d)).
+
+The governing property, stated once because three decisions follow from it: **a rule reads a value from exactly one place, and that place is the one the author's YAML actually reaches.** Per-tool fields arrive through `tool.values` (the resolved 47); the `backend:` block arrives through `config.raw`, because no resolver layer carries it (item 3). Getting this backwards is the single largest trap in behaviour 16, and item 3(a) names it explicitly.
+
+**1. The GPU count — a trailing scalar field on `ValidatedConfig`, defaulting to "unknown"**
+
+Behaviour 15's block pinned the shape (*"`gpu_count: int | None = None`, where `None` means 'unknown, skip silently'"*). Confirmed **as a plain scalar field, not a `GPUProbe` object**:
+
+```python
+@dataclass(frozen=True)
+class ValidatedConfig:
+    tools: dict[str, ResolvedTool]
+    raw: dict[str, object]
+    line_for: Callable[[str], int | None] = field(default=_no_line, kw_only=True)
+    path: Path = field(default=Path("tools.yaml"), kw_only=True)
+    probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
+    # --- added by behaviour 16; trailing, keyword-only, defaulted ---
+    gpu_count: int | None = field(default=None, kw_only=True)
+```
+
+- **Why a scalar and not a probe object.** `FileProbe` is an object because it groups **two predicates** over an **unbounded** set of paths, so it must be callable. The GPU count is **one datum for the whole run**: a `Callable[[], int | None]` would add laziness nobody needs and a second injection style to keep in step. A frozen dataclass wrapping a single int is a box with nothing in it.
+- **Why the default is `None` and not a real count, when `FileProbe`'s default IS the real filesystem.** The asymmetry is deliberate and is the point. `Path.is_file` is stdlib, cheap and portable; counting GPUs requires `pynvml` or a `nvidia-smi` subprocess — a vendor dependency the config layer must not acquire, and a subprocess `tswap validate` must never spawn (§2: *"No Docker needed — runs in CI"*). **The shipped config layer calls neither, in any code path.** `None` is the honest answer for a library that refuses to look.
+- **Consequence, stated plainly rather than hidden: in M1, `C521` never fires in production.** Nothing in M1 populates `gpu_count`, so every real `tswap validate` run skips the rule silently. It fires only where a test injects a count. This is not a defect of the rule — §6 rule 7 exists to warn against *this host*, and a validator that cannot see the host correctly says nothing. DoD item 6 (*"every §6 rule has a failing-config test"*) is satisfied by the injected-count test.
+- **Where a real count would come from if ever wired — pinned so 16 does not create a silent obligation on a later behaviour.** The natural home is **M5 preflight**, which already owns host-facing checks and a GPU stage (`plan/03` §7 stage 8) and is where `validate`'s rules get *moved* (guardrail 13). The **CLI (behaviour 21) is the second candidate** and may inject a counted value later. **M1 pins only the seam**: behaviour 21's contract is *not* extended here, and no M1 behaviour is obliged to produce a count. Adding one later is purely additive — one keyword argument at one construction site.
+- **Shipped-pin check, verified line by line.** [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) constructs with keyword arguments, reads back four values, then constructs with defaults; it asserts **no field count and no field list**. [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334) loops over the four names `("tools", "raw", "line_for", "path")`. A trailing keyword-only defaulted field is invisible to both, exactly as `probe` was. **Neither test is amended.**
+
+**2. Where each value lives — checked against the code, field by field**
+
+**(a) `devices` and `workers` are already resolvable `values` keys.** Both are in [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:32) (`devices: []`, `workers: 1`), so [`resolve_tool`](src/tool_swap/config/resolver.py:225) resolves them like any other of the 47 and the rules read `tool.values["devices"]` / `tool.values["workers"]`. **No carrier field, no resolver change.**
+
+**(b) `expose_host_port` is also already a resolvable `values` key** ([`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:55), default `False`), so `C530`/`C531` read `tool.values["expose_host_port"]`.
+
+**(c) …but two of the three cannot be authored today. Two schema fields must be added, or three rules are unreachable.** Verified against [`ToolConfig`](src/tool_swap/config/schema.py:151), which has `devices` (line 179) and **neither `workers` nor `expose_host_port`**:
+
+| Key | In `BUILT_IN_DEFAULTS`? | In `ToolConfig`? | Today, written inline |
+|---|---|---|---|
+| `devices` | yes | **yes** | accepted |
+| `workers` | yes | **no** | `TSWAP-C101` unknown key |
+| `expose_host_port` | yes | **no** | `TSWAP-C101` unknown key |
+
+This is **exactly the trap behaviour 14's `C405` fell into and behaviour 15's `image` escaped**: a rule that can never fire, because `extra="forbid"` rejects the key inside `validate_root` before any rule sees the config. `plan/02` §5.2's field table lists `expose_host_port` (*"bool \| int, `false`, Publish for debugging; `true` picks from `backend.port_range`"*) and §5.5 lists `workers` as tool-level, so both are documented tool keys. The green step adds them to **`ToolConfig` only**:
+
+```python
+# ToolConfig only:
+workers: int | None = None
+expose_host_port: bool | int | None = None
+```
+
+- **`DefaultsConfig` gains neither.** It already has `workers` (line 91) — nothing to do. It deliberately does **not** gain `expose_host_port`: a defaults-level published port would collide across every tool by construction, so `C530` would fire on every multi-tool config. The key is inherently per-tool. A `defaults.expose_host_port` stays a `TSWAP-C101`, which is the right answer.
+- **`ToolYamlConfig` gains neither**, following the A14/A15 precedent: §4's `tool.yaml` reference authors neither key, `batching.workers` is not in [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28) and would be a `TSWAP-C106`, and inventing a surface the spec does not describe is how a config layer grows keys nobody documented.
+- *(The boundary move — both keys go from rejected to accepted-and-checked — is flagged as assumption **A17**.)*
+
+**(d) No resolver change is needed, and this is worth stating because it is not obvious.** The resolver does not whitelist inline keys: [`_winner_index`](src/tool_swap/config/resolver.py:580) walks the layers asking `field in layer.data` for each of the 47 built-in field names, and the inline layer is the author's dict verbatim. So the moment the schema stops rejecting `workers:` / `expose_host_port:`, both flow into `values` with correct origins and no resolver edit. Behaviour 16 touches `schema.py` and `validate.py` only.
+
+**3. `port_range` — read from `config.raw["backend"]`, NOT from `values`**
+
+**(a) THE TRAP, named explicitly: `tool.values["port_range"]` exists and is a lie.** `port_range` **is** one of the 47 [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:76) keys, so every `ResolvedTool` carries `values["port_range"] == [7000, 7999]` and the obvious implementation compiles, type-checks and passes a naive test. **It is wrong.** No layer the resolver reads can ever supply it: `BackendConfig` is a *root* block, [`resolve_tool`](src/tool_swap/config/resolver.py:144) takes only `inline` / `tool_yaml` / `defaults` / `group`, and neither `ToolConfig` nor `DefaultsConfig` has a `port_range` field. So a user writing `backend: {port_range: [8000, 8999]}` would be validated against `[7000, 7999]` — every port in their own declared range reported as out of range. **`C531`/`C532` must not read `values["port_range"]`.** (The same caveat applies to the other seven backend keys and the nine router keys that ride along in `values`; behaviour 16 only needs this one, and does not fix the wider oddity.)
+
+**(b) The rule reads the root block through `config.raw` — the behaviour-12 precedent, not a new mechanism.** `ValidatedConfig.raw` is documented as *"the raw root YAML mapping"* and behaviour 12's [`effective_groups`](src/tool_swap/config/validate.py:318) already reads `raw["groups"]` this way. **No `port_range` carrier on `ResolvedTool`, no new `resolve_tool` parameter, no new rule input.** A helper mirrors `effective_groups` exactly:
+
+```python
+def effective_port_range(raw: dict[str, object]) -> object:
+    """The backend port range a rule should check against."""
+    backend = raw.get("backend")
+    if not isinstance(backend, dict) or "port_range" not in backend:
+        return list(BackendConfig.model_fields["port_range"].default)
+    return backend["port_range"]
+```
+
+- Pure, no mutation of `raw`, and the absent-block default is read **from the schema's own field default** — the same anti-drift move `_SYNTHESISED_DEFAULT_GROUP` makes with `GroupConfig.model_fields` (behaviour 12). It is copied, not aliased, so a rule can never mutate a Pydantic default (the `port_range` mutable-default hazard behaviour 3 has a dedicated test for).
+- The value is returned **as authored** — deliberately not narrowed to `list[int]` — because judging its shape is `C532`'s entire job (item 6).
+
+**(c) `C530` sees all tools by iterating `config.tools`,** which is the resolved set, reading each `ResolvedTool.values["expose_host_port"]`. It needs nothing else; cross-tool visibility was never in question.
+
+**4. `C520` — negative or non-integer device index**
+
+`devices` is `list[int]` in [`ToolConfig`](src/tool_swap/config/schema.py:179), [`DefaultsConfig`](src/tool_swap/config/schema.py:84) and [`GroupConfig`](src/tool_swap/config/schema.py:139), so it is tempting to assume the schema has already made every entry an `int`. **It has not, for two independent reasons, and the rule must handle both:**
+
+- **The rules never see Pydantic's output.** [`validate_root`](src/tool_swap/config/schema.py:291) calls `model_validate` and **discards the model**, returning only diagnostics; `resolve_tool` then merges the **raw parsed-YAML dicts**. So `values["devices"]` holds the entries **as authored**, uncoerced — a `"0"` stays the string `"0"`.
+- **Pydantic's lax mode coerces anyway.** `devices: ["0"]` passes `list[int]` by str→int coercion and produces **no** schema diagnostic at all, so if the rule did not check, a string index would reach M2 unreported.
+
+**Pinned: `C520` fires per offending entry when the entry is not an `int`, or is an `int` below 0.** `bool` is excluded by an explicit `isinstance(value, bool)` test **before** the `int` test (`True` is an `int` in Python, and `devices: [true]` is a mistake, not GPU 1). The message names the tool, the offending entry (`repr`, so `"0"` is visibly a string) and its position.
+
+**Overlap with the schema layer, stated honestly rather than engineered around:** `devices: [1.5]` is rejected by `list[int]` as a `TSWAP-C105` **and** flagged by `C520`, so one mistake can yield two diagnostics from two layers. This is accepted, not suppressed: the two layers run independently (`validate_root` before the rules, per behaviour 21's pipeline), a rule cannot see the schema's findings, and the "one mistake, one diagnostic" discipline of behaviours 13–15 governs **rules against each other**, not rules against the schema. The `C105` and the `C520` say compatible things.
+
+`devices` that is **not a list** (`devices: 3`, the R8 flaw) is **skipped silently** by all of `C520`/`C521`/`C522`/`C523` — [`TSWAP-C104`](src/tool_swap/config/schema.py:436) owns it with a bespoke message, and re-reporting it per rule would bury that message. This mirrors behaviour 13's "a block whose value is not a list is skipped silently".
+
+**A group-supplied `devices` yields one diagnostic per member tool.** Group values enter through the group layer (assumption A11) and land in each member's `values`, so a `groups.gpu0.devices: [-1]` shared by three tools produces three `C520`s at three tool locations. This is accepted: the rule is per-tool by construction, and each tool genuinely resolves to a bad device. The **remedy must therefore be self-sufficient** (the behaviour-13/14/15 rule) and name every place the list could have come from — *"the tool's `devices:`, the `defaults:` block, or the tool's group"* — rather than pretending to know which layer authored it.
+
+**5. `C521` / `C522` / `C523`**
+
+- **`C521` (WARNING).** Skipped **entirely and silently** when `config.gpu_count is None`. When a count is injected, it fires for every entry that is an `int`, not a `bool`, **`>= 0`** (negatives belong to `C520` — one mistake, one diagnostic) and `>= gpu_count`. Message names the index, the count seen, and that the config may target another machine (§6 rule 7's own reason). `gpu_count: 0` is a **legitimate injected value** meaning "this host has no GPUs" and warns for every device index — it is not conflated with `None`.
+- **`C522` (WARNING).** Duplicate index within **one tool's** `devices`. Compares only `int`, non-`bool` entries (a duplicated `"0"` is `C520`'s problem twice over). **One diagnostic per tool**, naming every duplicated index, located at the list rather than at an entry — the duplication is a property of the list, and picking "the second occurrence" would be arbitrary.
+- **`C523` (WARNING).** Fires when `values["workers"]` is an `int`, not a `bool`, `> 1` **and** `values["devices"]` is a **non-empty list**. `devices: []` with `workers: 4` → **nothing**, explicitly pinned and explicitly tested; that is the CPU case, where multiple workers are the intended way to use more cores. The message must state the mechanism — *VRAM multiplies by the worker count, invisibly to the scheduler* (§6 rule 4c) — because the symptom (an OOM under load) does not point at `workers:`. **The remedy names BOTH options**: reduce `workers`, **or** keep it and size the group accordingly (lower the group's `max_resident` so the multiplied VRAM still fits). A remedy offering only "reduce workers" would be telling a user their deliberate choice is wrong.
+
+**6. `C530` / `C531` / `C532` — the port rules**
+
+**(a) The type shape of `expose_host_port`, and the `bool`-before-`int` order.** §5.2 pins `bool | int`. The three meanings:
+
+| Value | Meaning | `C530` | `C531` |
+|---|---|---|---|
+| `false` (default) | publish nothing | no | no |
+| `true` | auto-allocate from `backend.port_range` | **no** | **no** |
+| an `int` | publish exactly this host port | yes | yes |
+
+**`true` participates in NEITHER check**, and this is asserted so that a future implementation does not start allocating at validate time (D21: normal operation publishes nothing and allocates nothing). Mechanically this depends on one detail worth pinning because it is the classic Python bug: **`isinstance(value, bool)` must be tested first**, since `isinstance(True, int)` is `True` — a naive `isinstance(value, int)` would treat `expose_host_port: true` as **port 1**, colliding it with every other `true` in the file. Any other type (a string, a list) is **skipped silently**; the schema owns the type.
+
+**(b) `C531` — an explicit port outside the range (ERROR).** Fires when the value is an `int` (not a `bool`) and falls outside the effective range from item 3. The message names **the port and the range**, both.
+
+**`expose_host_port: 0` is a `C531`, unconditionally — a decision.** Plan line 902 requires an error and does not assign a code. `0` is outside every realistic range, so `C531` fires naturally; the pin is that it fires **even if an authored `port_range` somehow contained 0**, because the objection is not arithmetic. The message carries a dedicated clause naming the direction: **`0` tells Docker "pick any free port", and tool-swap does not support that spelling — write `true` to auto-allocate from `backend.port_range`, or an explicit port.** That sentence is the whole value of the diagnostic: it converts a rejection into the one-word fix (`true`). Negative ports and ports above 65535 are covered by the same range comparison and need no special case.
+
+**(c) `C532` — the range itself (ERROR).** The authored shape is pinned by [`BackendConfig.port_range`](src/tool_swap/config/schema.py:69): **a list of exactly two ints, `[low, high]`** — `[7000, 7999]` in §3 line 69. It is **not** a tuple and **not** a `"7000-7999"` string; no spelling other than the two-element list is accepted, and none is parsed. The schema's `list[int]` catches non-int entries but **does not check the length** (`[]` and `[1,2,3]` both pass it), so `C532` owns:
+
+| Case | `C532`? |
+|---|---|
+| length ≠ 2 (`[]`, `[7000]`, `[7000, 7999, 8000]`) | yes — naming the length found |
+| a non-`int` (or `bool`) entry that survived coercion | yes |
+| `low > high` (inverted) | yes — naming both values |
+| `low == high` | **no** — a one-port range is tight but legitimate |
+| an endpoint outside `1..65535` | yes — not a port number |
+| not a list at all | **no** — skipped silently; the schema's `TSWAP-C105` owns it |
+
+**`C532` suppresses `C531`** for the whole run: a malformed range cannot judge any port, and emitting "port 7001 is outside `[7999, 7000]`" alongside "the range is inverted" is two diagnostics for one mistake. This is the `C512`-suppresses-`C513` pattern from behaviour 15. **`C532` does not suppress `C530`** — a collision between two tools is true regardless of the range.
+
+**(d) `C530` — a shared port (ERROR).** Collect `(tool key, port)` for every tool whose `expose_host_port` is an `int` and not a `bool`; emit **one diagnostic per colliding port**, naming the port and **every** tool claiming it (not one per pair, and not one per tool). Located at `tools`, following [`_C211Rule`](src/tool_swap/config/validate.py:422)'s duplicate-name precedent — the collision belongs to no single tool. `C530` and `C531` can both fire for the same port; they are different problems and neither suppresses the other (the behaviour-15 `C513`/`C516` precedent).
+
+**7. Location contract per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour-12/13/14/15 form. The file is never hardcoded, `line=None` is a legal outcome, and tests assert `location.line == config.line_for(location.yaml_path)` rather than a literal line number.
+
+| Code | `yaml_path` |
+|---|---|
+| `C520` | `tools.<key>.devices.<i>` |
+| `C521` | `tools.<key>.devices.<i>` |
+| `C522` | `tools.<key>.devices` |
+| `C523` | `tools.<key>.workers` |
+| `C530` | `tools` |
+| `C531` | `tools.<key>.expose_host_port` |
+| `C532` | `backend.port_range` |
+
+`<key>` is the `tools:` **map key**, matching behaviours 12–15. `<i>` is the **0-based** position in the resolved `devices` list, written **dotted-numeric** (`tools.t.devices.0`), which is behaviour 13's convention — [`_check_entry_descriptions`](src/tool_swap/config/validate.py:808) emits `tools.<key>.<block>.<index>.description`, and brackets appear nowhere in a `yaml_path` (the resolver's `mounts[i]` is an **origin** path, a different namespace). `C532` is the first `yaml_path` in M1 rooted at `backend`, which is correct and needs no new machinery: `line_for` takes any dotted path and is free to answer `None`.
+
+**8. Severity**
+
+`C520` **ERROR**; `C521` **WARNING**; `C522` **WARNING**; `C523` **WARNING**; `C530` **ERROR**; `C531` **ERROR**; `C532` **ERROR**. Every `remedy` is non-empty. Note the shape: the three `C52x` warnings are all *"this may be fine on another machine or on purpose"* judgements, while every ERROR is a statement the config is unusable as written on any host.
+
+**9. Registration**
+
+Module-level constants `TSWAP_C520_RULE` … `TSWAP_C532_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, **no import-time self-registration**, appended to `BUILTIN_RULES` in code order after behaviour 15's seven — **30 landed rules in total** (6 + 4 + 6 + 7 + 7). The seven ids in code order are `TSWAP-C520`, `TSWAP-C521`, `TSWAP-C522`, `TSWAP-C523`, `TSWAP-C530`, `TSWAP-C531`, `TSWAP-C532`.
+
+The green step extends **both** completeness constants, and both are required:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file).
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file).
+
+**This is the third behaviour to pay the two-constant tax** that behaviours 14 and 15 recorded. It is still not fixed here, for the reason 15 gave: collapsing them is worth its own step after 19, when the constant stops growing. The new test file restates `_BEHAVIOUR_12_IDS` … `_BEHAVIOUR_15_IDS` lengths as module-top constants and anchors behaviour 16's block **by index**, never by tail or total count — the pattern behaviour 14 had to be repaired into.
+
+**10. Shipped pins checked, one by one**
+
+- **Safe — [`test_builtin_rules_append_the_behaviour_15_codes_in_code_order`](tests/unit/config/test_validate_image_source.py:370): VERIFIED index-anchored.** It computes `first_c510 = ids.index(_BEHAVIOUR_15_IDS[0])`, asserts that index equals `len(_BEHAVIOUR_12_IDS) + len(_BEHAVIOUR_13_IDS) + len(_BEHAVIOUR_14_IDS)`, and slices forward; it carries **no** `len(BUILTIN_RULES)` assertion. Appending seven rules after it changes nothing it measures. **No preparatory red sub-step is needed** — behaviour 15's own repair of behaviour 14's file, plus 15's deliberate design, hold the line.
+- **Safe — behaviour 13's and the repaired behaviour 14's append-order tests**, and [`test_builtin_rules_carries_the_behaviour_12_codes_in_code_order`](tests/unit/config/test_validate_registry_builtins.py:131): all index-anchored or compared against `_EXPECTED_BUILTIN_IDS`, which the green step extends in the same commit.
+- **Safe — [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) and [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334):** re-verified line by line for `gpu_count` (item 1). No field count, no field list, a four-name loop. Neither is amended.
+- **Safe — the 47-key pins**, [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) and [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324): behaviour 16 adds **no** key to `BUILT_IN_DEFAULTS` and **no** key to `values`. `devices`, `workers`, `expose_host_port` and `port_range` are all already among the 47; the two schema fields added are *gates* on keys that already resolve. **`values` stays 47; `BUILT_IN_DEFAULTS` stays 47.**
+- **Safe — [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99):** `ResolvedTool` gains no carrier in behaviour 16 (item 3 chose `config.raw` over a `port_range` carrier), so it is not even touched.
+- **Safe — [`test_defaults.py`](tests/unit/config/test_defaults.py:1)'s literal 47-name table and its `port_range` mutable-default test:** unchanged; `effective_port_range` copies the schema default rather than aliasing any shared list.
+- **Safe — every `C101` suggestion test in [`test_schema.py`](tests/unit/config/test_schema.py:1).** Two new names, added to `ToolConfig` **only**, so they can only affect suggestions inside a `tools:` entry. Checked against [`nearest_alternative`](src/tool_swap/config/suggest.py:45)'s threshold (distance ≤ 0.3 × the longer name): [`test_unknown_key_names_key_path_and_nearest_alternative`](tests/unit/config/test_schema.py:316) — `batch_size` (10) vs `workers` (7) is threshold 3.0 against a distance of 9, and vs `expose_host_port` (16) threshold 4.8 against a distance of 14; both far outside, and `max_batch_size` still wins at distance 4. [`test_suggestion_inside_a_tool_suggests_tool_fields`](tests/unit/config/test_schema.py:412) — `titl` (4) vs `workers` is threshold 2.1 against a distance of 6, vs `expose_host_port` threshold 4.8 against a distance of 15; `ttl` still wins at distance 1. [`test_suggestion_inside_groups_suggests_group_fields`](tests/unit/config/test_schema.py:435) and [`test_unknown_key_without_close_match_lists_valid_keys`](tests/unit/config/test_schema.py:350) — `GroupConfig` and `RouterConfig` gain nothing. [`test_all_unknown_keys_in_one_file_are_reported_in_a_single_run`](tests/unit/config/test_schema.py:376) — its keys are unrelated to both new names. All unchanged.
+- **Safe — [`test_full_reference_config_validates_with_zero_errors`](tests/unit/config/test_schema.py:250).** The §3 reference config writes `workers` only under `defaults:` (where the field already exists) and writes `expose_host_port` nowhere, so adding two optional-`None` fields to `ToolConfig` cannot change its result. [`test_minimal_five_line_config_validates_with_zero_errors`](tests/unit/config/test_schema.py:262) likewise.
+- **Safe — [`test_all_documented_models_are_pydantic_models_forbidding_extra_keys`](tests/unit/config/test_schema.py:529):** adding a field does not change a model's `extra` setting.
+- **Safe — [`test_devices_as_count_gets_bespoke_message_not_pydantic_default`](tests/unit/config/test_schema.py:463):** it asserts *exactly one* `TSWAP-C1xx` error from `validate_root` for `devices: 3`. Behaviour 16 adds no schema diagnostic, and the rules are a separate layer this test does not run, so the count is unaffected. The `C520`-and-`C105` double-report of item 4 concerns `[1.5]`, which no shipped test exercises.
+- **Safe — there is no test asserting `workers:` or `expose_host_port:` is rejected inline.** Searched `test_schema.py`: no shipped test writes either key inside a `tools:` entry, so accepting them cannot contradict a committed expectation. The accept/reject boundary *does* move, which is the point of §5.2/§5.5 listing them — recorded as **A17**.
+- **Safe — behaviour 23's five-line config:** it declares no `devices`, no `workers` and no port, and inherits `devices: []` / `workers: 1` / `expose_host_port: false`, so all seven rules stay silent. With no `backend:` block, `effective_port_range` returns the schema default `[7000, 7999]`, which is well formed — no `C532`.
+- **Safe — [`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719) and [`test_validate_config_ignores_the_ambient_environment`](tests/unit/config/test_validate_registry.py:760):** `gpu_count` is data carried on the input, not an ambient read, and `effective_port_range` copies rather than mutates `raw`.
+- **Safe — [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:71)'s local `FLATTENING_TABLE` copy:** `_FLATTENING_TABLE` is not extended (item 2(c) keeps both keys out of `tool.yaml`), so the copy cannot drift further.
+
+**11. Rule/`ValidatedConfig` boundary**
+
+Every `C52x`/`C53x` rule reads only `config.tools[<key>].values["devices" | "workers" | "expose_host_port"]`, `config.raw["backend"]["port_range"]` (through `effective_port_range`), `config.gpu_count`, `config.path` and `config.line_for`. **No rule reads `config.probe`** — behaviour 16 touches no filesystem — and none reads `values["port_range"]` (item 3(a)), calls the loader, imports anything, or spawns a subprocess.
 
 ### Behaviour 17 — mounts (§6 rule 9, §5.6)
 
@@ -1249,6 +1429,10 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 **A15 (new, 2026-08-18) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 15's contract block adds `image: str | None` to the inline `ToolConfig` **only**, not to `ToolYamlConfig`. `plan/02` §5.2's field table lists `image` as a tool-level key (*"Pin a pre-built image of this tool instead of building it"*), and `TSWAP-C510`/`C511` are unimplementable without it — a config writing `image:` today is rejected by `extra="forbid"` as a `TSWAP-C101` before any rule runs, the same trap behaviour 14's `C405` fell into. **Unlike the `C405` correction, this one does move the accept/reject boundary**: `image: foo/bar:1` goes from *rejected as an unknown key* to *accepted and checked as an image source*, which is why it gets an `A`-number rather than being recorded as a plan correction. The move is toward the documented spec, not away from it, and no shipped test asserts the current rejection (verified — no `image`-as-unknown-key test exists). `ToolYamlConfig` is deliberately excluded: §4's `tool.yaml` reference has no `image:` key — image selection there is `runtime.base_image`, an M2 concern the resolver already ignores via `_PARTIAL_BLOCKS` — so adding it would invent a surface the spec does not describe. The user-visible consequence to confirm: in M1, `image:` is legal in a `tools.yaml` entry and illegal in a `tool.yaml`.
 
 **A16 (new, 2026-08-18) — NOT yet confirmed by the intake source; minor, worth one line in the PR description.** Behaviour 15's `TSWAP-C512` requires the file part of a `handler:` to end in **`.py`**. Plan line 652 enumerates four bad cases (no colon, no file, no name, bad identifier) and a missing `.py` is **not** among them, so this is a rejection the plan does not list. It is adopted because every example in `plan/02` §4 and `plan/03` writes `handler.py:Cls`, and because without it a `handler:Cls` falls through to `TSWAP-C513` with a confusing *"file not found: …/handler"* message instead of the actionable *"expected `file.py:ClassName`"*. Narrowing here is safe to relax later (relaxing would only turn a `C512` into a `C513`); the reverse would not be. The same rule also rejects a Python keyword as the class name (`handler.py:class` passes `str.isidentifier()` yet can never name a class), which sharpens the plan's *"bad identifier"* case rather than adding a new restriction.
+
+**A17 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 16's contract block adds `workers: int | None` and `expose_host_port: bool | int | None` to the inline `ToolConfig` **only** — not to `ToolYamlConfig`, and `expose_host_port` not to `DefaultsConfig` either (`workers` is already there). This is the **same trap and the same resolution as A15**: `plan/02` §5.5's field table lists `workers` as a tool-level key and §5.2 lists `expose_host_port` (*"bool | int, `false`, Publish for debugging; `true` picks from `backend.port_range`"*), yet neither is a field of `ToolConfig` today, so a tool writing either is rejected by `extra="forbid"` as a `TSWAP-C101` before any rule runs — which makes `TSWAP-C523`, `TSWAP-C530` and `TSWAP-C531` unreachable for an inline tool. **It moves the accept/reject boundary** (both keys go from *rejected as unknown* to *accepted and checked*), which is why it takes an `A`-number rather than being a plan correction. The move is toward the documented spec, and no shipped test asserts the current rejection (verified — `test_schema.py` writes neither key inside a `tools:` entry). Two deliberate exclusions: `DefaultsConfig` does **not** gain `expose_host_port`, because a defaults-level published port collides across every tool by construction and would make `C530` fire on every multi-tool config — the key is inherently per-tool; and `ToolYamlConfig` gains neither, following A14/A15, since §4's reference authors neither and `batching.workers` would additionally need a `_FLATTENING_TABLE` entry. The user-visible consequence to confirm: in M1, `workers:` and `expose_host_port:` are legal in a `tools.yaml` tool entry, `workers:` remains legal in `defaults:`, `expose_host_port:` remains illegal in `defaults:`, and both remain illegal in a `tool.yaml`.
+
+**Behaviour 16 note (2026-08-19) — `TSWAP-C521` never fires in production in M1. Not an assumption; a consequence recorded for visibility.** The GPU count reaches the rules as `ValidatedConfig.gpu_count: int | None = None`, and **nothing in M1 populates it**: counting GPUs needs `pynvml` or an `nvidia-smi` subprocess, and the config layer must acquire neither (§2 — `tswap validate` runs in CI with no Docker and no GPU). `None` means "unknown", the rule is skipped silently, and `C521` is exercised only where a test injects a count. A real count would come from **M5 preflight** (which already owns host-facing checks and is where these rules get *moved*, guardrail 13), or from the **CLI at behaviour 21** if wired sooner; M1 pins the seam only and places no obligation on behaviour 21. This satisfies §6 rule 7 honestly — a validator that cannot see the host says nothing about it — and adding a count later is one keyword argument at one construction site.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
