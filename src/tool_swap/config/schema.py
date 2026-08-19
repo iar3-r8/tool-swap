@@ -177,6 +177,23 @@ class ToolConfig(BaseModel):
     group: str | None = None
     ttl: int | None = None
     devices: list[int] | None = None
+    workers: int | None = Field(
+        default=None,
+        description=(
+            "Number of runtime-server workers per tool (plan/02 §5.5). "
+            "With a non-empty devices: list, workers > 1 multiplies the "
+            "tool's VRAM invisibly to the scheduler (TSWAP-C523)."
+        ),
+    )
+    expose_host_port: bool | int | None = Field(
+        default=None,
+        description=(
+            "Publish a host port for debugging (plan/02 §5.2): false "
+            "publishes nothing, true auto-allocates from "
+            "backend.port_range, an int publishes exactly that port "
+            "(TSWAP-C530 / TSWAP-C531)."
+        ),
+    )
     keep_warm: bool | None = None
     max_batch_size: int | None = None
     max_wait_ms: int | None = None

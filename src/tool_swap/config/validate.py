@@ -23,7 +23,7 @@ import string
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeGuard
 
 from tool_swap import __version__
 from tool_swap.config.errors import (
@@ -40,7 +40,7 @@ from tool_swap.config.resolver import (  # noqa: F401  (re-export)
     RESERVED_KEYS,
     ResolvedTool,
 )
-from tool_swap.config.schema import GroupConfig
+from tool_swap.config.schema import BackendConfig, GroupConfig
 from tool_swap.config.suggest import nearest_alternative
 
 #: Diagnostic code format; a rule id IS the code its diagnostics carry
@@ -234,6 +234,10 @@ class ValidatedConfig:
         probe: the filesystem predicates the rules may consult (default:
             :data:`REAL_FILESYSTEM`); behaviour 15's trailing,
             keyword-only, defaulted field.
+        gpu_count: the GPUs visible on this host, or ``None`` when
+            unknown (default); behaviour 16's trailing, keyword-only,
+            defaulted field.  Nothing in M1 populates it, so ``TSWAP-C521``
+            is skipped silently in production.
     """
 
     tools: dict[str, ResolvedTool]
@@ -241,6 +245,7 @@ class ValidatedConfig:
     line_for: Callable[[str], int | None] = field(default=_no_line, kw_only=True)
     path: Path = field(default=Path("tools.yaml"), kw_only=True)
     probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
+    gpu_count: int | None = field(default=None, kw_only=True)
 
 
 #: The module-level registry of rules.  A single live object (not a
@@ -340,6 +345,32 @@ def effective_groups(raw: dict[str, object]) -> dict[str, dict[str, object]]:
     if not isinstance(block, dict):
         return {}
     return copy.deepcopy(block)
+
+
+def effective_port_range(raw: dict[str, object]) -> object:
+    """The backend port range a rule should check against (behaviour 16).
+
+    The behaviour-12 :func:`effective_groups` precedent applied to
+    ``backend.port_range``: the ``backend:`` block is a root block no
+    resolver layer carries, so the rules read it through the raw mapping,
+    never through ``values["port_range"]`` (that key is one of the 47
+    built-ins and is always a lie).  The value is returned **as
+    authored** — deliberately not narrowed to ``list[int]`` — because
+    judging its shape is ``TSWAP-C532``'s job.  When the ``backend:``
+    block or its ``port_range`` key is absent, a fresh copy of the
+    schema's own field default is returned, never an alias of it.
+
+    Args:
+        raw: the raw root YAML mapping (never mutated).
+
+    Returns:
+        The authored ``port_range`` value, or a fresh copy of the
+        ``BackendConfig.port_range`` default.
+    """
+    backend = raw.get("backend")
+    if not isinstance(backend, dict) or "port_range" not in backend:
+        return list(BackendConfig.model_fields["port_range"].default)
+    return backend["port_range"]
 
 
 def _effective_group(tool: ResolvedTool) -> str | None:
@@ -1865,6 +1896,528 @@ TSWAP_C516_RULE: Final[Rule] = _C516Rule(
 )
 
 
+# ---------------------------------------------------------------------------
+# Behaviour 16 — devices, workers, host ports (§6 rules 4c, 7, 8)
+# ---------------------------------------------------------------------------
+
+
+def _is_device_index(value: object) -> TypeGuard[int]:
+    """True for a value usable as a device index (an ``int``, not a bool).
+
+    ``bool`` is tested before ``int`` because ``True`` is an ``int`` in
+    Python and ``devices: [true]`` is a mistake, not GPU 1 (plan item 4).
+
+    Args:
+        value: an as-authored ``devices`` entry.
+
+    Returns:
+        True when ``value`` is an ``int`` that is not a ``bool`` (narrows
+        the argument to ``int`` for the caller).
+    """
+    return not isinstance(value, bool) and isinstance(value, int)
+
+
+def _range_endpoints(raw: dict[str, object]) -> tuple[int, int] | None:
+    """The effective ``backend.port_range`` as judged endpoints, or ``None``.
+
+    The shape judgement ``TSWAP-C531`` needs before it may compare a port
+    against the range: a list of exactly two ints, each within
+    ``1..65535``, with ``low <= high``.  Any malformed shape answers
+    ``None`` and C531's range comparison is suppressed for the run (a
+    malformed range cannot judge any port — the C512-suppresses-C513
+    pattern); the port-0 clause is not arithmetic and is unaffected.
+
+    Args:
+        raw: the raw root YAML mapping (never mutated).
+
+    Returns:
+        The ``(low, high)`` endpoints when the range is well-formed, else
+        ``None``.
+    """
+    value = effective_port_range(raw)
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    low, high = value[0], value[1]
+    for endpoint in (low, high):
+        if not _is_device_index(endpoint):
+            return None
+        if not 1 <= endpoint <= 65535:
+            return None
+    if low > high:
+        return None
+    return (low, high)
+
+
+class _C520Rule(Rule):
+    """``TSWAP-C520``: a negative or non-integer device index."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``devices`` entry that is not a non-negative int.
+
+        The rules never see Pydantic's output — ``values["devices"]``
+        holds the entries as authored (a ``"0"`` stays the string
+        ``"0"`` even though the schema's lax mode coerced it) — so the
+        entry is judged itself, with ``bool`` excluded before the ``int``
+        test.  A ``devices`` value that is not a list is skipped
+        silently: ``TSWAP-C104`` owns it with a bespoke message.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.devices.<i>`` (0-based, dotted-numeric), naming
+            the tool, the entry (via ``repr``) and its position.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            for i, value in enumerate(devices):
+                if _is_device_index(value) and value >= 0:
+                    continue
+                message = (
+                    f"Tool {key!r} has an invalid device index {value!r} "
+                    f"at position {i} in devices:"
+                )
+                yaml_path = f"tools.{key}.devices.{i}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C521Rule(Rule):
+    """``TSWAP-C521``: a device index exceeding the visible GPUs."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn for every index at or above the injected GPU count.
+
+        Skipped entirely and silently when ``config.gpu_count`` is
+        ``None`` (unknown — the M1 production default, which nothing
+        populates); ``gpu_count == 0`` is a legitimate "no GPUs on this
+        host" value and warns for every index.  Negatives and non-int
+        entries belong to ``TSWAP-C520`` (one mistake, one diagnostic).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING per offending index at
+            ``tools.<key>.devices.<i>``, naming the index, the count
+            seen, and that the config may target another machine.
+        """
+        count = config.gpu_count
+        if count is None:
+            return []
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            for i, value in enumerate(devices):
+                if not _is_device_index(value) or value < 0:
+                    continue
+                if value < count:
+                    continue
+                message = (
+                    f"Tool {key!r} uses device index {value}, but only "
+                    f"{count} GPU(s) are visible on this host; the config "
+                    "may target another machine"
+                )
+                yaml_path = f"tools.{key}.devices.{i}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C522Rule(Rule):
+    """``TSWAP-C522``: a duplicate index within one tool's ``devices``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn once per tool whose ``devices`` lists an index twice.
+
+        Compares only ``int`` non-``bool`` entries (a duplicated
+        ``"0"`` is ``TSWAP-C520``'s problem twice over).  One diagnostic
+        per tool, at the LIST rather than at an entry — the duplication
+        is a property of the list, and picking "the second occurrence"
+        would be arbitrary.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.devices``,
+            naming every duplicated index.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            counts: dict[int, int] = {}
+            for value in devices:
+                if _is_device_index(value):
+                    counts[value] = counts.get(value, 0) + 1
+            duplicates = sorted(index for index, n in counts.items() if n > 1)
+            if not duplicates:
+                continue
+            message = (
+                f"Tool {key!r} lists duplicate device index(es) "
+                f"{', '.join(str(index) for index in duplicates)} in "
+                "devices:"
+            )
+            yaml_path = f"tools.{key}.devices"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C523Rule(Rule):
+    """``TSWAP-C523``: ``workers > 1`` AND a non-empty ``devices`` list."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when multiple workers multiply GPU VRAM.
+
+        Fires when ``workers`` is an ``int`` (not a ``bool``) ``> 1``
+        AND ``devices`` is a non-empty list.  ``devices: []`` (or absent)
+        with ``workers: 4`` yields nothing: that is the CPU case, where
+        multiple workers are the intended way to use more cores.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.workers``
+            stating that VRAM multiplies by the worker count, invisibly
+            to the scheduler.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            workers = tool.values.get("workers")
+            if not _is_device_index(workers) or workers <= 1:
+                continue
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list) or not devices:
+                continue
+            message = (
+                f"Tool {key!r} runs {workers} workers with a non-empty "
+                "devices: list, so the workers multiply its VRAM, "
+                "invisibly to the scheduler"
+            )
+            yaml_path = f"tools.{key}.workers"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C530Rule(Rule):
+    """``TSWAP-C530``: two tools sharing an explicit host port."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every host port claimed by two or more tools.
+
+        The operand set is every tool whose ``expose_host_port`` is an
+        ``int`` and not a ``bool`` (``bool``-before-``int``: ``true``
+        auto-allocates and participates in neither check; port 0 IS in
+        the set — no 0-exemption).  One diagnostic per colliding port,
+        at ``tools`` — the collision belongs to no single tool (the
+        ``_C211Rule`` duplicate-name precedent).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per colliding port at ``tools``, naming the port
+            and every tool claiming it.
+        """
+        claimants: dict[int, list[str]] = {}
+        for key, tool in config.tools.items():
+            value = tool.values.get("expose_host_port")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            claimants.setdefault(value, []).append(key)
+        findings: list[Diagnostic] = []
+        for port, keys in claimants.items():
+            if len(keys) < 2:
+                continue
+            message = (
+                f"Host port {port} is claimed by multiple tools: "
+                f"{', '.join(repr(key) for key in keys)}"
+            )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, "tools"),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C531Rule(Rule):
+    """``TSWAP-C531``: an explicit host port outside ``backend.port_range``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every explicit port the effective range cannot host.
+
+        Fires for every tool whose ``expose_host_port`` is an ``int``
+        and not a ``bool`` (``true`` auto-allocates and participates in
+        neither check — nothing is allocated at validate time).  Port
+        ``0`` is an error UNCONDITIONALLY, with its dedicated clause:
+        the objection is not arithmetic, so it fires even against a
+        range that contains 0.  Any other port outside the effective
+        range (endpoints inclusive, via
+        :func:`effective_port_range` — never
+        ``values["port_range"]``) is an error naming the port and both
+        endpoints; a malformed range suppresses that comparison for the
+        run (``TSWAP-C532`` owns it — the C512-suppresses-C513 pattern).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per offending tool at
+            ``tools.<key>.expose_host_port``.
+        """
+        endpoints = _range_endpoints(config.raw)
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("expose_host_port")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            yaml_path = f"tools.{key}.expose_host_port"
+            if value == 0:
+                message = (
+                    f"Tool {key!r} sets expose_host_port 0; 0 tells "
+                    "Docker to pick any free port, and tool-swap does "
+                    "not support that spelling — write true to "
+                    "auto-allocate from backend.port_range, or an "
+                    "explicit port"
+                )
+            elif endpoints is None:
+                continue  # TSWAP-C532 owns the malformed range
+            else:
+                low, high = endpoints
+                if low <= value <= high:
+                    continue
+                message = (
+                    f"Tool {key!r} exposes host port {value}, outside "
+                    f"backend.port_range [{low}, {high}]"
+                )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C532Rule(Rule):
+    """``TSWAP-C532``: an inverted or malformed ``backend.port_range``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Judge the authored range shape; one diagnostic per problem.
+
+        The schema's ``list[int]`` catches non-int entries but not the
+        length, the bounds or the order, so this rule owns: a length
+        other than 2 (naming the length found), a non-``int`` (or
+        ``bool``) entry, an endpoint outside ``1..65535``, and
+        ``low > high`` (naming both values).  ``low == high`` is a
+        tight but legitimate one-port range.  A non-LIST value is
+        skipped silently — the schema's ``TSWAP-C105`` owns it.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per problem at ``backend.port_range`` (the first
+            ``yaml_path`` in M1 rooted at ``backend``).
+        """
+        value = effective_port_range(config.raw)
+        if not isinstance(value, list):
+            return []
+        yaml_path = "backend.port_range"
+        if len(value) != 2:
+            message = (
+                f"backend.port_range has {len(value)} entries; exactly "
+                "two are required, [low, high]"
+            )
+            return [
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            ]
+        findings: list[Diagnostic] = []
+        for i, endpoint in enumerate(value):
+            if _is_device_index(endpoint):
+                continue
+            message = f"backend.port_range entry {i} is {endpoint!r}, not an int"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        low, high = value[0], value[1]
+        if _is_device_index(low) and not 1 <= low <= 65535:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range low endpoint {low} is not a "
+                        "port number (outside 1..65535)"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        if _is_device_index(high) and not 1 <= high <= 65535:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range high endpoint {high} is not a "
+                        "port number (outside 1..65535)"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        if _is_device_index(low) and _is_device_index(high) and low > high:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range is inverted: low {low} is "
+                        f"greater than high {high}"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C520`` — a negative or non-integer device index (§6 rule 7).
+TSWAP_C520_RULE: Final[Rule] = _C520Rule(
+    id="TSWAP-C520",
+    remedy=(
+        "Replace every device index with a non-negative integer GPU "
+        "index, wherever the list was set — the tool's devices: entry, "
+        "the defaults: block, or the tool's group"
+    ),
+)
+
+#: ``TSWAP-C521`` — a device index exceeding the visible GPUs (§6 rule 7,
+#: WARNING: the config may target another machine).
+TSWAP_C521_RULE: Final[Rule] = _C521Rule(
+    id="TSWAP-C521",
+    severity=Severity.WARNING,
+    remedy=(
+        "Use device indices below the visible GPU count on the target "
+        "host, or deploy on a host with enough GPUs: this config may "
+        "target another machine"
+    ),
+)
+
+#: ``TSWAP-C522`` — a duplicate index within one tool's devices (§6 rule 7,
+#: WARNING).
+TSWAP_C522_RULE: Final[Rule] = _C522Rule(
+    id="TSWAP-C522",
+    severity=Severity.WARNING,
+    remedy=(
+        "Remove the duplicate device index from the tool's devices: "
+        "list, or from the defaults: block or group that supplies it"
+    ),
+)
+
+#: ``TSWAP-C523`` — workers > 1 with a non-empty devices list (§6 rule 4c,
+#: WARNING: VRAM multiplies invisibly to the scheduler).
+TSWAP_C523_RULE: Final[Rule] = _C523Rule(
+    id="TSWAP-C523",
+    severity=Severity.WARNING,
+    remedy=(
+        "Reduce workers: to 1, or keep workers: and size the group's "
+        "max_resident: so the multiplied VRAM still fits"
+    ),
+)
+
+#: ``TSWAP-C530`` — two tools sharing an explicit host port (§6 rule 8).
+TSWAP_C530_RULE: Final[Rule] = _C530Rule(
+    id="TSWAP-C530",
+    remedy=(
+        "Give each tool a distinct expose_host_port int, or set true to "
+        "auto-allocate from backend.port_range"
+    ),
+)
+
+#: ``TSWAP-C531`` — an explicit host port outside backend.port_range
+#: (§6 rule 8; port 0 unconditionally).
+TSWAP_C531_RULE: Final[Rule] = _C531Rule(
+    id="TSWAP-C531",
+    remedy=(
+        "Pick an expose_host_port inside backend.port_range (both "
+        "endpoints inclusive), or true for auto-allocation; 0 is not a "
+        "supported spelling"
+    ),
+)
+
+#: ``TSWAP-C532`` — an inverted or malformed backend.port_range (§6 rule 8).
+TSWAP_C532_RULE: Final[Rule] = _C532Rule(
+    id="TSWAP-C532",
+    remedy=(
+        "Write backend.port_range as a two-int list [low, high] with "
+        "1 <= low <= high <= 65535 (low == high is a legal one-port "
+        "range)"
+    ),
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -1892,6 +2445,13 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C514_RULE,
     TSWAP_C515_RULE,
     TSWAP_C516_RULE,
+    TSWAP_C520_RULE,
+    TSWAP_C521_RULE,
+    TSWAP_C522_RULE,
+    TSWAP_C523_RULE,
+    TSWAP_C530_RULE,
+    TSWAP_C531_RULE,
+    TSWAP_C532_RULE,
 )
 
 
