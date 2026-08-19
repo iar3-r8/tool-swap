@@ -45,6 +45,17 @@ _KNOWN_BLOCKS: Final[frozenset[str]] = frozenset(
 #: are M2 concerns M1 does not own (plan, behaviour 14, block 3).
 _PARTIAL_BLOCKS: Final[frozenset[str]] = frozenset({"runtime"})
 
+#: tool.yaml nested keys that are RECOGNISED (no ``TSWAP-C106``) but
+#: flatten to NO flat field: ``batching.enabled`` is consumed by
+#: :func:`_apply_batching_disabled_override` (behaviour 18, item 6(b))
+#: and never enters ``values``, so the 47-key set stays intact.  Kept
+#: separate from :data:`_FLATTENING_TABLE` (whose values are field
+#: names) and from :data:`_PARTIAL_BLOCKS` (adding ``batching`` there
+#: would silence ``TSWAP-C106`` for every unmapped ``batching`` key).
+_FLATTENING_IGNORED: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("batching", "enabled")}
+)
+
 #: Withdrawn/reserved keys behaviour 14 rejects, mapped to the layers the
 #: schema reserves them at (mirrors the schema placement table).  Detected
 #: by PRESENCE in a layer mapping, never by value ("soft_ttl: null" is
@@ -231,6 +242,11 @@ def resolve_tool(
             _resolve_ttl(layers, layers[2], values, origins, name, diagnostics)
         else:
             _resolve_wholesale(layers, values, origins, field)
+    # Behaviour 18, item 6(b): the ADR-0005 translation — a pure
+    # function of the already-deep-copied layers, applied after the
+    # 47-key resolution so ``enabled: false`` beats ``max_batch_size``
+    # at every layer and nothing else.
+    _apply_batching_disabled_override(tool_yaml, layers, values, origins)
 
     # --- behaviour 13 carrier fields (outside ``values`` on purpose) ---
     description_winner = _winner_index_safe(layers, "description")
@@ -478,6 +494,10 @@ def _flatten_tool_yaml(
         for key, nested in value.items():
             target = _FLATTENING_TABLE.get((block, key))
             if target is None:
+                if (block, key) in _FLATTENING_IGNORED:
+                    # Recognised, but it flattens to no flat field: the
+                    # resolver consumes it as a translation input.
+                    continue
                 if block in _PARTIAL_BLOCKS:
                     # Unmapped keys of a partial block are a later
                     # milestone's concern; ignore silently (no C106).
@@ -489,6 +509,48 @@ def _flatten_tool_yaml(
         if key in BUILT_IN_DEFAULTS:
             flat[key] = copy.deepcopy(value)
     return flat
+
+
+def _apply_batching_disabled_override(
+    tool_yaml: Mapping[str, object] | None,
+    layers: Sequence[_Layer],
+    values: dict[str, object],
+    origins: OriginMap,
+) -> None:
+    """Apply ``batching.enabled: false`` → ``max_batch_size: 1`` (ADR-0005).
+
+    When the tool.yaml ``batching:`` block carries ``enabled`` exactly
+    ``False``, ``max_batch_size`` becomes ``1`` regardless of any
+    authored value at any layer, and its recorded origin becomes the
+    ``enabled`` key's (the line the author must edit to change the
+    outcome); every other field is untouched — "``max_batch_size: 1``,
+    and nothing else" is taken literally.  ``enabled`` never enters
+    ``values``.  ``enabled: true``, an absent key, an absent block or a
+    non-bool value are all no-ops (absent means absent).
+
+    Args:
+        tool_yaml: the tool's raw ``tool.yaml`` mapping, or ``None``.
+        layers: the layers, most specific first (the last is the
+            built-in baseline, excluded from the shadowed list).
+        values: the resolved 47-key mapping to override in place.
+        origins: the origin map to re-record ``max_batch_size`` into.
+    """
+    if tool_yaml is None:
+        return
+    batching = tool_yaml.get("batching")
+    if not isinstance(batching, Mapping):
+        return
+    if batching.get("enabled") is not False:
+        return
+    values["max_batch_size"] = 1
+    enabled_origin = Origin(level=OriginLevel.TOOL_YAML, source="tool.yaml")
+    shadowed = [
+        layer.origin_for("max_batch_size")
+        for layer in layers[:-1]
+        if "max_batch_size" in layer.data
+        and layer.origin_for("max_batch_size") != enabled_origin
+    ]
+    origins.record("max_batch_size", enabled_origin, overrides=shadowed)
 
 
 def _unmapped_key(tool_name: str, block: str, key: str) -> Diagnostic:

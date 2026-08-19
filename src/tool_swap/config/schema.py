@@ -195,6 +195,23 @@ class ToolConfig(BaseModel):
         ),
     )
     keep_warm: bool | None = None
+    autostart: bool | None = Field(
+        default=None,
+        description=(
+            "Whether a request to a stopped tool starts it (plan/02 §5.3): "
+            "false returns 503 for a stopped tool instead of starting it. "
+            "Contradicts keep_warm: true (TSWAP-C600)."
+        ),
+    )
+    max_concurrent: int | None = Field(
+        default=None,
+        description=(
+            "Optional cap on in-flight requests to a READY tool "
+            "(plan/02 §5.3): 429 beyond it. A cap below 1 rejects every "
+            "request (TSWAP-C602) — use autostart: false to disable a "
+            "tool."
+        ),
+    )
     max_batch_size: int | None = None
     max_wait_ms: int | None = None
     mounts: list[str] | None = None

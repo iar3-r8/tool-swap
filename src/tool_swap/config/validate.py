@@ -36,6 +36,7 @@ from tool_swap.config.errors import (
 # ``RESERVED_KEYS`` is defined in the resolver (behaviour 14, block 2) and
 # re-exported here as part of this module's pinned public API (the
 # behaviour-14 test file imports it from ``validate``).
+from tool_swap.config.origin import OriginLevel
 from tool_swap.config.resolver import (  # noqa: F401  (re-export)
     RESERVED_KEYS,
     ResolvedTool,
@@ -2760,6 +2761,303 @@ TSWAP_C543_RULE: Final[Rule] = _C543Rule(
 )
 
 
+def _origin_phrase(tool: ResolvedTool, field: str) -> str:
+    """The phrase a C60x message uses to name the layer that set ``field``.
+
+    A TOTAL helper (never raises): ``OriginMap.winning`` raises
+    ``KeyError`` for an unrecorded path, and this translates that into
+    the pinned ``origin unrecorded`` phrase rather than letting it
+    surface as a ``TSWAP-C999`` from inside a rule.  ``Origin.render()``
+    is deliberately not used: it is ``config show``'s renderer, and with
+    the resolver's fixed source strings it doubles the layer word
+    (``"inline (inline)"``), which reads as a bug inside a sentence.
+
+    The phrases are pinned by behaviour 18, item 2(b): ``INLINE`` →
+    ``set inline``; ``TOOL_YAML`` → ``set in the tool's tool.yaml``;
+    ``DEFAULTS`` with a ``groups.<name>.<field>`` source →
+    ``set in group '<name>'``; any other ``DEFAULTS`` source →
+    ``set in the defaults: block``; ``BUILT_IN`` → ``the built-in
+    default``.
+
+    Args:
+        tool: the resolved tool whose origin map is read.
+        field: the flat field name, as the resolver records it.
+
+    Returns:
+        The pinned phrase naming the layer that set ``field``.
+    """
+    try:
+        origin = tool.origins.winning(field)
+    except KeyError:
+        return "origin unrecorded"
+    if origin.level is OriginLevel.INLINE:
+        return "set inline"
+    if origin.level is OriginLevel.TOOL_YAML:
+        return "set in the tool's tool.yaml"
+    if origin.level is OriginLevel.DEFAULTS:
+        if origin.source.startswith("groups."):
+            group_name = origin.source.split(".", 2)[1]
+            return f"set in group {group_name!r}"
+        return "set in the defaults: block"
+    return "the built-in default"
+
+
+class _C600Rule(Rule):
+    """``TSWAP-C600``: ``keep_warm: true`` AND ``autostart: false``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool that can never start as configured.
+
+        Fires when ``keep_warm is True`` AND ``autostart is False`` —
+        identity against the bool singletons, not truthiness: a non-bool
+        on either key is skipped silently (the schema's ``TSWAP-C105``
+        owns it).  Layer-blind on purpose: a ``defaults:``-level
+        ``autostart: false`` plus one ``keep_warm: true`` tool is an
+        error for that tool, and the message cites the origin of EACH
+        half, since the two halves frequently come from different
+        layers.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one ERROR per tool at ``tools.<key>.keep_warm``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.values.get("keep_warm") is not True:
+                continue
+            if tool.values.get("autostart") is not False:
+                continue
+            message = (
+                f"Tool {key!r} sets keep_warm: true "
+                f"({_origin_phrase(tool, 'keep_warm')}) with "
+                f"autostart: false ({_origin_phrase(tool, 'autostart')}); "
+                "keep_warm starts the tool at boot and exempts it from "
+                "TTL, while autostart: false forbids starting it "
+                "automatically at all"
+            )
+            yaml_path = f"tools.{key}.keep_warm"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C601Rule(Rule):
+    """``TSWAP-C601``: ``keep_warm: true`` AND an EXPLICIT ``ttl > 0``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when a keep-warm tool carries a dead ``ttl`` it authored.
+
+        Fires when all three hold: ``keep_warm is True``; ``ttl`` is an
+        ``int``/``float`` (not a ``bool``) ``> 0``; and the ttl's
+        winning origin is ``INLINE`` or ``TOOL_YAML`` — authored on this
+        tool, not inherited from ``defaults:`` or the built-in (the
+        rejected wider reading: a ``defaults.ttl`` written once for a
+        dozen tools expresses no expectation about the keep-warm one).
+        A non-numeric ``ttl`` or an unrecorded ttl origin is skipped
+        silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.keep_warm``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.values.get("keep_warm") is not True:
+                continue
+            ttl = tool.values.get("ttl")
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                continue
+            if ttl <= 0:
+                continue
+            try:
+                ttl_level = tool.origins.winning("ttl").level
+            except KeyError:
+                continue
+            if ttl_level not in (OriginLevel.INLINE, OriginLevel.TOOL_YAML):
+                continue
+            message = (
+                f"Tool {key!r} sets keep_warm: true "
+                f"({_origin_phrase(tool, 'keep_warm')}) with ttl {ttl} "
+                f"({_origin_phrase(tool, 'ttl')}); keep_warm exempts the "
+                "tool from TTL, so the ttl value has no effect"
+            )
+            yaml_path = f"tools.{key}.keep_warm"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C602Rule(Rule):
+    """``TSWAP-C602``: ``max_concurrent`` at or below zero."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag a concurrency cap that rejects every request.
+
+        Fires when ``max_concurrent`` is an ``int`` (not a ``bool``)
+        ``<= 0`` — widened from ``== 0``: a negative cap is the same
+        mistake with the same consequence, and the message names the
+        actual value found.  ``None`` is the documented "uncapped"
+        built-in and is skipped silently, as is a non-int.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one ERROR per tool at
+            ``tools.<key>.max_concurrent``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("max_concurrent")
+            if value is None or isinstance(value, bool):
+                continue
+            if not isinstance(value, int) or value > 0:
+                continue
+            message = (
+                f"Tool {key!r} sets max_concurrent {value} "
+                f"({_origin_phrase(tool, 'max_concurrent')}); a cap "
+                "below 1 rejects every request with 429, so the tool "
+                "can never serve"
+            )
+            yaml_path = f"tools.{key}.max_concurrent"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: The C603 range table, in plan table order (item 6(a)):
+#: ``(field, range phrase the message states, is-out-of-range)``.
+#: ``max_wait_ms: 0`` is legal (flush immediately); ``1`` is the floor
+#: for ``max_batch_size`` / ``workers`` / the six timeouts.
+_C603_RANGES: Final[tuple[tuple[str, str, Callable[[float], bool]], ...]] = (
+    ("max_batch_size", ">= 1", lambda value: value < 1),
+    ("max_wait_ms", ">= 0", lambda value: value < 0),
+    ("workers", ">= 1", lambda value: value < 1),
+    ("start_timeout", "> 0", lambda value: value <= 0),
+    ("ready_timeout", "> 0", lambda value: value <= 0),
+    ("queue_timeout", "> 0", lambda value: value <= 0),
+    ("request_timeout", "> 0", lambda value: value <= 0),
+    ("drain_timeout", "> 0", lambda value: value <= 0),
+    ("stop_timeout", "> 0", lambda value: value <= 0),
+)
+
+
+class _C603Rule(Rule):
+    """``TSWAP-C603``: an out-of-range batching or timeout number."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every out-of-range value, one diagnostic per key.
+
+        One table-driven rule over the nine fields of
+        :data:`_C603_RANGES`, iterated per tool in table order
+        (deterministic, values-independent).  Each check is
+        ``bool``-before-``numeric`` and a non-numeric value is skipped
+        silently (the schema's ``TSWAP-C105`` owns it).  Each
+        diagnostic names its own field, its own value, its own range
+        and its own origin — each is a separate edit.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per offending key at ``tools.<key>.<field>``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            for range_field, range_phrase, out_of_range in _C603_RANGES:
+                value = tool.values.get(range_field)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if not out_of_range(value):
+                    continue
+                message = (
+                    f"Tool {key!r} sets {range_field} {value} "
+                    f"({_origin_phrase(tool, range_field)}); {range_field} "
+                    f"must be {range_phrase}"
+                )
+                yaml_path = f"tools.{key}.{range_field}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+#: ``TSWAP-C600`` — keep_warm: true plus autostart: false (§6 rule 11).
+TSWAP_C600_RULE: Final[Rule] = _C600Rule(
+    id="TSWAP-C600",
+    remedy=(
+        "Resolve the contradiction, one of two: set keep_warm: false — "
+        "the tool then starts on demand and idle-stops after ttl — or "
+        "set autostart: true — the tool then starts at boot and stays "
+        "resident, exempt from TTL. Either key may live in the tool's "
+        "entry or the defaults: block"
+    ),
+)
+
+#: ``TSWAP-C601`` — keep_warm: true plus an explicit ttl > 0 (§6 rule 11,
+#: WARNING).
+TSWAP_C601_RULE: Final[Rule] = _C601Rule(
+    id="TSWAP-C601",
+    severity=Severity.WARNING,
+    remedy=(
+        "Remove the ttl from this tool if keep_warm is what you want, "
+        "or set keep_warm: false if the idle timeout is what you want"
+    ),
+)
+
+#: ``TSWAP-C602`` — max_concurrent at or below zero (§6 rule 11).
+TSWAP_C602_RULE: Final[Rule] = _C602Rule(
+    id="TSWAP-C602",
+    remedy=(
+        "Set max_concurrent to a positive integer, or drop the key to "
+        "leave the tool uncapped; use autostart: false to disable a "
+        "tool"
+    ),
+)
+
+#: ``TSWAP-C603`` — out-of-range batching or timeout numbers (§6 rule 11).
+TSWAP_C603_RULE: Final[Rule] = _C603Rule(
+    id="TSWAP-C603",
+    remedy=(
+        "Set the named field to a value in its range: max_batch_size "
+        ">= 1, max_wait_ms >= 0, workers >= 1, and each of "
+        "start_timeout, ready_timeout, queue_timeout, request_timeout, "
+        "drain_timeout and stop_timeout > 0"
+    ),
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -2798,6 +3096,10 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C541_RULE,
     TSWAP_C542_RULE,
     TSWAP_C543_RULE,
+    TSWAP_C600_RULE,
+    TSWAP_C601_RULE,
+    TSWAP_C602_RULE,
+    TSWAP_C603_RULE,
 )
 
 
