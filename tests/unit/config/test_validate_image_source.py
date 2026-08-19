@@ -606,7 +606,7 @@ def test_c510_requirements_never_count_and_requirements_only_is_c511() -> (
     """
     register(TSWAP_C510_RULE)
     register(TSWAP_C511_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -706,7 +706,7 @@ def test_c511_handler_carrier_set_from_tool_yaml_suppresses() -> None:
     """
     register(TSWAP_C510_RULE)
     register(TSWAP_C511_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -771,7 +771,7 @@ def test_c512_valid_form_produces_nothing() -> None:
     """
     register(TSWAP_C512_RULE)
     register(TSWAP_C513_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -967,7 +967,7 @@ def test_c513_resolves_relative_to_base_dir_when_set() -> None:
     ``/srv/tools/t1/handler.py``, never at the config-directory root.
     """
     register(TSWAP_C513_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -1003,7 +1003,7 @@ def test_c513_resolves_relative_to_config_path_parent_when_base_dir_none() -> (
     ``/etc/tswap/handler.py``.
     """
     register(TSWAP_C513_RULE)
-    probe = _FakeProbe(files={Path("/etc/tswap/handler.py")})
+    probe = _FakeProbe(files={Path("/etc/tswap/handler.py"): True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -1104,7 +1104,7 @@ def test_c513_existing_handler_file_produces_nothing() -> None:
     """
     register(TSWAP_C513_RULE)
     register(TSWAP_C516_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -1214,7 +1214,7 @@ def test_c514_existing_requirements_produces_nothing() -> None:
     Assertion: an empty report.
     """
     register(TSWAP_C514_RULE)
-    probe = _FakeProbe(files={_BASE / "requirements.txt"})
+    probe = _FakeProbe(files={_BASE / "requirements.txt": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -1527,7 +1527,7 @@ def test_c516_handler_inside_base_yields_no_warning() -> None:
     """
     register(TSWAP_C516_RULE)
     register(TSWAP_C513_RULE)
-    probe = _FakeProbe(files={_BASE / "shared" / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "shared" / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
@@ -1560,7 +1560,7 @@ def test_c516_dotdot_that_cancels_out_yields_no_warning() -> None:
     """
     register(TSWAP_C516_RULE)
     register(TSWAP_C513_RULE)
-    probe = _FakeProbe(files={_BASE / "handler.py"})
+    probe = _FakeProbe(files={_BASE / "handler.py": True})
     cfg = _config(
         tools={
             "t1": _tool(
