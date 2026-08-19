@@ -117,6 +117,13 @@ _EXPECTED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C601",
     "TSWAP-C602",
     "TSWAP-C603",
+    # Behaviour 19 (D9 group starvation, group capacity) extends the set
+    # here.  NOTE: TSWAP-C611 was WITHDRAWN before implementation
+    # (2026-08-19, A20/item 0) - its predicate already ships as TSWAP-C223 -
+    # so the numbering intentionally jumps C610 -> C612 and the gap stays.
+    "TSWAP-C610",
+    "TSWAP-C612",
+    "TSWAP-C613",
 )
 
 
