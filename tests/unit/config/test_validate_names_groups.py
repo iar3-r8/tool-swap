@@ -136,6 +136,11 @@ _LANDED_BUILTIN_IDS: Final[tuple[str, ...]] = (
     "TSWAP-C541",
     "TSWAP-C542",
     "TSWAP-C543",
+    # Behaviour 18 (contradictions) extends the set here.
+    "TSWAP-C600",
+    "TSWAP-C601",
+    "TSWAP-C602",
+    "TSWAP-C603",
 )
 
 #: The pinned C210 reason phrase (plan line 214).
