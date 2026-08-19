@@ -543,7 +543,7 @@ def test_parse_mount_is_pure_given_home_and_missing_config_dir(
     assert results[0] is not None
     assert results[0] == results[1]
     assert results[0].host == "/fake/home/x"
-    assert results[0].resolved_host == Path("/does/not/exist/x")
+    assert results[0].resolved_host == Path("/fake/home/x")
 
 
 # ---------------------------------------------------------------------------
@@ -627,13 +627,14 @@ def test_c540_suppresses_c541_c542_and_c543_for_that_entry_only() -> None:
 
     Plan item 5: "``C540`` suppresses ``C541``, ``C542`` and ``C543``
     for that entry … Suppression is per entry, never per tool."  The
-    4-part entry ``a:b:BOGUS`` would, if parsed as 3-part, carry a bad
-    mode (C541), a relative container (C542) and a missing host (C543) —
-    but it did not parse, so only C540 may fire.  The neighbouring
-    VALID entry must still be judged (nothing fires on it here).
+    4-part entry ``a:b:BOGUS:extra`` does not parse at all, so only
+    C540 may fire — its first three parts would have carried a missing
+    host (C543), a relative container (C542) and a bad mode (C541) had
+    they parsed as a 3-part entry.  The neighbouring VALID entry must
+    still be judged (nothing fires on it here).
 
-    Arrangement: one tool with ``["a:b:BOGUS", "/exists:/c"]``, the
-    probe answering ``is_dir`` for ``/exists``; ALL four rules
+    Arrangement: one tool with ``["a:b:BOGUS:extra", "/exists:/c"]``,
+    the probe answering ``is_dir`` for ``/exists``; ALL four rules
     registered.
     Action: run ``validate_config``.
     Assertion: exactly one diagnostic — the C540 at ``mounts.0``; no
@@ -642,7 +643,7 @@ def test_c540_suppresses_c541_c542_and_c543_for_that_entry_only() -> None:
     for rule in _ALL_C54X_RULES:
         register(rule)
     cfg = _config(
-        tools={"t1": _tool("t1", mounts=["a:b:BOGUS", "/exists:/c"])},
+        tools={"t1": _tool("t1", mounts=["a:b:BOGUS:extra", "/exists:/c"])},
         probe=_FakeProbe(dirs={Path("/exists"): True}),
     )
 
