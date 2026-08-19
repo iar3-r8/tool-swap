@@ -166,6 +166,14 @@ class ToolConfig(BaseModel):
     handler: str | None = None
     requirements: str | None = None
     build: BuildConfig | None = None
+    image: str | None = Field(
+        default=None,
+        description=(
+            "Pin a pre-built image of this tool instead of building it "
+            "(plan/02 §5.2). Exactly one of image:, build: or a managed "
+            "handler: may be present (TSWAP-C510 / TSWAP-C511)."
+        ),
+    )
     group: str | None = None
     ttl: int | None = None
     devices: list[int] | None = None

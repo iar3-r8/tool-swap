@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, cast
 
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS, builtin_defaults
@@ -87,6 +88,18 @@ class ResolvedTool:
             ``"defaults"``), most-specific-first then key-sorted.
             Outside ``values`` on purpose (behaviour 14): the keys are
             reserved, never resolved fields.
+        image: the layered (inline > ``tool.yaml``) image source;
+            ``None`` when no layer supplied the key.
+        handler: the layered (inline > ``tool.yaml``) handler entry point;
+            ``None`` when no layer supplied the key.
+        requirements: the layered (inline > ``tool.yaml``) requirements
+            file; ``None`` when no layer supplied the key.
+        build: the inline ``build:`` block, deep-copied as authored;
+            ``None`` when absent (behaviour 15: a block, never flattened).
+        base_dir: the tool directory, or ``None`` for a tool without
+            ``path:``; the behaviour-15 rules resolve relative paths
+            against it, or against ``config.path.parent`` when it is
+            ``None``.
     """
 
     name: str
@@ -103,6 +116,14 @@ class ResolvedTool:
     # Behaviour 14 carrier field; trailing on purpose so every existing
     # construction site stays valid.
     reserved_keys: tuple[tuple[str, str], ...] = ()
+    # Behaviour 15 carrier fields; trailing on purpose so every existing
+    # construction site stays valid.  Outside ``values`` on purpose
+    # (plan, behaviour 15, item 3): none of them is a resolvable field.
+    image: str | None = None
+    handler: str | None = None
+    requirements: str | None = None
+    build: dict[str, object] | None = None
+    base_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +148,7 @@ def resolve_tool(
     tool_yaml: dict[str, object] | None = None,
     defaults: dict[str, object] | None = None,
     group: dict[str, object] | None = None,
+    base_dir: Path | None = None,
 ) -> ResolvedTool:
     """Resolve one tool's layers into values, origins, and diagnostics.
 
@@ -148,6 +170,11 @@ def resolve_tool(
             or ``None``; only tool-level fields are taken from it and
             group-only fields (``max_resident``, ``eviction``) are
             ignored without a diagnostic.
+        base_dir: the tool directory for a ``path:`` tool (behaviour 15),
+            stored verbatim on the result; ``None`` means "no ``path:``",
+            which the behaviour-15 rules resolve against
+            ``config.path.parent``.  Never computed here, and the
+            filesystem is never touched.
 
     Returns:
         A frozen :class:`ResolvedTool` whose ``values`` cover exactly the
@@ -162,11 +189,21 @@ def resolve_tool(
     inline_data = copy.deepcopy(inline)
     if tool_yaml is not None:
         tool_flat = _flatten_tool_yaml(tool_yaml, name, diagnostics)
-        if "description" in tool_yaml:
-            # Additive: ``description`` is not a flat built-in field, so
-            # it stays out of ``values`` and of the 47-key flattening;
-            # this only makes it visible to the description layering.
-            tool_flat["description"] = copy.deepcopy(tool_yaml["description"])
+        for key in ("description", "handler"):
+            # Additive: neither is a flat built-in field, so each stays
+            # out of ``values`` and of the 47-key flattening; this only
+            # makes it visible to the carrier layering (behaviours 13
+            # and 15).
+            if key in tool_yaml:
+                tool_flat[key] = copy.deepcopy(tool_yaml[key])
+        # ``runtime.requirements`` (plan/02 §4) feeds the requirements
+        # carrier from the tool.yaml layer without touching the
+        # flattening table: ``runtime`` is a partial block whose
+        # unmapped keys are M2 concerns, and ``requirements`` is not a
+        # flat field, so ``values`` stays at 47 keys.
+        runtime_block = tool_yaml.get("runtime")
+        if isinstance(runtime_block, Mapping) and "requirements" in runtime_block:
+            tool_flat["requirements"] = copy.deepcopy(runtime_block["requirements"])
     else:
         tool_flat = {}
     group_layer = _group_layer(group)
@@ -197,6 +234,19 @@ def resolve_tool(
 
     # --- behaviour 13 carrier fields (outside ``values`` on purpose) ---
     description_winner = _winner_index_safe(layers, "description")
+    # --- behaviour 15 carrier fields (outside ``values`` on purpose) ---
+    image = _carrier_value(layers, "image")
+    handler = _carrier_value(layers, "handler")
+    requirements = _carrier_value(layers, "requirements")
+    build = _carrier_block(inline_data, "build")
+    for carrier_key in ("image", "handler", "requirements"):
+        winner = _winner_index_safe(layers, carrier_key)
+        if winner >= 0:
+            origins.record(carrier_key, layers[winner].origin_for(carrier_key))
+    if build is not None:
+        # ``build`` is inline-only (a block, never flattened); its
+        # origin is the inline layer's.
+        origins.record("build", layers[0].origin_for("build"))
     # --- behaviour 14: reserved-key presence scan (no diagnostic of its
     # own; every C4xx is a rule reading ``reserved_keys``) ---
     reserved_keys = _scan_reserved_keys(inline_data, tool_yaml, defaults)
@@ -234,7 +284,54 @@ def resolve_tool(
         params=params,
         json_schema=json_schema,
         reserved_keys=reserved_keys,
+        image=image,
+        handler=handler,
+        requirements=requirements,
+        build=build,
+        base_dir=base_dir,
     )
+
+
+def _carrier_value(layers: Sequence[_Layer], key: str) -> str | None:
+    """The layered carrier value for ``image`` / ``handler`` / ``requirements``.
+
+    Same layering as :func:`_winner_index_safe`: inline > ``tool.yaml`` >
+    ``defaults:`` (these keys are not group or built-in fields), with
+    ``None`` when no layer supplied the key — the ``C511``-load-bearing
+    absence.  The winning value is deep-copied, preserving the "mutating a
+    caller's dicts never affects another resolution" contract.
+
+    Args:
+        layers: the layers, most specific first.
+        key: the carrier key (``image`` / ``handler`` / ``requirements``).
+
+    Returns:
+        A deep copy of the winning value, or ``None`` when absent.
+    """
+    winner = _winner_index_safe(layers, key)
+    if winner < 0:
+        return None
+    return cast("str | None", copy.deepcopy(layers[winner].data[key]))
+
+
+def _carrier_block(inline: Mapping[str, object], key: str) -> dict[str, object] | None:
+    """The inline-only dict carrier (``build``), deep-copied as authored.
+
+    ``build`` is a block, never flattened (plan, behaviour 15, item 3),
+    and only the inline layer may supply it — a ``tool.yaml`` has no
+    ``build:`` key.  A non-dict value is stored as authored; the schema
+    layer owns its shape.
+
+    Args:
+        inline: the tool's inline entry (already deep-copied on entry).
+        key: the carrier key (``build``).
+
+    Returns:
+        A deep copy of the inline value, or ``None`` when absent.
+    """
+    if key not in inline:
+        return None
+    return cast("dict[str, object]", copy.deepcopy(inline[key]))
 
 
 def _winner_index_safe(layers: Sequence[_Layer], field: str) -> int:

@@ -16,6 +16,8 @@ registers nothing (behaviour 11a, Option B).
 from __future__ import annotations
 
 import copy
+import keyword
+import os
 import re
 import string
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -155,6 +157,66 @@ def _no_line(_path: str) -> int | None:
     return None
 
 
+def _real_is_file(path: Path) -> bool:
+    """Real-filesystem ``is_file`` predicate (``OSError`` swallowed).
+
+    A permission denial, an overlong path or a broken symlink loop answers
+    ``False`` rather than escaping a rule as a ``TSWAP-C999`` crash: the
+    honest answer is "I could not see that file", which the rules'
+    "does not exist" messages already convey.
+
+    Args:
+        path: the path to test.
+
+    Returns:
+        True when ``path`` is an existing regular file.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _real_is_dir(path: Path) -> bool:
+    """Real-filesystem ``is_dir`` predicate (``OSError`` swallowed).
+
+    Args:
+        path: the path to test.
+
+    Returns:
+        True when ``path`` is an existing directory.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+@dataclass(frozen=True)
+class FileProbe:
+    """The ONLY filesystem contact the config layer has (behaviour 15).
+
+    Every rule that needs disk knowledge goes through this object,
+    carried on :class:`ValidatedConfig`, so ``validate_config`` stays a
+    pure function of its input and tests inject dict-backed fakes.
+
+    Attributes:
+        is_file: reports an existing regular file (default:
+            ``Path.is_file``, ``OSError`` swallowed to ``False``).
+        is_dir: reports an existing directory (default:
+            ``Path.is_dir``, ``OSError`` swallowed to ``False``).
+    """
+
+    is_file: Callable[[Path], bool] = _real_is_file
+    is_dir: Callable[[Path], bool] = _real_is_dir
+
+
+#: The real-filesystem probe: a no-arg :class:`FileProbe` IS the real
+#: filesystem, and it is the default every :class:`ValidatedConfig`
+#: carries (behaviour 15, item 1).
+REAL_FILESYSTEM: Final[FileProbe] = FileProbe()
+
+
 @dataclass(frozen=True)
 class ValidatedConfig:
     """The resolved configuration a rule's ``check`` is run against.
@@ -169,12 +231,16 @@ class ValidatedConfig:
         line_for: maps a dotted YAML path to a 1-based source line or
             ``None``.
         path: the config file path.
+        probe: the filesystem predicates the rules may consult (default:
+            :data:`REAL_FILESYSTEM`); behaviour 15's trailing,
+            keyword-only, defaulted field.
     """
 
     tools: dict[str, ResolvedTool]
     raw: dict[str, object]
     line_for: Callable[[str], int | None] = field(default=_no_line, kw_only=True)
     path: Path = field(default=Path("tools.yaml"), kw_only=True)
+    probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
 
 
 #: The module-level registry of rules.  A single live object (not a
@@ -1262,6 +1328,543 @@ TSWAP_C405_RULE: Final[Rule] = _C405Rule(
 )
 
 
+# ---------------------------------------------------------------------------
+# Behaviour 15 — image source, handler and file existence (§6 rules 5, 6)
+# ---------------------------------------------------------------------------
+
+#: The pinned expected handler form the C512 message shows (plan block 4).
+_EXPECTED_HANDLER_FORM: Final[str] = "file.py:ClassName"
+
+
+def _parse_handler(handler: str) -> tuple[str, str] | None:
+    """Parse a ``handler`` value as ``file.py:ClassName`` (plan block 4).
+
+    Split on the FIRST colon.  Both halves must be non-empty after
+    stripping surrounding whitespace; the file part must end in ``.py``;
+    the name part must be a Python identifier that is not a keyword
+    (``str.isidentifier`` is the language's own definition; a keyword
+    such as ``class`` can never name a class, and a dotted name is not
+    part of the documented form).
+
+    Shared by C512 (which reports a ``None`` result), C513 (which checks
+    the file part) and C516 (which checks the escape), so the three
+    rules cannot disagree about parseability.
+
+    Args:
+        handler: the ``handler`` carrier value.
+
+    Returns:
+        The ``(file part, name part)`` pair when the value is well
+        formed, else ``None``.
+    """
+    if ":" not in handler:
+        return None
+    file_part, name_part = handler.split(":", 1)
+    file_part = file_part.strip()
+    name_part = name_part.strip()
+    if not file_part or not file_part.endswith(".py"):
+        return None
+    if not name_part or not name_part.isidentifier() or keyword.iskeyword(name_part):
+        return None
+    return file_part, name_part
+
+
+def _resolved(base: Path, value: str) -> Path:
+    """Resolve ``value`` against ``base``, LEXICALLY (plan block 2(a)).
+
+    ``base / Path(value)`` with a purely lexical normalisation
+    (``os.path.normpath`` semantics): collapse ``.`` and cancel ``..``
+    against the preceding segment textually.  Never
+    :meth:`Path.resolve` (disk contact, CWD-dependent), never
+    ``Path.cwd()``, never ``~`` expansion — the loader expands ``~`` for
+    ``path:`` only, and a ``~`` left unexpanded is a portability mistake
+    whose verbatim path is more informative in the message.  An absolute
+    ``value`` is honoured as-is (normalised).
+
+    Args:
+        base: the resolution root (the tool directory or the config
+            directory).
+        value: the as-authored path value.
+
+    Returns:
+        The normalised path.
+    """
+    return Path(os.path.normpath(base / Path(value)))
+
+
+def _tool_base(config: ValidatedConfig, tool: ResolvedTool) -> Path:
+    """The resolution root for one tool (plan block 2(a)).
+
+    Args:
+        config: the validated configuration (its ``path`` supplies the
+            fallback).
+        tool: the resolved tool (its ``base_dir`` wins when set).
+
+    Returns:
+        ``tool.base_dir`` when set, else ``config.path.parent``.
+    """
+    return tool.base_dir if tool.base_dir is not None else config.path.parent
+
+
+def _image_sources(tool: ResolvedTool) -> list[str]:
+    """The image sources PRESENT on a tool, in ``image``, ``build``,
+    ``handler`` order (plan block 3(b)).
+
+    Presence, never value: a ``build: {}`` still counts (its shape is
+    the schema layer's one diagnostic), and ``requirements`` never
+    counts — it is an attribute of the managed source, optional.
+
+    Args:
+        tool: the resolved tool.
+
+    Returns:
+        The source names present (zero, one or two or three entries).
+    """
+    sources: list[str] = []
+    if tool.image is not None:
+        sources.append("image")
+    if tool.build is not None:
+        sources.append("build")
+    if tool.handler is not None:
+        sources.append("handler")
+    return sources
+
+
+class _C510Rule(Rule):
+    """``TSWAP-C510``: more than one image source."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool carrying two or more image sources.
+
+        One diagnostic per tool (not one per pair), naming every source
+        found and requiring exactly one.  ``path:`` is not a source — it
+        is a layer supplier — so it is not special-cased: the resolver
+        has already merged a ``tool.yaml``'s ``handler`` into the
+        carrier, and the rule sees the post-merge picture.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool at ``tools.<key>``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            sources = _image_sources(tool)
+            if len(sources) < 2:
+                continue
+            found = ", ".join(f"'{source}'" for source in sources)
+            message = (
+                f"Tool {key!r} defines {len(sources)} image sources "
+                f"({found}); exactly one of image:, build: or a managed "
+                "handler: may be present"
+            )
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C511Rule(Rule):
+    """``TSWAP-C511``: no image source at all."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool with none of ``image`` / ``build`` / ``handler``.
+
+        Reads the carriers, never ``config.raw`` (the inline layer only;
+        a ``tool.yaml``-supplied ``handler`` is absent from ``raw`` and
+        reading it would resurrect a false positive on every ``path:``
+        tool).  A ``path:`` tool whose ``tool.yaml`` supplies a
+        ``handler`` arrives with the carrier set, so it is legal.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per source-less tool at ``tools.<key>``,
+            listing the three ways to define a tool.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if _image_sources(tool):
+                continue
+            message = (
+                f"Tool {key!r} has no image source: define exactly one "
+                "of an image: (a pre-built image), a build: block (we "
+                "build it), or a managed handler: (+ optional "
+                "requirements:)"
+            )
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C512Rule(Rule):
+    """``TSWAP-C512``: a ``handler`` outside the ``file.py:ClassName`` form."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every unparseable ``handler`` (plan block 4).
+
+        A malformed handler suppresses C513 and C516 for the same tool:
+        they re-run the shared :func:`_parse_handler` and skip on
+        failure, so the three rules cannot disagree.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per malformed handler at
+            ``tools.<key>.handler``, showing the expected form and the
+            value found.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.handler is None or _parse_handler(tool.handler) is not None:
+                continue
+            message = (
+                f"handler {tool.handler!r} is not in the expected form "
+                f"{_EXPECTED_HANDLER_FORM}"
+            )
+            yaml_path = f"tools.{key}.handler"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C513Rule(Rule):
+    """``TSWAP-C513``: the handler file does not exist (or is a directory)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every parseable handler whose file part is not a file.
+
+        Static-only: the file is probed, never imported.  Suppressed
+        when the handler fails C512's parse (one mistake, one
+        diagnostic).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per missing handler file at
+            ``tools.<key>.handler`` carrying ``str(resolved)`` in the
+            message; the message adds "is a directory, not a file" when
+            the probe reports the path as a directory.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.handler is None:
+                continue
+            parsed = _parse_handler(tool.handler)
+            if parsed is None:
+                continue  # C512 owns the malformed string
+            resolved = _resolved(_tool_base(config, tool), parsed[0])
+            if probe.is_file(resolved):
+                continue
+            if probe.is_dir(resolved):
+                message = f"Handler file {str(resolved)} is a directory, not a file"
+            else:
+                message = f"Handler file does not exist: {str(resolved)}"
+            yaml_path = f"tools.{key}.handler"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C514Rule(Rule):
+    """``TSWAP-C514``: a named ``requirements`` file that does not exist."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every named requirements file the probe cannot find.
+
+        ``None`` yields nothing and queries no disk (C514 only fires
+        when the file is named).  Suppressed by nothing: a tool can
+        carry both C513 and C514 in one report.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per missing file at
+            ``tools.<key>.requirements`` carrying ``str(resolved)`` in
+            the message.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.requirements is None:
+                continue
+            resolved = _resolved(_tool_base(config, tool), tool.requirements)
+            if probe.is_file(resolved):
+                continue
+            message = f"Requirements file does not exist: {str(resolved)}"
+            yaml_path = f"tools.{key}.requirements"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C515Rule(Rule):
+    """``TSWAP-C515``: ``build.context`` or ``build.dockerfile`` missing."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag a build context that is not a directory, and a
+        dockerfile that is not a file within it.
+
+        ``build=None`` yields nothing and queries no disk; a present
+        ``build`` that is not a dict is skipped silently (the schema
+        layer owns the ``build`` shape — one mistake, one diagnostic,
+        never a C999).  The dockerfile resolves WITHIN the context
+        directory unless it is absolute, in which case it is used
+        as-is.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per problem: the context at
+            ``tools.<key>.build.context`` (mirrored message "is a file,
+            not a directory" when the probe reports a file), the
+            dockerfile at ``tools.<key>.build.dockerfile``; each message
+            carries ``str(resolved)``.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            build = tool.build
+            if not isinstance(build, dict):
+                continue
+            base = _tool_base(config, tool)
+            context = build.get("context")
+            dockerfile = build.get("dockerfile", "Dockerfile")
+            context_path = f"tools.{key}.build.context"
+            dockerfile_path = f"tools.{key}.build.dockerfile"
+            context_is_dir = False
+            if isinstance(context, str):
+                context_resolved = _resolved(base, context)
+                if probe.is_dir(context_resolved):
+                    context_is_dir = True
+                else:
+                    if probe.is_file(context_resolved):
+                        message = (
+                            f"Build context {str(context_resolved)} is a "
+                            "file, not a directory"
+                        )
+                    else:
+                        message = (
+                            f"Build context does not exist: {str(context_resolved)}"
+                        )
+                    findings.append(
+                        Diagnostic(
+                            code=self.id,
+                            severity=self.severity,
+                            message=message,
+                            location=_tool_location(config, context_path),
+                            remedy=self.remedy,
+                        )
+                    )
+            # The dockerfile resolves WITHIN the context directory, so it
+            # is only checked when that directory exists.
+            if context_is_dir and isinstance(dockerfile, str):
+                dockerfile_resolved = _resolved(context_resolved, dockerfile)
+                if not probe.is_file(dockerfile_resolved):
+                    findings.append(
+                        Diagnostic(
+                            code=self.id,
+                            severity=self.severity,
+                            message=(
+                                f"Dockerfile does not exist: {str(dockerfile_resolved)}"
+                            ),
+                            location=_tool_location(config, dockerfile_path),
+                            remedy=self.remedy,
+                        )
+                    )
+        return findings
+
+
+class _C516Rule(Rule):
+    """``TSWAP-C516``: a path escaping the tool directory (WARNING)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on every lexical escape past the resolution root.
+
+        The comparison is on the NORMALISED path (``is_relative_to``
+        semantics, pure lexical, no I/O): ``sub/../handler.py`` cancels
+        out inside the base and warns nothing, while ``../shared/...``
+        and an absolute path elsewhere both warn.  The escape is
+        ALLOWED (a WARNING, not an error) and does not suppress
+        C513/C514/C515 — an escaping path that also does not exist
+        yields both, since they are different problems.  Evaluated only
+        for a parseable handler (shared :func:`_parse_handler`).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per offending path, at the path's own
+            key (``tools.<key>.handler`` / ``.requirements`` /
+            ``.build.context`` / ``.build.dockerfile``), naming the
+            resolved path and the portability problem.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            base = _tool_base(config, tool)
+            candidates: list[tuple[str, Path]] = []
+            if tool.handler is not None:
+                parsed = _parse_handler(tool.handler)
+                if parsed is not None:
+                    candidates.append(
+                        (f"tools.{key}.handler", _resolved(base, parsed[0]))
+                    )
+            if tool.requirements is not None:
+                candidates.append(
+                    (f"tools.{key}.requirements", _resolved(base, tool.requirements))
+                )
+            build = tool.build
+            if isinstance(build, dict):
+                context = build.get("context")
+                if isinstance(context, str):
+                    candidates.append(
+                        (f"tools.{key}.build.context", _resolved(base, context))
+                    )
+                dockerfile = build.get("dockerfile", "Dockerfile")
+                if isinstance(dockerfile, str):
+                    root = (
+                        _resolved(base, context) if isinstance(context, str) else base
+                    )
+                    candidates.append(
+                        (f"tools.{key}.build.dockerfile", _resolved(root, dockerfile))
+                    )
+            for yaml_path, resolved in candidates:
+                if resolved.is_relative_to(base):
+                    continue
+                message = (
+                    f"{str(resolved)} escapes the tool directory "
+                    f"{str(base)}: it breaks the portability that "
+                    "path: exists to provide"
+                )
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+#: ``TSWAP-C510`` — more than one image source (§6 rule 5).
+TSWAP_C510_RULE: Final[Rule] = _C510Rule(
+    id="TSWAP-C510",
+    remedy=(
+        "Keep exactly one image source: an image: (pre-built), a build: "
+        "block (we build it), or a managed handler: — remove the others "
+        "from the tool's inline 'tools.<name>' entry"
+    ),
+)
+
+#: ``TSWAP-C511`` — no image source (§6 rule 5).
+TSWAP_C511_RULE: Final[Rule] = _C511Rule(
+    id="TSWAP-C511",
+    remedy=(
+        "Give the tool exactly one image source: an image: (pre-built), "
+        "a build: block, or a managed handler: in its inline "
+        "'tools.<name>' entry, or a tool.yaml (via path:) that supplies "
+        "a handler:"
+    ),
+)
+
+#: ``TSWAP-C512`` — a handler outside the file.py:ClassName form (§6 rule 6).
+TSWAP_C512_RULE: Final[Rule] = _C512Rule(
+    id="TSWAP-C512",
+    remedy=(
+        "Write the handler as file.py:ClassName — a .py file relative to "
+        "the tool directory, a ':' and a Python class name that is not "
+        "a keyword"
+    ),
+)
+
+#: ``TSWAP-C513`` — the handler file does not exist (§6 rule 6).
+TSWAP_C513_RULE: Final[Rule] = _C513Rule(
+    id="TSWAP-C513",
+    remedy=(
+        "Create the handler file at the path shown, or fix the path: it "
+        "is relative to the tool's directory (its path: directory, or "
+        "the root config's directory for an inline tool)"
+    ),
+)
+
+#: ``TSWAP-C514`` — a named requirements file does not exist (§6 rule 6).
+TSWAP_C514_RULE: Final[Rule] = _C514Rule(
+    id="TSWAP-C514",
+    remedy=(
+        "Create the requirements file at the path shown, or fix the "
+        "path: it is relative to the tool's directory"
+    ),
+)
+
+#: ``TSWAP-C515`` — a build context or dockerfile is missing (§6 rule 6).
+TSWAP_C515_RULE: Final[Rule] = _C515Rule(
+    id="TSWAP-C515",
+    remedy=(
+        "Create the context directory (or the Dockerfile within it) at "
+        "the paths shown, or fix build.context / build.dockerfile: they "
+        "are relative to the tool's directory, and the dockerfile "
+        "resolves within the context"
+    ),
+)
+
+#: ``TSWAP-C516`` — a path escapes the tool directory (§6 rule 6, WARNING:
+#: the escape is allowed).
+TSWAP_C516_RULE: Final[Rule] = _C516Rule(
+    id="TSWAP-C516",
+    severity=Severity.WARNING,
+    remedy=(
+        "Keep the path inside the tool's directory (no ../ walking out, "
+        "no absolute path elsewhere): escaping it breaks the "
+        "portability that path: exists to provide"
+    ),
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -1282,6 +1885,13 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C403_RULE,
     TSWAP_C404_RULE,
     TSWAP_C405_RULE,
+    TSWAP_C510_RULE,
+    TSWAP_C511_RULE,
+    TSWAP_C512_RULE,
+    TSWAP_C513_RULE,
+    TSWAP_C514_RULE,
+    TSWAP_C515_RULE,
+    TSWAP_C516_RULE,
 )
 
 
