@@ -1290,7 +1290,262 @@ Every `C54x` rule reads only `config.tools[<key>].values["mounts"]`, `config.pat
   - `TSWAP-C602` — `max_concurrent: 0` → error (a cap of zero rejects everything; use `autostart: false` to disable a tool).
   - `TSWAP-C603` — `max_batch_size < 1`, `max_wait_ms < 0`, `workers < 1`, any timeout `<= 0` → error naming the field and the permitted range. `batching.enabled: false` resolves to `max_batch_size: 1` and nothing else (ADR-0005), asserted here as a resolution outcome, not a validation error.
 - **Edge cases:** the diagnostic must cite the **origin** of each conflicting value, since the two halves frequently come from different layers (`keep_warm` inline, `autostart` from `defaults:`) — and that is exactly the case a user cannot debug unaided.
-- **Files:** `src/tool_swap/config/validate.py`, `tests/unit/config/test_validate_contradictions.py`.
+- **Files:** `src/tool_swap/config/validate.py`, `src/tool_swap/config/resolver.py` (the `batching.enabled` resolution, item 6), `src/tool_swap/config/schema.py` (two inline keys, item 1(b)), `tests/unit/config/test_validate_contradictions.py`.
+
+#### Confirmed contract details (2026-08-19)
+
+Four rules, and the **first rule group in M1 whose message content is the origin map rather than the value**. Behaviour 16 pinned how a rule reads a root block; behaviour 17 pinned how a rule reaches the disk; this block pins **which origin accessor a rule calls, what a winning layer is rendered as in prose, and what "explicitly set" concretely means**. It also pins **one new resolver behaviour** (item 6) and **one schema widening** (item 1(b), assumption **A19**) — behaviour 18 is not a pure-rule behaviour, and pretending otherwise would leave two of its four codes unreachable.
+
+The governing property, stated once because four decisions follow from it: **a contradiction is a property of the RESOLVED tool, but its remedy is a property of the LAYERS.** The rule therefore reads `tool.values` to decide *whether* to fire and `tool.origins` to decide *what to say*. Neither half is optional: values alone produce a diagnostic naming a key the author cannot find, and origins alone cannot tell a contradiction from a coincidence.
+
+**1. The fields, named exactly, and the two that are unreachable today**
+
+**(a) Every field behaviour 18 reads is a resolvable value in the 47-key set**, read from `tool.values[<key>]` — verified key by key against [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:20). **No carrier is read, `config.raw` is never read, and no key is added to `values` (it stays 47).**
+
+| Code | Keys read from `tool.values` | Built-in default |
+|---|---|---|
+| `C600` | `keep_warm`, `autostart` | `False`, `True` |
+| `C601` | `keep_warm`, `ttl` | `False`, `900` |
+| `C602` | `max_concurrent` | `None` |
+| `C603` | `max_batch_size`, `max_wait_ms`, `workers`, and the **six** timeout keys below | `8`, `20`, `1` |
+
+**The plan's "any timeout `<= 0`" means exactly these six keys, and no others:** `start_timeout` (120), `ready_timeout` (600), `queue_timeout` (300), `request_timeout` (300), `drain_timeout` (30), `stop_timeout` (30). There is **no key named `timeout`**. Three near-misses are deliberately **out of scope**, recorded so nobody adds them by analogy:
+
+- **`ttl`** is not a timeout for `C603`'s purposes. Its legal range is `-1` / `0` / `>0` and [`TSWAP-C501`](src/tool_swap/config/resolver.py:700) already owns it inside the resolver; a second range check would contradict the `0` sentinel.
+- **`probe_interval`** (`1.0`) is a poll interval, not a timeout. `> 0` is arguably right for it too, but the plan does not say so and inventing the clause here would put a range check on a float field nobody asked about.
+- **`max_queue_depth`** (`64`) is a count, not a timeout. Same reasoning.
+
+**`max_concurrent` is the real key name** — verified in [`defaults.py`](src/tool_swap/config/defaults.py:27) and in `plan/02` §5.3's field table. There is no `max_instances`.
+
+**(b) TWO of the four codes are unreachable through the schema today, and the green step must widen `ToolConfig` — assumption A19.** [`ToolConfig`](src/tool_swap/config/schema.py:151) has `extra="forbid"`, and it carries **neither `autostart` nor `max_concurrent`**:
+
+- `autostart` exists on [`DefaultsConfig`](src/tool_swap/config/schema.py:81) but **not** on `ToolConfig`. So `C600` is reachable today *only* through `defaults: {autostart: false}` + an inline `keep_warm: true` — which is, by luck, exactly the plan's own headline example. A tool writing `autostart: false` on itself gets a `TSWAP-C101` unknown-key error before any rule runs.
+- `max_concurrent` exists on **neither** model. `C602` is therefore **completely unreachable** today: no config can express `max_concurrent: 0`.
+
+This is the identical trap A15 (`image`) and A17 (`workers` / `expose_host_port`) recorded, and it takes the identical resolution: **add `autostart: bool | None = None` and `max_concurrent: int | None = None` to the inline `ToolConfig` only.** `plan/02` §5.3's field table lists both as tool-level keys (`autostart` *"bool, `true`, If `false`, a request to a stopped model returns 503 instead of starting it"*; `max_concurrent` *"int, unset, Optional cap on in-flight requests to a `READY` tool; **429** beyond it"*), so the move is toward the documented spec.
+
+Three deliberate exclusions, each with its reason:
+
+- **`DefaultsConfig` does not gain `max_concurrent`.** §3's `defaults:` block does not list it and §5.3 presents it as a per-tool shed-load knob. Following A14/A15/A17: do not invent a surface the spec does not describe. A `defaults.max_concurrent` stays a `TSWAP-C101`.
+- **`ToolYamlConfig` gains neither**, the A14/A15/A17 precedent unchanged: §4's `tool.yaml` reference authors neither key, and `lifecycle.autostart` would additionally need a `_FLATTENING_TABLE` entry.
+- **The six timeout keys are NOT added to `ToolConfig`.** They appear only in §3's `defaults:` block and in **no** §5 field table, so `defaults:`-level *is* their documented home. `C603`'s timeout clause therefore fires on the resolved value of a `defaults:`-authored timeout, and an inline `start_timeout:` stays a `TSWAP-C101`. This is the honest reading, and it is why item 2's origin citation carries the whole weight of "where do I fix this?" for those six.
+
+`max_concurrent: int | None = None` has a benign ambiguity worth stating: `None` is both "absent" and the built-in "uncapped" sentinel, so an inline `max_concurrent: null` is indistinguishable from omission at the schema layer. The resolver's explicit-null rule resolves both to `None`, `C602` skips `None`, and the outcome — uncapped — is the same either way. Nothing to decide.
+
+**2. ORIGIN CITATION — the accessor, the layer vocabulary, and the message shape**
+
+This is the headline edge case, so every piece is pinned literally.
+
+**(a) The accessor is [`OriginMap.winning(field_path)`](src/tool_swap/config/origin.py:129), which returns an [`Origin`](src/tool_swap/config/origin.py:42)** — a frozen `(level: OriginLevel, source: str)` pair. It is **not** `origins.get(...)`, there is no tuple return, and there is no `(layer, path)` shape. `shadowed(field_path)` also exists and behaviour 18 **does not use it** (that is behaviour 22's `--verbose`).
+
+**`winning` raises `KeyError` for an unrecorded path, and that is a real hazard, not a hypothetical.** Every hand-built `ResolvedTool` in the shipped test files passes `origins=OriginMap()` — see [`_tool`](tests/unit/config/test_validate_mounts.py:250). A rule that called `winning("keep_warm")` on such a fixture would raise, be caught by `validate_config`, and report `TSWAP-C999` instead of its own code. **The rules therefore go through one shared, total helper**, and behaviour 18's own fixtures record real origins so the citation is exercised:
+
+```python
+def _origin_phrase(tool: ResolvedTool, field: str) -> str:
+    """How a C60x message names the layer that set ``field``."""
+```
+
+**(b) The layer vocabulary, pinned to the exact strings a message must contain.** [`OriginLevel`](src/tool_swap/config/origin.py:16) has exactly four members and **no `GROUP`** (assumption A11): a group-supplied value records level `DEFAULTS` with the source `groups.<name>.<field>` ([`_group_layer`](src/tool_swap/config/resolver.py:420)). `_origin_phrase` maps them as:
+
+| Winning origin | Pinned phrase |
+|---|---|
+| `INLINE` | `set inline` |
+| `TOOL_YAML` | `set in the tool's tool.yaml` |
+| `DEFAULTS`, source **not** starting `groups.` | `set in the defaults: block` |
+| `DEFAULTS`, source `groups.<name>.<field>` | `set in group '<name>'` (the name from `source.split(".")[1]`, `repr`-quoted) |
+| `BUILT_IN` | `the built-in default` |
+| **unrecorded** (`KeyError`) | `origin unrecorded` |
+
+- **`Origin.render()` is deliberately NOT used.** It is `config show`'s renderer, and because the resolver stores fixed source strings it produces `"inline (inline)"`, `"defaults (defaults)"` and `"tool.yaml (tool.yaml)"` — a doubled word that reads as a bug inside a sentence. `render()` stays behaviour 22's; the prose phrase is behaviour 18's. The two are independent by design and a test pins each separately.
+- **The built-in case has no author, and the phrase says so** rather than naming a layer: `the built-in default`. A message reading *"autostart: true (the built-in default)"* is the honest answer to "where did that come from?".
+- **The group branch is defensive today.** [`GroupConfig`](src/tool_swap/config/schema.py:127) carries only `max_resident`, `eviction` and `devices`, and `_group_layer` filters on `BUILT_IN_DEFAULTS`, so no group can currently supply `keep_warm`, `autostart`, `ttl` or `max_concurrent`. The branch is still implemented and still tested — by a hand-built `OriginMap` recording a `groups.g.keep_warm` source — because `GroupConfig` is the one model most likely to grow, and a `KeyError`-free helper with an untested branch is how a `C999` ships.
+
+**(c) The message names BOTH values AND both origins.** Pinned templates; tests assert **substrings**, never whole strings (§0's rule):
+
+```
+C600: Tool 't1' sets keep_warm: true (set inline) with autostart: false
+      (set in the defaults: block); keep_warm starts the tool at boot and
+      exempts it from TTL, while autostart: false forbids starting it
+      automatically at all
+C601: Tool 't1' sets keep_warm: true (set inline) with ttl 3600 (set
+      inline); keep_warm exempts the tool from TTL, so the ttl value has
+      no effect
+C602: Tool 't1' sets max_concurrent 0 (set inline); a cap below 1 rejects
+      every request with 429, so the tool can never serve
+C603: Tool 't1' sets max_batch_size 0 (set in the defaults: block);
+      max_batch_size must be >= 1
+```
+
+The assertable shape for `C600` is therefore: the message contains `keep_warm`, `autostart`, **and one phrase from the table above for each of them**. A test that sets the two halves in *different* layers and asserts both phrases appear is the one test this whole block exists for.
+
+**3. `TSWAP-C600` — `keep_warm: true` + `autostart: false` (ERROR)**
+
+Fires when `values["keep_warm"] is True` **and** `values["autostart"] is False`. Identity against the bool singletons, not truthiness: `keep_warm: 1` is a schema-layer problem (`bool` on both models), and treating `1` as `true` here would report a contradiction the author cannot see in their file. Any non-bool value on either key is **skipped silently** — behaviour 13's *"a value of the wrong shape is skipped silently"*, applied for the fifth time.
+
+**Layer-blind on purpose.** A `defaults: {autostart: false}` plus one `keep_warm: true` tool is an error *for that tool*, and the fact that eleven sibling tools are fine is exactly why the origin phrase is in the message rather than the location. Contrast `C601`, which is authorship-sensitive (item 4) — the asymmetry is deliberate: `C600` says *this tool can never run as configured*, a fact independent of who wrote it; `C601` says *you probably expected something*, a claim about an author.
+
+**Both remedies, each with its consequence** (§6 rule 11's *"naming both remedies with their consequences"*). The `remedy` is a rule-level constant, self-sufficient per the behaviour 13/14/15/16/17 rule, and contains both of these assertable fragments:
+
+> `set keep_warm: false` … *the tool then starts on demand and idle-stops after `ttl`*
+> `set autostart: true` … *the tool then starts at boot and stays resident, exempt from TTL*
+
+and closes by naming where each key may live — *the tool's entry or the `defaults:` block* — because the rule cannot know which of the two the reader owns. A test asserts the substrings `keep_warm: false` and `autostart: true` both appear.
+
+**4. `TSWAP-C601` — `keep_warm: true` + an EXPLICIT `ttl > 0` (WARNING)**
+
+Fires when all three hold:
+
+1. `values["keep_warm"] is True`;
+2. `values["ttl"]` is an `int`/`float`, not a `bool`, and `> 0`;
+3. **`tool.origins.winning("ttl").level` is `INLINE` or `TOOL_YAML`** — the ttl was authored **on this tool**.
+
+**Condition 3 is the pin, and it is narrower than "not the built-in default".** Two candidate readings of *"explicitly `> 0`"* were on the table:
+
+| Reading | Verdict |
+|---|---|
+| (a) origin ∈ {`INLINE`, `TOOL_YAML`} — the ttl was set on this tool | **PINNED** |
+| (b) origin is anything but `BUILT_IN` — any author-written ttl, including `defaults.ttl` | **Rejected** |
+
+- **(b) makes the specification's own reference config warn.** [`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md:77) ships `defaults: {ttl: 900}` and, twenty lines later, a `text_cleanup` tool whose only lifecycle key is `keep_warm: true`. Under (b) that config emits a `C601` — and behaviour 24 requires `tools.example.yaml` to validate, with `--strict` promoting warnings to errors. A rule whose first victim is the document that defines it is the wrong rule.
+- **(b) is also wrong on the merits.** A `defaults.ttl` written once for a dozen tools expresses no expectation about the keep-warm one; `keep_warm: true` next to `ttl: 3600` in the same entry does. The plan's justification is *"the author probably expected one"*, and (a) is the reading under which that sentence is true.
+- **Narrowing is the safe direction.** Relaxing (a) into (b) later only adds warnings to configs already accepted; tightening (b) into (a) would silence a warning users had learned to expect.
+
+Consequences, each worth its own test:
+
+| Config | `ttl` origin | Outcome |
+|---|---|---|
+| `keep_warm: true`, no `ttl` anywhere | `BUILT_IN` (900) | **no C601** |
+| `keep_warm: true`, `defaults: {ttl: 900}` | `DEFAULTS` | **no C601** — the spec's own reference config |
+| `keep_warm: true`, `defaults: {ttl: 0}` | `DEFAULTS` | no C601 (fails clause 2 as well) |
+| `keep_warm: true`, inline `ttl: 3600` | `INLINE` | **C601** |
+| `keep_warm: true`, `tool.yaml` `lifecycle: {ttl: 600}` | `TOOL_YAML` | **C601** |
+| `keep_warm: true`, inline `ttl: 0` | `INLINE` | no C601 — `0` is *never idle-stop*, which **agrees** with `keep_warm` |
+| `keep_warm: true`, inline `ttl: -1` inheriting `defaults: {ttl: 900}` | `DEFAULTS` | **no C601** — see below |
+
+**The `ttl: -1` case is the reason the origin check is written against `winning("ttl")` and not against a re-read of the layers.** [`_resolve_ttl`](src/tool_swap/config/resolver.py:644) records the origin of *the layer the sentinel inherited from*, not of the layer holding the `-1`. So an inline `ttl: -1` resolves with a `DEFAULTS` (or `BUILT_IN`) origin and does not warn — which is the correct answer: `-1` means *"whatever the defaults say"*, i.e. no per-tool expectation. This is a landed resolver behaviour behaviour 18 consumes rather than changes, and it is worth one dedicated test because it looks like a bug until the sentence above is read.
+
+The message states the mechanism (*`keep_warm` exempts the tool from TTL, so the `ttl` value has no effect*) and cites the origin of **both** halves, exactly as `C600` does. The remedy names both resolutions: *remove the `ttl` from this tool if `keep_warm` is what you want, or set `keep_warm: false` if the idle timeout is what you want*.
+
+**5. `TSWAP-C602` — `max_concurrent: 0` (ERROR)**
+
+Fires when `values["max_concurrent"]` is an `int`, **not** a `bool`, and `<= 0`. Three deliberate widenings/narrowings of the plan's literal `max_concurrent: 0`:
+
+- **`<= 0`, not `== 0`.** A negative cap is the same mistake with the same consequence and the same remedy; reporting `0` and ignoring `-1` would be an obvious gap. The message names the actual value found, so `-1` reads correctly.
+- **`bool` before `int`.** `max_concurrent: false` is `0` in Python. `int | None` on the schema means it is a shape error there, and re-reporting it as a cap-of-zero would name a number the author never wrote. The `bool`-before-`int` discipline of [`_C530Rule`](src/tool_swap/config/validate.py:2148) and [`_is_device_index`](src/tool_swap/config/validate.py:1910), reused.
+- **`None` is skipped silently.** It is the documented "uncapped" default (§5.3 *"Unset means uncapped"*), and it is the built-in value, so every clean tool hits this branch.
+
+The message names the field, the value, and its origin phrase; the **remedy carries the plan's own redirection verbatim enough to assert**:
+
+> **`use autostart: false to disable a tool`**
+
+A test asserts that substring, and asserts the message contains `max_concurrent` and `0`. The pairing matters: an operator who wrote `max_concurrent: 0` was trying to turn something off, and naming the key that actually does it is the whole value of the diagnostic. `C602` is otherwise the simplest of the four — one key, one comparison, one remedy.
+
+**6. `TSWAP-C603` — out-of-range numbers (ERROR), and the `batching.enabled` resolution**
+
+**(a) The nine fields and their permitted ranges, as the message must state them:**
+
+| Key | Fires when | Range phrase in the message |
+|---|---|---|
+| `max_batch_size` | `< 1` | `>= 1` |
+| `max_wait_ms` | `< 0` | `>= 0` |
+| `workers` | `< 1` | `>= 1` |
+| `start_timeout` | `<= 0` | `> 0` |
+| `ready_timeout` | `<= 0` | `> 0` |
+| `queue_timeout` | `<= 0` | `> 0` |
+| `request_timeout` | `<= 0` | `> 0` |
+| `drain_timeout` | `<= 0` | `> 0` |
+| `stop_timeout` | `<= 0` | `> 0` |
+
+Implemented as **one table-driven rule**, not nine rules: a module-level `_C603_RANGES: Final[tuple[tuple[str, str, Callable[[float], bool]], ...]]` of `(key, range phrase, is-out-of-range)`, iterated per tool in table order. **One diagnostic per offending key**, so a tool with `max_batch_size: 0` and `workers: 0` reports two — each names its own field, its own range and its own origin, because each is a separate edit.
+
+- **`max_wait_ms: 0` is legal** (`>= 0`): it means *flush immediately*, a meaningful setting on a latency-critical tool. `-1` is the error.
+- **Every check is `bool`-before-`int`**, and a non-numeric value is skipped silently (the schema's `int` owns it).
+- **Order within a tool is table order**, which is `values`-independent and therefore deterministic — the plan's *"deterministic output"* requirement, satisfied without sorting.
+
+**(b) `batching.enabled: false` → `max_batch_size: 1` is NEW RESOLVER WORK. It is not implemented today.** Verified against the code, three ways:
+
+- **`enabled` is in no schema model.** Neither [`DefaultsConfig`](src/tool_swap/config/schema.py:73) nor [`ToolConfig`](src/tool_swap/config/schema.py:151) nor [`ToolYamlConfig`](src/tool_swap/config/schema.py:230) has it, and none of them models a `batching:` block at all.
+- **`("batching", "enabled")` is not in [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28)**, which maps only `("batching", "max_batch_size")`. `batching` **is** in `_KNOWN_BLOCKS` (derived from the table) and is **not** in `_PARTIAL_BLOCKS`, so a `tool.yaml` writing `batching: {enabled: false}` today emits **`TSWAP-C106`** — *"does not map to any tool field"* — and is otherwise ignored.
+- **`enabled` is not in [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:20)**, so it is not one of the 47 and never reaches `values`.
+
+The pinned resolution, and the reason it is a resolution rather than a rule: ADR-0005 and `plan/02` §5.5 both say `enabled: false` *"means `max_batch_size: 1`, and nothing else"* — a **translation**, not a complaint. A rule cannot perform it (rules do not write `values`, behaviour 17's governing property), and every downstream consumer must see the translated value, so it belongs where the value is produced.
+
+> **Pinned:** the `tool.yaml` `batching:` block gains **`("batching", "enabled")` as a recognised key that flattens to NO flat field**, and `resolve_tool` applies one post-resolution override: **when the effective `batching.enabled` is exactly `False`, `values["max_batch_size"]` becomes `1`, regardless of any authored `max_batch_size` at any layer.** `max_wait_ms`, `workers` and every other batching-adjacent field are **untouched** — *"and nothing else"* is taken literally. The origin recorded for the overridden `max_batch_size` is **the origin of the `enabled` key that caused it**, since that is the line the author must edit to change the outcome; a test pins that, because pointing at a shadowed `max_batch_size:` would be actively misleading.
+
+Consequences pinned so the green step needs no judgement:
+
+- **`enabled` never enters `values`. The 47-key set does not change**, and neither does `BUILT_IN_DEFAULTS`. It is read from the layers, used, and discarded — the `soft_ttl`-scan precedent (behaviour 14), one layer down.
+- **The `C106` regression is the sharp edge.** Adding `enabled` to the recognised-keys set means a `tool.yaml` `batching: {enabled: false}` stops being a `C106`. The mechanism: `_FLATTENING_TABLE` maps `("batching", "enabled")` to `None` is not expressible (the table's values are field names), so the green step adds a separate `_FLATTENING_IGNORED: Final[frozenset[tuple[str, str]]] = frozenset({("batching", "enabled")})` consulted before the `C106` branch. **`batching` must NOT be added to `_PARTIAL_BLOCKS`** — that would silence `C106` for *every* unmapped `batching` key and lose the typo protection §6 rule 1 exists for. A test asserts `batching: {zz_not_a_key: 3}` is still a `C106`.
+- **Where `enabled` may be authored: `tool.yaml`'s `batching:` block, and inline `batching:` is NOT added.** §4 authors the block in `tool.yaml`; §5.5's field table names the key `batching.enabled` (dotted, block-scoped) rather than a flat tool key; and adding an inline `batching:` mapping to `ToolConfig` would introduce M1's first nested inline block for one boolean. An inline `enabled:` or `batching:` stays a `TSWAP-C101`. *(This is the narrow half of A19 — see item 12.)*
+- **Precedence for `enabled` is `tool.yaml` only**, so there is no layer contest to resolve and no `defaults.batching`. One provider, one value, `None` when absent.
+- **`enabled: true` is a no-op**, explicitly: the override fires on `is False` only. A `None`/absent/non-bool `enabled` changes nothing.
+
+**(c) Behaviour 18's `C603` test then asserts the resolution as an OUTCOME, per the plan's own sentence** — `resolve_tool(..., tool_yaml={"batching": {"enabled": False, "max_batch_size": 32}})` yields `values["max_batch_size"] == 1`, **no diagnostic**, and no `C603` (1 satisfies `>= 1`). The test lives in the behaviour-18 file even though the code lives in the resolver, because the plan puts the assertion here; a one-line cross-reference in [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:1)'s docstring is worth adding so the resolver's own file names where its newest behaviour is pinned.
+
+**7. Location contract per code**
+
+Every diagnostic carries `Location(file=str(config.path), yaml_path=<below>, line=config.line_for(<the same string>))` — the behaviour 12/13/14/15/16/17 form. The file is never hardcoded, `line=None` is a legal outcome, and tests assert `location.line == config.line_for(location.yaml_path)` rather than a literal line number.
+
+| Code | `yaml_path` |
+|---|---|
+| `C600` | `tools.<key>.keep_warm` |
+| `C601` | `tools.<key>.keep_warm` |
+| `C602` | `tools.<key>.max_concurrent` |
+| `C603` | `tools.<key>.<the offending field>` |
+
+**The cross-field codes are located at `keep_warm`, and the precedent is behaviour 16's `C523`, not its `C530`.** Behaviour 16 established the distinction and behaviour 18 applies it unchanged:
+
+- **`C530` locates at bare `tools`** because *"the collision belongs to no single tool"* ([`_C530Rule`](src/tool_swap/config/validate.py:2148)) — a genuinely cross-**tool** finding.
+- **`C523` locates at `tools.<key>.workers`** ([plan item 9](plans/m1-configuration.md:1042)) even though it reads `workers` **and** `devices`. A cross-**field**, single-tool finding picks one canonical field and names the other in the message.
+
+`C600` and `C601` are `C523`'s shape exactly, so both locate at **`tools.<key>.keep_warm`** — the field that is `true` in every firing, the field the reader most likely wrote, and the one whose line a `line_for` lookup is most likely to find. **`keep_warm` is chosen deliberately over "the first field alphabetically" or "the more specific layer's field":** the latter would make the location depend on the origin map, so two configs with identical values would report different locations — non-determinism dressed as helpfulness.
+
+**A location may point at a line the author did not write, and that is accepted.** When `keep_warm` came from `defaults:`, `config.line_for("tools.t1.keep_warm")` returns `None` and the render falls back to the file plus the YAML path (behaviour 2's `Location` rendering). **The message's origin phrase is what carries the truth**, which is precisely why item 2 is mandatory rather than decorative. `C603`'s six timeout keys hit this every time, since `defaults:` is their only documented home.
+
+**8. Severity**
+
+`C600` **ERROR**; `C601` **WARNING**; `C602` **ERROR**; `C603` **ERROR**. Every `remedy` is non-empty. The shape matches behaviours 16 and 17: the single warning is a *"you probably expected something"* judgement about an author's intent, while all three errors are statements that the tool cannot serve a request as configured — `C600` never starts, `C602` rejects everything with 429, `C603` hands the runtime a number it cannot use.
+
+**9. Registration**
+
+Module-level constants `TSWAP_C600_RULE` … `TSWAP_C603_RULE` in `validate.py`, each a frozen `Rule` subclass instance whose `id` is its code, **no import-time self-registration**, appended to `BUILTIN_RULES` in code order after behaviour 17's four — **38 landed rules in total** (6 + 4 + 6 + 7 + 7 + 4 + 4). The four ids in code order are `TSWAP-C600`, `TSWAP-C601`, `TSWAP-C602`, `TSWAP-C603`.
+
+The green step extends **both** completeness constants, and both are required:
+
+- [`_EXPECTED_BUILTIN_IDS`](tests/unit/config/test_validate_registry_builtins.py:74) (behaviour 11a's file).
+- [`_LANDED_BUILTIN_IDS`](tests/unit/config/test_validate_names_groups.py:98) (behaviour 12a's file).
+
+**This is the fifth behaviour to pay the two-constant tax** that behaviours 14, 15, 16 and 17 recorded. Still not fixed here, for the reason each of them gave: collapsing them is worth its own step after 19, when the constant stops growing — **and behaviour 19 is the last growth, so that step is now next.** The new test file restates `_BEHAVIOUR_12_IDS` … `_BEHAVIOUR_17_IDS` lengths as module-top constants and anchors behaviour 18's block **by index**, never by tail or total count.
+
+**10. Behaviour 17's append test: VERIFIED index-anchored. No preparatory sub-step is required.**
+
+[`test_builtin_rules_append_the_behaviour_17_codes_in_code_order`](tests/unit/config/test_validate_mounts.py:1234) computes `first_c540 = ids.index(_BEHAVIOUR_17_IDS[0])`, asserts that index equals the sum of the five preceding block lengths, slices forward by `len(_BEHAVIOUR_17_IDS)`, and then checks object identity per constant. It carries **no** `len(BUILTIN_RULES)` assertion, **no** tail slice such as `ids[-4:]`, and no total count. Appending four rules after it changes nothing it measures. Its sibling [`test_rule_objects_carry_expected_ids_and_severities`](tests/unit/config/test_validate_mounts.py:1208) reads only the four C54x constants. **Behaviour 18 needs no 18.0 repair step** — unlike behaviour 15, which did.
+
+**11. Shipped pins checked, one by one**
+
+- **THE ONE REAL BREAK — [`test_unmapped_nested_key_is_c106_error_naming_the_key`](tests/unit/config/test_merge_semantics.py:278) needs checking, and passes.** It writes `tool_yaml={"batching": {"max_batch_size": 16, "zz_not_a_key": 3}}` and asserts exactly one `C106`. `zz_not_a_key` is **not** `enabled`, so `_FLATTENING_IGNORED` does not cover it and the `C106` still fires. **This test is not amended.** It is listed first because it is the test item 6(b) was most likely to break, and the `_FLATTENING_IGNORED`-rather-than-`_PARTIAL_BLOCKS` choice is what keeps it green.
+- **Safe — [`test_merge_semantics.py`](tests/unit/config/test_merge_semantics.py:71)'s local `FLATTENING_TABLE` copy** and its two table tests ([`test_flattening_table_is_one_nested_key_per_flat_field`](tests/unit/config/test_merge_semantics.py:235), [`test_flattening_maps_each_nested_key_to_its_flat_field`](tests/unit/config/test_merge_semantics.py:248)): the copy is a **local literal** that never imports `_FLATTENING_TABLE`, and item 6(b) adds `enabled` to a **separate** `_FLATTENING_IGNORED` set rather than to the table, so the table is byte-identical and the copy cannot drift. Had the design put `("batching", "enabled")` into `_FLATTENING_TABLE` itself, the "one nested key per flat field" test would have needed a target field to point at — another reason for the separate set.
+- **Safe — the 47-key pins**, [`test_values_covers_exactly_the_builtin_field_set`](tests/unit/config/test_resolver.py:115) and [`test_built_in_default_key_set_is_exhaustive_over_resolvable_fields`](tests/unit/config/test_defaults.py:324): behaviour 18 adds **no** key to `BUILT_IN_DEFAULTS` and **no** key to `values`. `enabled` is read and discarded (item 6(b)); the nine `C603` fields, `keep_warm`, `autostart`, `ttl` and `max_concurrent` are all already among the 47. **`values` stays 47; `BUILT_IN_DEFAULTS` stays 47.**
+- **Safe, and checked precisely because item 6(b) changes a VALUE — no shipped test pins the `batching.enabled: false` outcome.** Grepped for `enabled` across `tests/`: the only hits are unrelated (`external_scaler_enabled` in vendored docs). No test authors a `batching:` block containing `enabled`, so nothing asserts today's behaviour (a `C106` plus an unchanged `max_batch_size`). **The value change is unobserved by the shipped suite.**
+- **Safe — [`test_field_in_no_layer_resolves_to_builtin`](tests/unit/config/test_resolver.py:196)'s `max_batch_size == 8` case** and [`test_defaults.py`](tests/unit/config/test_defaults.py:74)'s literal `"max_batch_size": 8`: neither passes a `batching` block, so the override never fires and the built-in stands.
+- **Safe — [`test_inline_top_level_key_wins_over_flattened_twin`](tests/unit/config/test_merge_semantics.py:270)** (`inline={"max_batch_size": 32}` over `tool_yaml={"batching": {"max_batch_size": 16}}` → `32`): no `enabled` key, so the override never fires and inline still wins. Worth naming because it is the test that would break if the override were written as *"`enabled` absent means false"*. **Absent means absent.**
+- **Safe — [`test_defaults.py`](tests/unit/config/test_defaults.py:58)'s value table and [`EXPECTED_RESOLVABLE_FIELDS`](tests/unit/config/test_defaults.py:135):** `keep_warm: False`, `autostart: True`, `max_concurrent: None`, `ttl: 900`, `workers: 1`, `max_wait_ms: 20` and the six timeouts keep their documented values. Behaviour 18 changes **no default**; it only judges resolved values.
+- **Safe — [`test_schema.py`](tests/unit/config/test_schema.py:150)'s `FULL_REFERENCE_CONFIG`:** it writes `keep_warm: False` and `autostart: True` inside `defaults:` (both already fields there) and `keep_warm: True` inside a `tools:` entry (already a `ToolConfig` field). It writes **neither `autostart` nor `max_concurrent` inside a `tools:` entry**, so item 1(b)'s two additions are invisible to it — and **no shipped test asserts that either key is currently rejected as unknown**, verified by grep. The same finding A15 and A17 recorded.
+- **Safe — [`test_suggest.py`](tests/unit/config/test_suggest.py:46):** its candidate lists are **local literals** in the test, not derived from the schema models, so adding two `ToolConfig` fields cannot change a suggestion it pins. (`autostart` is already in both lists.)
+- **Safe — [`test_validate_config_is_pure_and_does_not_mutate_its_input`](tests/unit/config/test_validate_registry.py:719) and [`test_validate_config_ignores_the_ambient_environment`](tests/unit/config/test_validate_registry.py:760):** every `C60x` rule reads only `tool.values`, `tool.origins`, `config.path` and `config.line_for`. **No rule touches `config.raw`, `config.probe`, `config.home`, `config.gpu_count`, the filesystem, `os.environ` or the clock**, and none mutates anything. Behaviour 18 is the first rule group since behaviour 12 to need **no** ambient seam at all.
+- **Safe — [`test_validated_config_fields_and_defaults`](tests/unit/config/test_validate_registry.py:311) and [`test_validated_config_is_frozen`](tests/unit/config/test_validate_registry.py:334):** `ValidatedConfig` gains **no field** (contrast behaviours 15, 16 and 17, which each added one). Neither test is touched.
+- **Safe — [`test_resolved_tool_is_frozen_dataclass_with_pinned_fields`](tests/unit/config/test_resolver.py:99):** `ResolvedTool` gains **no carrier**. `enabled` is consumed inside `resolve_tool` and never stored.
+- **Safe — [`test_resolve_tool_is_pure_equal_inputs_equal_results`](tests/unit/config/test_resolver.py:344) and [`test_resolve_tool_deep_copies_inputs_on_entry`](tests/unit/config/test_resolver.py:372):** the override is a pure function of the already-deep-copied layers — no filesystem, no environment, no clock. **Behaviour 10's purity pin (plan line 189) is preserved**, which is the one property item 6(b) had to be checked against.
+- **Safe — the ttl tests**, [`test_ttl_minus_one_inherits_defaults_with_defaults_origin`](tests/unit/config/test_resolver.py:287) and [`test_ttl_legal_values_resolve_as_is`](tests/unit/config/test_resolver.py:314): [`_resolve_ttl`](src/tool_swap/config/resolver.py:644) is **not modified**. Item 4 *reads* the origin it already records.
+- **Safe — [`test_origin.py`](tests/unit/config/test_origin.py:1):** `OriginMap`, `Origin`, `OriginLevel` and `render()` are all unchanged. Item 2 adds a **prose** helper in `validate.py` and deliberately does not touch `render()`.
+- **Safe — behaviour 23's five-line config:** it declares none of `keep_warm`, `autostart`, `ttl`, `max_concurrent` or `batching`, inheriting `False`, `True`, `900`, `None` and the batching defaults, so all four rules stay silent.
+- **Watch, not a break — behaviour 24's `tools.example.yaml`:** item 4's option (a) exists precisely so a `defaults.ttl` beside a `keep_warm: true` tool does **not** warn, which is the shape `plan/02` §3 ships and the shape that fixture will follow. Under `--strict` a `C601` there would be a CI failure; under the pinned reading it cannot fire. No committed test exists yet.
+
+**12. Assumption A19, and the rule/`ValidatedConfig` boundary**
+
+**A19 (new) — the schema widening of item 1(b) plus the `batching.enabled` surface of item 6(b).** Both move the accept/reject boundary and therefore need an `A`-number rather than a plan correction; both are recorded in §5 and are worth one line in the PR description. In summary: `autostart:` and `max_concurrent:` become legal in a `tools.yaml` **tool entry** (they are `TSWAP-C101` today, which makes `C602` unreachable and `C600` reachable only via `defaults:`); `batching: {enabled: ...}` becomes legal in a **`tool.yaml`** (a `TSWAP-C106` today) and stays illegal inline; `max_concurrent` stays illegal in `defaults:`; the six `C603` timeout keys stay legal in `defaults:` only.
+
+Every `C60x` rule reads only `config.tools[<key>].values[...]`, `config.tools[<key>].origins`, `config.path` and `config.line_for`. **No rule reads `config.raw`** (every field is per-tool and fully resolved), **none reads `config.probe`, `config.home` or `config.gpu_count`**, none touches the filesystem, `os.environ` or the clock, none calls the loader, and none imports anything.
 
 ### Behaviour 19 — D9 group starvation, and group capacity (§6 rules 12, 13)
 
@@ -1592,6 +1847,8 @@ Behaviours 12–19 are siblings and could be reordered or parallelised; the list
 
 **Behaviour 15 carries a mandatory preparatory sub-step (added 2026-08-18).** Before behaviour 15's red step, [`test_builtin_rules_append_the_behaviour_14_codes_in_code_order`](tests/unit/config/test_validate_reserved.py:264) must be position-stabilised — it is tail-anchored (`ids[-6:]`, `len(BUILTIN_RULES) == 16`) and any append breaks it. It is a test-only change, committed on its own, exactly as 12a was: **15.0 (repair, suite green, commit) → 15 red → 15 green.** See behaviour 15's contract block, item 0. The same hazard applies to every later appending behaviour (16–19), so each should check its predecessor's append-order test for tail anchoring before starting.
 
+**Behaviours 16, 17 and 18 need NO such sub-step (verified 2026-08-19).** Each predecessor's append-order test was checked and is index-anchored: behaviour 16's block verified 15's, behaviour 17's verified 16's, and behaviour 18's block item 10 verifies [`test_builtin_rules_append_the_behaviour_17_codes_in_code_order`](tests/unit/config/test_validate_mounts.py:1234) — it computes `ids.index(_BEHAVIOUR_17_IDS[0])`, compares against the sum of the five preceding block lengths, and carries no tail slice and no `len(BUILTIN_RULES)` assertion. **Behaviour 19 must run the same check against behaviour 18's own append test.**
+
 ---
 
 ## 5. Assumptions — ALL CONFIRMED (2026-08-17)
@@ -1625,6 +1882,14 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 **Plan correction (2026-08-19) — behaviour 17's Windows-path edge case. Not a new assumption.** Plan line 1095 states that a host path containing `:` *"is documented as unsupported and produces `C540`"*. That is true only for spellings that split into **four or more** parts (`C:\data:/weights:ro`); the three-part spelling `C:\data:/weights` parses cleanly as `host="C"`, `container="\data"`, `mode="/weights"` and therefore yields `TSWAP-C541` (bad mode) **and** `TSWAP-C542` (non-absolute container path) instead. Detecting it as `C540` would require a "does this look like a drive letter?" heuristic inside a parser whose whole virtue is that it is a colon count. Nothing user-visible widens or narrows — the entry is an error before and after, with a **more** specific message — so this needs **no** confirmation from [issue #2](https://github.com/iar3-r8/tool-swap/issues/2) and no new `A`-number. The trap is carried in `C541`'s remedy instead, which states that mount entries are split on `:` and that a host path containing one is unsupported. Recorded here and in behaviour 17's block, item 5, for visibility.
 
 **Behaviour 17 note (2026-08-19) — `TSWAP-C503` is a resolver diagnostic, not a rule, and behaviour 17 does not modify it. Not an assumption; a verification recorded for visibility.** Pinning behaviour 17 raised the question of whether `C503` compares raw mount strings (in which case `a:/x:ro` and `a:/x` would not collide) or parsed container paths. Verified against the shipped code: [`_split_mount`](src/tool_swap/config/resolver.py:861) already splits on `:` and [`_duplicate_container_paths`](src/tool_swap/config/resolver.py:816) keys on `parts[1]`, so those two entries **already** collide on `/x` and already warn today. **No shipped rule is modified and no shipped test changes.** Two consequences are recorded rather than fixed: `C503`'s location carries `file=<the tool name>` (the resolver has no config path), which is inconsistent with the `C54x` locations but is a landed pin behaviour 17 must not quietly rewrite; and a colon-less entry counts as its own container path, so two layers each writing a bare `/data` produce a `C503` alongside two `C540`s — two diagnostics for a mistake genuinely made twice, each with a correct message.
+
+**A19 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 18's contract block moves the accept/reject boundary in **three** places, all in the same direction (toward the documented spec) and all necessary to make its four codes reachable:
+
+1. **`autostart: bool | None` and `max_concurrent: int | None` are added to the inline [`ToolConfig`](src/tool_swap/config/schema.py:151) only.** This is the **same trap and the same resolution as A15 and A17**. `plan/02` §5.3's field table lists both as tool-level keys (`autostart` *"bool, `true`, If `false`, a request to a stopped model returns 503 instead of starting it"*; `max_concurrent` *"int, unset, Optional cap on in-flight requests to a `READY` tool; **429** beyond it"*), yet `ToolConfig` has neither, so a tool writing either is rejected by `extra="forbid"` as a `TSWAP-C101` before any rule runs. The consequence is severe rather than cosmetic: **`TSWAP-C602` is completely unreachable** — no config can express `max_concurrent: 0` anywhere, because the key is on no model — and `TSWAP-C600` is reachable only through `defaults: {autostart: false}` plus an inline `keep_warm: true`. `DefaultsConfig` already has `autostart` and deliberately does **not** gain `max_concurrent` (§3's `defaults:` block does not list it and §5.3 presents it as a per-tool load-shedding knob, so a `defaults.max_concurrent` stays a `TSWAP-C101`); `ToolYamlConfig` gains neither, following A14/A15/A17.
+2. **`batching: {enabled: ...}` becomes a recognised `tool.yaml` key, and stays illegal inline.** ADR-0005 and §5.5 both require `enabled: false` to mean *"`max_batch_size: 1`, and nothing else"*, and behaviour 18's `C603` bullet asks for that outcome to be asserted. Today the key is in **no** schema model, in **no** [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28) entry and in **no** `BUILT_IN_DEFAULTS` slot, so a `tool.yaml` writing it emits `TSWAP-C106` (*"does not map to any tool field"*) and the value is discarded — the translation the ADR mandates happens nowhere in the shipped code. The green step recognises the key through a new `_FLATTENING_IGNORED` set — **not** by adding `batching` to `_PARTIAL_BLOCKS`, which would silence `C106` for every unmapped `batching` key and lose the typo protection §6 rule 1 exists for — and applies the translation inside `resolve_tool`, leaving it a pure function of the layers. An inline `batching:` block is **not** added to `ToolConfig`: §5.5's field table spells the key block-scoped (`batching.enabled`), §4 authors the block in `tool.yaml`, and adding M1's first nested inline block for one boolean is not warranted.
+3. **The six `TSWAP-C603` timeout keys stay legal in `defaults:` only.** `start_timeout`, `ready_timeout`, `queue_timeout`, `request_timeout`, `drain_timeout` and `stop_timeout` appear in §3's `defaults:` block and in **no** §5 field table, so `defaults:`-level is their documented home and **no** widening is proposed. The consequence is that `C603`'s timeout clause always locates at a `tools.<key>.<field>` path the author did not write, with the message's origin phrase carrying the truth — which is why behaviour 18's origin citation is mandatory rather than decorative.
+
+**No shipped test asserts any of the current rejections** (verified: [`test_schema.py`](tests/unit/config/test_schema.py:227)'s `FULL_REFERENCE_CONFIG` writes neither `autostart` nor `max_concurrent` inside a `tools:` entry, and no committed test writes a `batching: {enabled: ...}` block at all). **No shipped test pins the current `batching.enabled: false` outcome either**, so point 2's value change is unobserved by the suite. The user-visible consequences to confirm: in M1, `autostart:` and `max_concurrent:` are legal in a `tools.yaml` tool entry; `autostart:` remains legal in `defaults:` and `max_concurrent:` remains illegal there; both remain illegal in a `tool.yaml`; and `batching: {enabled: false}` is legal in a `tool.yaml`, forcing `max_batch_size: 1` regardless of any authored value, while an inline `batching:` stays a `TSWAP-C101`.
 
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
