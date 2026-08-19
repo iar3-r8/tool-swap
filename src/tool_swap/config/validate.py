@@ -238,6 +238,11 @@ class ValidatedConfig:
             unknown (default); behaviour 16's trailing, keyword-only,
             defaulted field.  Nothing in M1 populates it, so ``TSWAP-C521``
             is skipped silently in production.
+        home: the home directory ``~`` expansion uses, or ``None`` for the
+            REAL home (default); behaviour 17's trailing, keyword-only,
+            defaulted field.  ``None`` lets ``parse_mount`` read the real
+            ``$HOME`` via :meth:`Path.expanduser`; an injected ``Path``
+            replaces a leading ``~`` literally, keeping the rules pure.
     """
 
     tools: dict[str, ResolvedTool]
@@ -246,6 +251,7 @@ class ValidatedConfig:
     path: Path = field(default=Path("tools.yaml"), kw_only=True)
     probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
     gpu_count: int | None = field(default=None, kw_only=True)
+    home: Path | None = field(default=None, kw_only=True)
 
 
 #: The module-level registry of rules.  A single live object (not a
@@ -2418,6 +2424,342 @@ TSWAP_C532_RULE: Final[Rule] = _C532Rule(
 )
 
 
+# ---------------------------------------------------------------------------
+# Behaviour 17 — mounts (§6 rule 9, §5.6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParsedMount:
+    """One parsed ``host:container[:ro|rw]`` entry.
+
+    The parsed view the four ``C54x`` rules and behaviour 22 (``config
+    show``) share: it is a pure function of the authored string, the
+    config directory and the injected home, and it is never written back
+    into ``values`` (which keeps holding the authored strings).
+
+    Attributes:
+        host: the host part as authored, after leading-``~`` expansion;
+            may still be relative.
+        container: the container part as authored.
+        mode: the mode as authored, or ``"ro"`` when the entry omitted
+            the third part (a ``"RO"`` survives verbatim — ``C541`` is
+            the rule that rejects it).
+        mode_defaulted: ``True`` iff the authored entry had no third
+            part.
+        resolved_host: the host resolved against the config file's
+            directory, LEXICALLY (normpath; no disk, no CWD).
+    """
+
+    host: str
+    container: str
+    mode: str
+    mode_defaulted: bool
+    resolved_host: Path
+
+
+def _expand_host(host: str, home: Path | None) -> str:
+    """Expand a LEADING ``~`` in a host part (plan item 3).
+
+    Only a leading ``~`` expands, exactly :meth:`Path.expanduser`
+    semantics: ``"a~/b"`` is a literal directory name.  When ``home`` is
+    provided the expansion is a literal substitution and ``os.environ``
+    is never read; ``None`` means the real home.
+
+    Args:
+        host: the host part as authored.
+        home: the injected home, or ``None`` for the real ``$HOME``.
+
+    Returns:
+        The host with its leading ``~`` replaced (or unchanged).
+    """
+    if home is None:
+        return str(Path(host).expanduser())
+    if host == "~":
+        return str(home)
+    if host.startswith("~/"):
+        return str(home / host[2:])
+    return host
+
+
+def parse_mount(
+    entry: str, *, config_dir: Path, home: Path | None = None
+) -> ParsedMount | None:
+    """Parse one mount entry; ``None`` means unparseable (``TSWAP-C540``).
+
+    PURE: no disk access, no environment read when ``home`` is given.
+    The entry is split on ``":"`` BEFORE any expansion (expansion cannot
+    introduce or remove a colon): it parses iff there are exactly 2 or
+    3 parts and every part is non-empty.  A 2-part entry gets
+    ``mode="ro"`` with ``mode_defaulted=True``; a 3-part entry keeps the
+    mode AS AUTHORED (``C541`` judges it, not the parser).  The host
+    resolves against ``config_dir`` lexically (shared :func:`_resolved`).
+
+    Args:
+        entry: the authored mount string.
+        config_dir: the config file's directory — the resolution base
+            for relative hosts (never a tool's ``base_dir``).
+        home: the home for leading-``~`` expansion, or ``None`` for the
+            real home.
+
+    Returns:
+        The parsed view, or ``None`` for exactly the ``C540`` shapes.
+    """
+    parts = entry.split(":")
+    if len(parts) not in (2, 3) or not all(parts):
+        return None
+    host = _expand_host(parts[0], home)
+    if len(parts) == 3:
+        mode = parts[2]
+        mode_defaulted = False
+    else:
+        mode = "ro"
+        mode_defaulted = True
+    return ParsedMount(
+        host=host,
+        container=parts[1],
+        mode=mode,
+        mode_defaulted=mode_defaulted,
+        resolved_host=_resolved(config_dir, host),
+    )
+
+
+def _string_mount_entries(config: ValidatedConfig) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(tool key, index, entry)`` for every string ``mounts`` entry.
+
+    Non-list ``mounts`` values and non-string entries are skipped
+    silently: ``TSWAP-C105`` owns both at the schema layer, and
+    re-reporting either per rule would bury the schema's message.  One
+    shared iteration keeps the four rules on identical entry sets.
+
+    Args:
+        config: the validated configuration to scan.
+
+    Yields:
+        ``(key, i, entry)`` for every string entry, in tool order and
+        list order (``i`` is 0-based into the resolved list).
+    """
+    for key, tool in config.tools.items():
+        mounts = tool.values.get("mounts")
+        if not isinstance(mounts, list):
+            continue
+        for i, entry in enumerate(mounts):
+            if isinstance(entry, str):
+                yield key, i, entry
+
+
+class _C540Rule(Rule):
+    """``TSWAP-C540``: an unparseable mount entry."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every entry that :func:`parse_mount` cannot parse.
+
+        Suppression is per ENTRY, never per tool: an entry that fails
+        parsing is ``None`` for :func:`parse_mount`, so C541/C542/C543
+        (which all re-run it and skip on ``None``) cannot fire on the
+        same entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per unparseable entry at
+            ``tools.<key>.mounts.<i>`` naming the value and both
+            expected forms verbatim.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            if parse_mount(entry, config_dir=config.path.parent, home=config.home):
+                continue
+            message = (
+                f"Mount entry {entry!r} is unparseable: expected "
+                "host:container or host:container:ro|rw"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C541Rule(Rule):
+    """``TSWAP-C541``: a mount mode outside ``{ro, rw}``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every 3-part entry whose mode is not literally ``ro``/``rw``.
+
+        Matched EXACTLY and case-sensitively (assumption A18): ``:RO``
+        is a C541, not a synonym.  A defaulted mode (2-part entry)
+        never fires — the parser's ``"ro"`` is already legal.
+        Independent of C542: both may fire on one entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.mounts.<i>`` naming the mode via ``repr`` and
+            listing both legal values.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None or parsed.mode_defaulted:
+                continue  # C540 owns the unparseable; the default is legal
+            if parsed.mode in ("ro", "rw"):
+                continue
+            message = (
+                f"Mount entry {entry!r} has mode {parsed.mode!r}; the "
+                "only legal modes are ro and rw"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C542Rule(Rule):
+    """``TSWAP-C542``: a non-absolute container path."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every parsed entry whose container part is not absolute.
+
+        Docker requires an absolute destination; Windows-style container
+        paths are unsupported and the message says so.  Independent of
+        C541: both may fire on one entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.mounts.<i>`` naming the container part.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None or parsed.container.startswith("/"):
+                continue
+            message = (
+                f"Mount entry {entry!r} has a non-absolute container "
+                f"path {parsed.container!r}: Docker requires an "
+                "absolute destination, and Windows-style container "
+                "paths are unsupported"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C543Rule(Rule):
+    """``TSWAP-C543``: the host path does not exist (WARNING)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on every parsed entry whose host is neither file nor dir.
+
+        Either predicate satisfies existence — a bind source is
+        legitimately a directory (weights caches) or a file (a socket, a
+        single model file).  Never an error: the path may be created
+        before the container starts.  Not suppressed by C541/C542, which
+        say nothing about the host side.
+
+        Args:
+            config: the validated configuration to check (disk
+                knowledge arrives only through ``config.probe``).
+
+        Returns:
+            One WARNING per missing host at ``tools.<key>.mounts.<i>``,
+            naming the absolute expanded ``str(resolved_host)``.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None:
+                continue
+            if probe.is_file(parsed.resolved_host) or probe.is_dir(
+                parsed.resolved_host
+            ):
+                continue
+            message = (
+                f"Mount host path does not exist: {str(parsed.resolved_host)} "
+                "(it may be created before the container starts)"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C540`` — an unparseable mount entry (§6 rule 9).
+TSWAP_C540_RULE: Final[Rule] = _C540Rule(
+    id="TSWAP-C540",
+    remedy=(
+        "Rewrite the entry as host:container or host:container:ro|rw; "
+        "a host path containing ':' (a Windows drive letter, for "
+        "example) is not supported — mount entries are split on ':'"
+    ),
+)
+
+#: ``TSWAP-C541`` — a mount mode outside {ro, rw} (§6 rule 9).
+TSWAP_C541_RULE: Final[Rule] = _C541Rule(
+    id="TSWAP-C541",
+    remedy=(
+        "Use ro or rw as the third part, exactly lowercase; a host "
+        "path containing ':' (a Windows drive letter, for example) is "
+        "not supported — mount entries are split on ':'"
+    ),
+)
+
+#: ``TSWAP-C542`` — a non-absolute container path (§6 rule 9).
+TSWAP_C542_RULE: Final[Rule] = _C542Rule(
+    id="TSWAP-C542",
+    remedy="Make the container path absolute (start it with '/')",
+)
+
+#: ``TSWAP-C543`` — the host path does not exist (§6 rule 9, WARNING).
+TSWAP_C543_RULE: Final[Rule] = _C543Rule(
+    id="TSWAP-C543",
+    severity=Severity.WARNING,
+    remedy=(
+        "Confirm the path exists on the host running the daemon — mount "
+        "entries are host paths interpreted by the Docker daemon, not "
+        "paths inside the router container — wherever the entry was "
+        "set: the tool's mounts:, the defaults: block, or its "
+        "tool.yaml; the path may also be created before the container "
+        "starts"
+    ),
+)
+
+
 #: Every rule M1 ships, in code order (behaviour 11a): the single list
 #: M5 moves into preflight.  Behaviours 13-19 append their rules here,
 #: in code order, as they land.
@@ -2452,6 +2794,10 @@ BUILTIN_RULES: Final[tuple[Rule, ...]] = (
     TSWAP_C530_RULE,
     TSWAP_C531_RULE,
     TSWAP_C532_RULE,
+    TSWAP_C540_RULE,
+    TSWAP_C541_RULE,
+    TSWAP_C542_RULE,
+    TSWAP_C543_RULE,
 )
 
 
