@@ -2831,6 +2831,285 @@ app.add_typer(config_app, name="config")
 - **Error behaviour:** none — this is the golden path. Any diagnostic at all is a test failure, which is what makes it a meaningful guard against over-eager warnings accumulating in later milestones.
 - **Files:** `tools/example_echo/{tool.yaml,handler.py,requirements.txt}` (new fixtures — see assumption **A8**), `tests/unit/config/test_minimal_config.py`.
 
+#### Confirmed contract details (2026-08-20)
+
+Behaviour 23 is the only ledger item whose green step ships **production artifacts** (three committed fixture files) rather than source. Everything below is pinned against the shipped loader, resolver, rule set and CLI so that the red step needs no guessing and the green step is a transcription.
+
+**0. What the shipped code forces before any choice is made**
+
+| Fact | Where | Consequence for B23 |
+|---|---|---|
+| A relative `path:` resolves against **the root config file's directory**, never the CWD | [`_resolve_tool_path(value, base_dir)`](src/tool_swap/config/loader.py:296) — `(base_dir / Path(value).expanduser()).resolve()` — called with `base_dir = path.parent` at [loader.py:715](src/tool_swap/config/loader.py:715) | The "same file validates from a different CWD" edge is **real and testable**: `monkeypatch.chdir` anywhere, keep the config and the tool directory together, and resolution must still succeed. Already pinned at the unit level by [`test_include_cwd_independent_data_and_layer_identical`](tests/unit/config/test_includes.py:246); B23 re-asserts it end to end |
+| A `path:` whose directory **does not exist** is skipped silently (no `C005`) | [loader.py:452-453](src/tool_swap/config/loader.py:452) | The RED step fails on `C300` + `C511` (no description, no image source), **not** on `C005`. Pinned so the red output is expected, not surprising |
+| `tool.yaml` is **never schema-validated** (only the root document is, via [`validate_root`](src/tool_swap/config/schema.py:308) on `loaded.data`) | [`_read_tool_yaml`](src/tool_swap/config/loader.py:385); [`run_pipeline`](src/tool_swap/cli/_pipeline.py:130) | No `C101` can fire for a `tool.yaml` key. The only `tool.yaml` key risk is the resolver's `C106` for an unmapped key inside a **known** block |
+| Only `description` and `handler` are lifted from `tool.yaml` as carriers, plus `runtime.requirements`; every other top-level `tool.yaml` key is used **only** if it is one of the 47 `BUILT_IN_DEFAULTS` names | [resolver.py:201-217](src/tool_swap/config/resolver.py:201), [`_flatten_tool_yaml`](src/tool_swap/config/resolver.py:471) | **An `image:` in `tool.yaml` is silently dropped** and the tool would then trip `C511`. The fixture's image source **must** be a managed `handler:` — this is forced, not preferred (it also agrees with A15, which put `image` on `ToolConfig` only) |
+| `build:` is an **inline-only** carrier and `C515` probes the real filesystem for the context directory and the Dockerfile | [`_carrier_block`](src/tool_swap/config/resolver.py:257), [`_C515Rule`](src/tool_swap/config/validate.py:1681) | A `build:` fixture would need a committed `Dockerfile`. Rejected: it adds a file the spec does not list and a probe the golden path does not need |
+| There is **no `function:` image source** in M1 — the three sources are `image` / `build` / `handler` | [`_image_sources`](src/tool_swap/config/validate.py:1447) | Nothing reads `handler.py`'s *contents*; `C513` only probes `is_file`. Nothing reads `requirements.txt`'s contents; `C514` only probes `is_file` |
+| `make lint` covers `src/` only (`ruff check src/`, `ruff format --check src/`, `mypy src/`) | [Makefile:14-17](Makefile:14) | `tools/example_echo/handler.py` is **not** linted or type-checked. It still gets a module docstring, because it is the example users copy |
+| pytest collects `testpaths = ["tests"]` | [pyproject.toml:65](pyproject.toml:65) | `tools/example_echo/handler.py` is never collected. `pythonpath = ["src", "."]` does make `import tools` possible; nothing imports it, and no module named `tools` exists in either package |
+| `.gitignore` holds only `plan/task/`, `.env`, `anvil.local.yaml`, `zoo-code-settings.json`, `.roo/mcp.json`, `.venv/.anvil-requirements-stamp` | [.gitignore](.gitignore:1) | **Nothing ignores `tools/`** — the fixtures are committable with no `.gitignore` change. (Contrast `plan/08_REPO_LAYOUT.md`'s `models/` block, which is *"gitignored except examples"*; under A8 we are not in that directory) |
+
+**1. The three committed fixture files — copy verbatim**
+
+`tools/example_echo/tool.yaml`:
+
+```yaml
+name: example_echo
+version: "0.1.0"
+description: Echo the text you send it back, unchanged.
+handler: handler.py:EchoHandler
+
+runtime:
+  requirements: requirements.txt
+
+inputs:
+  - name: text
+    type: string
+    description: The text to echo back, unchanged.
+```
+
+`tools/example_echo/handler.py`:
+
+```python
+"""The dependency-free example tool: it echoes its input back.
+
+Used by behaviour 23's golden-path test and by ``tools.example.yaml``
+(behaviour 24).  M1 never imports this file — ``TSWAP-C513`` only probes
+that it exists — so it is deliberately trivial; the batched calling
+convention it follows is ADR-0005's (every handler takes and returns a
+list).
+"""
+
+
+class EchoHandler:
+    """Return each request unchanged."""
+
+    def predict(self, batch: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Echo every item of the batch.
+
+        Args:
+            batch: One dict per request, each carrying ``text``.
+
+        Returns:
+            One dict per request, in the same order.
+        """
+        return [{"text": item["text"]} for item in batch]
+```
+
+`tools/example_echo/requirements.txt`:
+
+```
+# No third-party dependencies: the echo tool uses only the standard library.
+```
+
+Notes on each choice, one line each:
+
+- **`name: example_echo` is mandatory-or-absent, and present is better**: a mismatch is [`C201`](src/tool_swap/config/loader.py:349), and writing it proves the fixture agrees with the `tools:` key the config uses.
+- **`version:` is inert in M1** (not a `BUILT_IN_DEFAULTS` key, not a known block, so it is neither flattened nor a `C106`); it is kept because §4's `tool.yaml` reference authors it and this file is the example users copy.
+- **`handler: handler.py:EchoHandler`** — the file part ends in `.py` (A16) and the class part is a non-keyword identifier, so [`_parse_handler`](src/tool_swap/config/validate.py:1377) succeeds and `C512`/`C513`/`C516` are all satisfied.
+- **`runtime.requirements: requirements.txt`** rather than a top-level `requirements:` — [resolver.py:215-217](src/tool_swap/config/resolver.py:215) is the pinned path from `tool.yaml` to the `requirements` carrier, and `runtime` is a `_PARTIAL_BLOCK` so no unmapped-key `C106` is possible. Declaring it is what makes the shipped `requirements.txt` *exercised* (by `C514`) rather than decorative.
+- **One `inputs:` entry, described** — decided, with rationale: it makes `config show` print `inputs: 1 entry` (a real carrier, not just the 30 built-ins), it exercises the S-layer end to end on the golden path (`compile_inputs` → meta-schema) at the cost of three lines, and behaviours 24/25 will show this file to users as *the* minimal tool. `outputs:`/`params:`/`json_schema:` are **omitted**: they would add no new clean-path guard (B20 covers both compile sides exhaustively) and `outputs` carries a `C302`/`S120` WARNING risk for zero benefit.
+- **No `batching:`, `resources:`, `lifecycle:` blocks** — every one of the 30 tool fields must fall to the built-in layer for item 6's assertion to mean anything.
+
+**2. The rule checklist — all 41 landed rules plus the S-codes, and why each is silent**
+
+Read with the fixture above and the golden config of item 3. Most entries are a *silence by construction* — the rule's operand is absent or at its built-in value — rather than a near-miss; the two worth reading twice are `C223` and `C613`, which are silent for reasons specific to the synthesised `default` group.
+
+| Code | Why the fixture does not trip it |
+|---|---|
+| `C000` | The config file is written by the test and exists |
+| `C001` | Valid YAML in both files |
+| `C002` | No key appears twice in any mapping |
+| `C003` / `C004` | Non-empty; the root is a mapping |
+| `C005` | The tool directory exists **and** holds `tool.yaml` |
+| `C006` | `path:` names a directory, not a file |
+| `C007` | `tool.yaml` contains no `path:` key |
+| `C010` / `C011` / `C012` | No `${VAR}` anywhere; no `--env-file`; the config's directory is a `tmp_path` with no `.env` (an argument for `tmp_path` over the repo root, which may hold a developer's gitignored `.env`) |
+| `C101` | Root keys are `tools` → `example_echo` → `path`, all declared on [`RootConfig`](src/tool_swap/config/schema.py:295)/[`ToolConfig`](src/tool_swap/config/schema.py:151). `tool.yaml` is not schema-checked at all |
+| `C104` / `C105` | No `devices:` and no shape error anywhere |
+| `C106` | The only nested block is `runtime:`, a `_PARTIAL_BLOCK` whose unmapped keys are ignored ([resolver.py:501-504](src/tool_swap/config/resolver.py:501)) |
+| `C201` | `tool.yaml`'s `name` equals the `tools:` map key |
+| `C202` | One tool, one `path:` |
+| `C210` | `example_echo` matches `^[a-z0-9][a-z0-9_-]*$` |
+| `C211` | One tool |
+| `C220` | The tool's `group` resolves to `default`, which [`effective_groups`](src/tool_swap/config/validate.py:330) synthesises because `groups:` is absent |
+| `C221` / `C222` | The synthesised group is `{max_resident: 4, eviction: "lru"}` — `>= 1` and in the valid set |
+| `C223` | `referenced == {"default"}` and `groups == {"default"}`, so `orphans == []` and the rule returns `[]` at [validate.py:665-667](src/tool_swap/config/validate.py:665). **Note the mechanism**: the suppression clause (`if not referenced.intersection(groups)`) is *not* what saves us — the synthesised `default` group **is** referenced, which is the stronger and more durable reason |
+| `C300` | `tool.yaml` supplies a non-blank `description` |
+| `C301` | The single `inputs` entry has a non-blank `description` |
+| `C302` / `C303` | No `outputs:`, no `params:` (`_check_entry_descriptions` returns `[]` for a non-list block) |
+| `C400` / `C403` / `C405` | No `soft_ttl`, `scalar_inputs` or `max_batch_bytes` in any layer, so `reserved_keys == ()` |
+| `C401` / `C402` | `runtime_server` falls to the built-in `"bentoml"` |
+| `C404` | The `inputs` entry carries no `batchable` key |
+| `C510` | Exactly one source present: `handler` (image `None`, build `None`) |
+| `C511` | That one source is present — supplied by the `tool.yaml` layer, which is why `path:` alone is legal |
+| `C512` | `handler.py:EchoHandler` parses |
+| `C513` | `base_dir` is the tool directory ([`_tool_base`](src/tool_swap/config/validate.py:1433)), so the probe finds the committed `handler.py` |
+| `C514` | Same base; the committed `requirements.txt` exists |
+| `C515` | `build is None` → the rule queries no disk. **This is why an `image:`/`build:` fixture was avoided**: a `build:` source would demand a committed `Dockerfile` under `REAL_FILESYSTEM` |
+| `C516` | `handler.py` and `requirements.txt` normalise **inside** the tool directory — no `../`, no absolute path |
+| `C520` | `devices` falls to the built-in `[]` — no entries to judge |
+| `C521` | `config.gpu_count is None` in production and in the pipeline (nothing populates it), so the rule returns `[]` immediately |
+| `C522` | Empty `devices` |
+| `C523` | `workers` is the built-in `1` |
+| `C530` / `C531` | `expose_host_port` is the built-in `False`; both rules exclude `bool` before `int` |
+| `C532` | No `backend:` block, so [`effective_port_range`](src/tool_swap/config/validate.py:357) returns a fresh copy of `BackendConfig.port_range` = `[7000, 7999]` — two ints, in range, not inverted |
+| `C540`–`C543` | `mounts` falls to the built-in `[]` — no entries to parse or probe |
+| `C600` | `keep_warm` is `False` |
+| `C601` | `keep_warm` is `False` (and no explicit `ttl` was written at any layer) |
+| `C602` | `max_concurrent` is the built-in `None` |
+| `C603` | Every one of the nine table fields is at its built-in value: `max_batch_size 8 >= 1`, `max_wait_ms 20 >= 0`, `workers 1 >= 1`, and the six timeouts `120/600/300/300/30/30`, all `> 0` |
+| `C610` | The single member has `keep_warm: False`, so `all(... is True)` is false; capacity `4 >= 1` regardless |
+| `C612` | The synthesised `default` group declares no `devices`, so it does not participate |
+| `C613` | Guarded by `if "groups" not in config.raw: return []` at [validate.py:3304](src/tool_swap/config/validate.py:3304) — **that guard exists for this behaviour**, and B23's test is what keeps it honest |
+| `C999` | No rule raises |
+| `S100`–`S110`, `S120`, `S130`, `S140` | One well-formed `inputs` entry: a non-empty identifier `name`, a `type` from the six, a non-blank string `description`, no `required`/`semantic`/`items`, no duplicate names, no `params:` to collide with, no `json_schema:` to conflict, and the compiled schema (`$schema`, `type`, `properties`, `additionalProperties: false`; `required` omitted because it is empty) passes `validate_against_metaschema`. `outputs`/`params`/`json_schema` are `None` → no schema, no diagnostics |
+
+**3. The golden five-line config, and where it lives**
+
+Verbatim, exactly the spec's snippet — **three** non-comment lines, comfortably inside R4's five:
+
+```yaml
+tools:
+  example_echo:
+    path: ./tools/example_echo
+```
+
+**Pinned: the tool DIRECTORY is the committed artifact; the config file is written by the test to `tmp_path`.** Rationale, in order of weight:
+
+1. **A8's point is that the *fixtures* ship** — `tools/example_echo/` is what `tools.example.yaml` (B24) and the generated docs (B25) point at. Nothing in the spec asks for a committed root `tools.yaml`.
+2. **A committed root `tools.yaml` would change the CLI's default behaviour** for every developer and every future test: `tswap validate` with no arguments currently exits 2 with `C000`, and a root config would silently make it exit 0 against a file nobody asked to validate.
+3. **`.env` discovery**: [loader.py:263](src/tool_swap/config/loader.py:263) auto-reads `<config dir>/.env`. The repo root may hold a developer's gitignored `.env`; `tmp_path` never does. A golden path that depends on a machine's untracked file is not a golden path.
+4. The CWD edge is *only* expressible with a relative `path:`, and a relative `path:` resolves against the config's directory — so the config and the tool directory must sit in the same tree. The test therefore **copies the committed tool directory into `tmp_path`**.
+
+**4. The test file: `tests/unit/config/test_minimal_config.py`**
+
+It drives **both** layers, deliberately: the pipeline form is the mechanical guard, the CLI form is the user-facing claim, and each is three lines.
+
+```python
+ROOT = Path(__file__).resolve().parents[3]
+COMMITTED_TOOL_DIR = ROOT / "tools" / "example_echo"
+
+#: The spec's snippet, verbatim (plan, behaviour 23, "Inputs").
+MINIMAL_CONFIG = "tools:\n  example_echo:\n    path: ./tools/example_echo\n"
+
+
+def _plant(tmp_path: Path) -> Path:
+    """Copy the COMMITTED tool directory next to a tmp_path config."""
+    shutil.copytree(COMMITTED_TOOL_DIR, tmp_path / "tools" / "example_echo")
+    config = tmp_path / "tools.yaml"
+    config.write_text(MINIMAL_CONFIG, encoding="utf-8")
+    return config
+```
+
+- **Registry isolation**: copy the autouse `_restore_registry` fixture verbatim from [`test_config_show_cli.py`](tests/unit/cli/test_config_show_cli.py:154) — `run_pipeline` calls `register_builtin_rules()`, and leaf test directories have no `__init__.py`, so it is copied, not imported (the shipped precedent).
+- **Runner**: the shipped `_make_runner()` pattern — `CliRunner(env={**os.environ, "COLUMNS": "80", "TERM": "linux", "NO_COLOR": "1"})`.
+- **The pipeline form** calls [`run_pipeline(config, env={}, env_file=None)`](src/tool_swap/cli/_pipeline.py:85) directly with an **empty** env (the golden config interpolates nothing, and an empty env proves it).
+- **A test file in `tests/unit/config/` importing `tool_swap.cli._pipeline` is fine**: the import-linter contracts constrain `tool_swap` ↔ `tool_swap_runtime` only, and behaviour 26's leaf rule is about `src/`, not tests.
+
+**5. The `≤ 5` check — exact algorithm, in the test file**
+
+```python
+def _non_comment_lines(text: str) -> list[str]:
+    """The config's significant lines: blank and #-comment lines dropped."""
+    return [
+        line
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_the_minimal_config_is_at_most_five_lines() -> None:
+    """R4: 'a working single-model config must fit in five lines'."""
+    assert len(_non_comment_lines(MINIMAL_CONFIG)) <= 5
+```
+
+Asserted against the **same constant the other tests write to disk**, so the promise cannot drift from the file that proves it. `<=`, not `==`: R4 is a ceiling, and the snippet uses three.
+
+**6. What the test asserts — the pinned set**
+
+| # | Test | Assertion |
+|---|---|---|
+| 1 | `test_the_minimal_config_is_at_most_five_lines` | item 5's helper, `<= 5` |
+| 2 | `test_pipeline_reports_zero_diagnostics` | `run_pipeline(...).diagnostics == []` — **the mechanical guard**: loader + root schema + resolver + all 41 rules, of any severity |
+| 3 | `test_validate_json_report_is_empty` | `tswap validate --config <p> --json` → `exit_code == 0` **and** `result.stdout.strip() == "[]"`. This is the only assertion that also covers the **schema layer**, which the pipeline stops before: [`_schema_diagnostics`](src/tool_swap/cli/validate.py:118) is appended by the command, after [`run_pipeline`](src/tool_swap/cli/_pipeline.py:85) returns ([validate.py:351](src/tool_swap/cli/validate.py:351)) |
+| 4 | `test_validate_exits_zero_with_empty_stderr` | `tswap validate --config <p>` → `exit_code == 0`, `result.stderr == ""`, and `result.stdout` contains the [`_ok_line`](src/tool_swap/cli/validate.py:210) zero-warning form `f"OK {p} — 1 tools, no problems found"` |
+| 5 | `test_validate_strict_also_exits_zero` | The same run with `--strict` → `exit_code == 0` and `stderr == ""`. `--strict` promotes warnings to failure, so this is the **second** independent proof of warning-freedom and it anticipates B24's `--strict` gate |
+| 6 | `test_config_show_is_fully_populated_with_builtin_origins` | item 7's substring set |
+| 7 | `test_validate_from_a_different_cwd_is_identical` | item 8's CWD edge |
+| 8 | `test_no_group_diagnostic_when_groups_is_absent` | `[d for d in pipeline.diagnostics if d.code.startswith("TSWAP-C2")] == []`, plus `effective_groups(pipeline.config.raw) == {"default": {"max_resident": 4, "eviction": "lru"}}` — the synthesised group is asserted to exist **and** to be silent, so a future `C223`/`C613` regression names itself |
+| 9 | `test_committed_fixture_files_exist` | The three files under `COMMITTED_TOOL_DIR` are `is_file()`. A one-line guard so a deleted fixture fails with *"the fixture is gone"* rather than with a confusing `C005`/`C511` cascade three tests later |
+
+**7. The `config show` assertions — a substring set, not a golden**
+
+**No second golden snapshot.** B22 already owns the byte-for-byte format via its `MINIMAL` snapshot ([`test_config_show_cli.py`](tests/unit/cli/test_config_show_cli.py:558)), and that fixture is a *different* config (an inline `image:`, no `path:`, no `tool.yaml`). Duplicating the format here would mean two files to edit for one column change, and B23's claim is about *content* — "fully populated, built-in origins" — not about alignment. Pinned assertions on `tswap config show --config <p>`:
+
+- `result.exit_code == 0` and `result.stderr == ""`.
+- `"tool: example_echo"` appears in stdout.
+- **All 30 tool fields are present**, asserted mechanically rather than listed: for every `field in TOOL_FIELDS` (imported from [`cli/config_show.py`](src/tool_swap/cli/config_show.py:105) — B22's item-3 pin, derived from `BUILT_IN_DEFAULTS`, never hand-copied), `f"  {field}:" in stdout`. This *is* the ledger's *"fully-populated resolved config"*, made checkable.
+- **Every one of those 30 lines is annotated `built-in default`** except `description` (which is not one of the 30) — the strongest available form of *"every value not written above has origin `built-in default`"*: take the stdout lines between `tool: example_echo` and the end of the section, and assert every line starting `f"  {field}:"` for `field in TOOL_FIELDS` ends with `_BUILTIN_ANNOTATION`.
+- **The `description` line carries the `tool.yaml` origin**: a line containing `"description: Echo the text you send it back, unchanged."` whose annotation ends with the suffix `"example_echo/tool.yaml (tool.yaml)"` — the **suffix**, never the absolute path, which is `tmp_path`-dependent (B22's item-13 pin).
+- **`inputs: 1 entry`** appears, with the same `(tool.yaml)` suffix — the singular form is B22's pin at [config_show.py:750](src/tool_swap/cli/config_show.py:750).
+- **`ttl: 900` is annotated `built-in default`** — the ledger's own example value, asserted as one concrete line rather than left to the loop.
+- **`"***" not in result.stdout`** — the fixture has no `auth_token` and no secret-shaped `env` key, so the redaction path must not fire; `auth_token: null` renders `null` because [`_redact`](src/tool_swap/cli/config_show.py:267) returns a `None` value untouched (A12 as sharpened).
+- `"router:"` and `"backend:"` appear once each (A24), and **no tool section lists `port:`** — reusing B22's shipped assertion shape.
+- Every annotation constant (`_BUILTIN_ANNOTATION`, `TOOL_FIELDS`) is **imported from `cli/config_show.py`**, never re-spelled — B21's item-14 pin, so a wording change breaks one place.
+
+**8. The CWD edge — exact mechanics**
+
+Grounded in the shipped resolver: [`_resolve_tool_path`](src/tool_swap/config/loader.py:296) joins against `base_dir`, and `base_dir` is `path.parent` ([loader.py:715](src/tool_swap/config/loader.py:715)). The `path:` in the config therefore stays **relative** — an absolute path would make the test vacuous by removing the very resolution it exists to exercise.
+
+```python
+def test_validate_from_a_different_cwd_is_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: CliRunner
+) -> None:
+    config = _plant(tmp_path)
+    elsewhere = tmp_path.parent / "elsewhere"
+    elsewhere.mkdir()
+
+    monkeypatch.chdir(tmp_path)
+    inside = _invoke_validate(runner, config)
+    monkeypatch.chdir(elsewhere)
+    outside = _invoke_validate(runner, config)
+
+    assert inside.exit_code == 0
+    assert outside.exit_code == inside.exit_code
+    assert outside.stdout == inside.stdout
+    assert outside.stderr == inside.stderr == ""
+```
+
+`--config` is passed as an **absolute** path (locating the file is the shell's job, not the resolver's); the `path:` *inside* it is relative, which is what the edge tests. `elsewhere` is a sibling of `tmp_path`, so it contains neither the config nor a `tools/` directory — a CWD-reading resolver would fail loudly rather than accidentally succeed. Byte-identical stdout is asserted, not merely equal exit codes, because the CLI echoes the config path and a CWD-dependent renderer would show up there first.
+
+**9. Warning-freedom: both forms, and why both**
+
+- **Pipeline form** (`diagnostics == []`) is the mechanical guard: it is severity-blind by construction, so a future WARNING cannot slip past an exit-code check. Assert the **empty list**, not `len(...) == 0`, so a failure prints the offending diagnostics.
+- **CLI form** (`exit_code == 0` **and** `stderr == ""`) is the user-facing claim. `exit_code == 0` alone is insufficient: [`_emit`](src/tool_swap/cli/validate.py:241) renders warnings on stderr **on the success path** ([validate.py:291](src/tool_swap/cli/validate.py:291)) and still exits 0, so a warning-bearing golden path would pass an exit-code-only assertion while violating the spec. `stderr == ""` is what makes "no warnings" mechanical at the CLI.
+- `--strict` (test 5) is the third angle and costs one invocation.
+
+**10. Red/green ordering, and the repo-layout amendment**
+
+- **RED = the test file alone** (`tests/unit/config/test_minimal_config.py`). It fails because `tools/example_echo/` does not exist: `test_committed_fixture_files_exist` fails on the missing files, and the pipeline test fails with **`TSWAP-C300` + `TSWAP-C511`** — *not* `C005`, because a missing `path:` directory is skipped silently at [loader.py:452](src/tool_swap/config/loader.py:452). (`shutil.copytree` will also raise `FileNotFoundError` in `_plant`; either way the failure is unambiguous.) Pinned here so the red output is verified rather than interpreted.
+- **GREEN = the three fixture files + the layout amendment**, one commit. The fixtures are production artifacts, not test helpers, which is why they land in green.
+- **The repo-layout amendment: add `"tools"` and `"tools/example_echo"` to [`OTHER_DIRS`](tests/unit/test_repo_layout.py:66).** `test_repo_layout.py` pins directories by an **explicit list**, not by enumerating the filesystem ([`test_other_directory_exists`](tests/unit/test_repo_layout.py:196) is parametrised over `OTHER_DIRS`), so a new top-level directory **breaks nothing** — the amendment is additive and purely declarative. It belongs in the **green** commit: adding the entries in the red step would create a second, unrelated red for a directory the red step does not create. `SRC_TOOL_SWAP_PACKAGES` and `TEST_DIRS` are untouched (`tools/` is neither a `src/` package nor a test directory, and it must **not** gain an `__init__.py`).
+- **No `.gitignore` change** — verified above: nothing in it matches `tools/` or `example_echo`.
+- **No shipped test breaks.** Checked: `test_repo_layout.py` is list-driven (additive); [`test_bentoml_boundary.py`](tests/unit/test_bentoml_boundary.py:112) walks `src/` only; [`test_dependencies.py`](tests/unit/config/test_dependencies.py:251) globs `ROOT / "src"` only; `make lint` is `src/`-only; pytest collects `tests/` only. The one thing to confirm at green time is `git check-ignore -v tools/example_echo/tool.yaml` printing nothing.
+
+**11. New assumption — A26**
+
+**A26 (new, 2026-08-20) — NOT yet confirmed by [issue #2](https://github.com/iar3-r8/tool-swap/issues/2); worth one line in the PR description.** Two shapes of the B23 deliverable that the spec does not decide. (A13–A25 are taken and **A23 is deliberately unallocated** — see the note above — so **A26** is the next free number.)
+
+1. **The five-line config is written to `tmp_path` by the test; only the tool DIRECTORY is committed.** The ledger says *"exactly this file and a matching tool directory"* without saying which is a repo artifact. A committed root `tools.yaml` would change `tswap validate`'s no-argument behaviour repo-wide (exit 2 → exit 0) and would make the golden path depend on `.env` auto-discovery in the repo root ([loader.py:263](src/tool_swap/config/loader.py:263)). The test copies the committed directory beside a `tmp_path` config, which keeps the relative-`path:` resolution — the whole point of the CWD edge — genuinely exercised.
+2. **`tools/example_echo/tool.yaml` declares one `inputs:` entry, and its image source is a managed `handler:`.** The `handler:` half is **forced** by the shipped resolver (an `image:` written in a `tool.yaml` is never lifted into a carrier — [resolver.py:201-217](src/tool_swap/config/resolver.py:201) — so the tool would trip `C511`), and a `build:` source would drag in a committed `Dockerfile` under `C515`'s real-filesystem probe. The `inputs:` half is a genuine choice: it costs three lines and buys a clean-path exercise of the whole S-layer plus a more meaningful `config show`, and this file is what B24's `tools.example.yaml` and B25's generated docs will show users as the minimal tool. The alternative (an input-less tool) is defensible on minimalism grounds and is a one-line revert if the maintainer prefers it.
+
+**No shipped test is affected** by either half. The user-visible consequences to confirm: the repository gains a top-level `tools/example_echo/` holding three small committed files; `tswap validate` with no arguments continues to exit 2 with `TSWAP-C000`; and the shipped example tool declares exactly one described input.
+
+**12. What this behaviour must NOT do**
+
+- **No source change.** B23 touches no file under `src/`. If any rule fires on the fixture, the fix is the **fixture**, never the rule — a rule bent to accommodate the golden path stops guarding the milestone.
+- **No new diagnostic code, no `--strict` semantics change, no renderer change.**
+- **No second golden snapshot** (item 7), and **no committed root `tools.yaml`** (item 3).
+- **No `Dockerfile`, no `.dockerignore`, no `__init__.py`** in `tools/example_echo/` — the spec lists three files, and three is what ships.
+
 ### Behaviour 24 — `tools.example.yaml` validates, asserted in CI
 
 - **Inputs:** a committed `tools.example.yaml` at the repo root.
@@ -3159,6 +3438,7 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A22** | The ledger's *"cross-tool diagnostics implicating the named tool are reported"* under `tswap validate <tool>` | **Narrowed to a `yaml_path` prefix test** (`tools.<X>` / `tools.<X>.…`). Cross-tool findings at bare `tools` (`C211`, `C530`) or under `groups.…` (`C223`, `C610`, `C612`, `C613`) are not shown per-tool; a note line names how many were hidden and points at the whole-file run. Message-substring matching was rejected as untestable and fragile | 21, 22 |
 | **A24** | The ledger's *"The router and backend blocks are shown too, with origins"* | **Narrowed to two top-level blocks read from `raw`**, annotated `(router)`/`(backend)`, **not** per tool: the 17 keys are in `ResolvedTool.values` but no layer the resolver sees can supply them, so a per-tool view would print `port: 8600 # built-in default` under a config saying `router: {port: 9000}`. Generalises behaviour 16's shipped `port_range`-from-`raw` decision. `router.log_output` is displayed but unsettable in M1 | 22 |
 | **A25** | `config show --verbose`'s shadowed values | **The shipped `OriginMap.shadowed` suffices — no resolver change.** Two gaps pinned, not fixed: a `tool.yaml` shadow shows the **file but not the value** (recovering it needs the resolver-private `_FLATTENING_TABLE`), and the **carrier fields record no shadows at all**. The built-in tail is **synthesised** by the renderer, because including it in the resolver would break a shipped `test_resolver.py` assertion | 22 |
+| **A26** | The ledger's *"exactly this file and a matching tool directory"* — which half is a repo artifact, and what the tool declares | **Only the tool DIRECTORY is committed**; the five-line config is written to `tmp_path` by the test (a committed root `tools.yaml` would flip `tswap validate`'s no-argument behaviour repo-wide and make the golden path depend on `.env` auto-discovery in the repo root). The fixture's image source is a managed **`handler:`** — forced, since a `tool.yaml` `image:` is never lifted into a carrier and `build:` would demand a committed `Dockerfile` under `C515`'s probe — and it declares **one described `inputs:` entry**, which is the genuine choice (a one-line revert if input-less minimalism is preferred) | 23, 24 |
 
 ### Scope boundaries recorded deliberately
 
