@@ -1,18 +1,23 @@
 """Typer application for the ``tswap`` CLI.
 
 The app, its no-subcommand callback and the ``version`` command live here;
-``tool_swap.__main__`` re-exports them so the ``python -m tool_swap`` and
-``tswap`` entry points keep pointing at the same object.
+the ``validate`` command body lives in :mod:`tool_swap.cli.validate` and is
+registered on this same app below.  ``tool_swap.__main__`` re-exports
+``app`` and ``main`` so the ``python -m tool_swap`` and ``tswap`` entry
+points keep pointing at the same object.
 """
 
 from __future__ import annotations
 
 import typer
 
+from tool_swap.cli.validate import validate as _validate
+
 app = typer.Typer(
     name="tswap",
     help="tswap — router CLI for managing AI agent tool contexts.\n\n"
-    "Commands: version   Print the tool-swap version.",
+    "Commands: version    Print the tool-swap version.\n"
+    "         validate   Validate a tool-swap config file.",
 )
 
 
@@ -30,6 +35,13 @@ def version() -> None:
     from tool_swap import __version__
 
     print(__version__)
+
+
+# The command body, its flags and its help strings are defined in
+# tool_swap/cli/validate.py; registering the function here (rather than
+# decorating it there) keeps this app the single registration point and
+# avoids an import cycle back to this module.
+app.command()(_validate)
 
 
 def main() -> None:
