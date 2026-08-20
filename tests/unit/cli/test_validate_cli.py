@@ -284,12 +284,7 @@ WARNING_ONLY = (
     "    ttl: 300\n"
 )
 
-_MISSING_DESC_TOOL_YAML = (
-    "name: t\n"
-    "inputs:\n"
-    "  - name: x\n"
-    "    type: string\n"
-)
+_MISSING_DESC_TOOL_YAML = "name: t\ninputs:\n  - name: x\n    type: string\n"
 
 #: The tool itself has no ``description:`` (TSWAP-C300, ERROR) and its
 #: ``inputs:`` entry has none either (TSWAP-C301 from the config layer and
@@ -298,10 +293,7 @@ _MISSING_DESC_TOOL_YAML = (
 #: NOT in MISSING_DESCRIPTION_CODES, and stays an ERROR), so this fixture
 #: still exits 1 with the flag — it pins the downgrade, not the exit.
 MISSING_DESCRIPTIONS = (
-    "tools:\n"
-    "  t:\n"
-    "    image: registry.example.com/t:1\n"
-    "    path: ./t\n"
+    "tools:\n  t:\n    image: registry.example.com/t:1\n    path: ./t\n"
 )
 
 #: A tool whose only finding is its own missing description (TSWAP-C300,
@@ -309,11 +301,7 @@ MISSING_DESCRIPTIONS = (
 #: ``--allow-missing-descriptions`` the C300 is downgraded to WARNING, the
 #: report has zero remaining errors, and the exit becomes 0 (plan item 8,
 #: row 5) — the flag's whole purpose.
-TOOLS_DESC = (
-    "tools:\n"
-    "  t:\n"
-    "    image: registry.example.com/t:1\n"
-)
+TOOLS_DESC = "tools:\n  t:\n    image: registry.example.com/t:1\n"
 
 #: ``image:`` references a variable that is neither in the ambient env nor
 #: in any env file — TSWAP-C010 from the interpolator, exit 2.
@@ -353,9 +341,7 @@ ENV_FILE_CONFIG = (
 _ENV_FILE_TEXT = "TSWAP_ENV_FILE_IMAGE=image:1\n"
 
 
-def _invoke(
-    runner: CliRunner, config_path: Path, *args: str
-) -> "object":
+def _invoke(runner: CliRunner, config_path: Path, *args: str) -> object:
     """Invoke ``validate`` with ``--config <path>`` plus *args*."""
     return runner.invoke(app, ["validate", "--config", str(config_path), *args])
 
@@ -403,26 +389,6 @@ class TestHelp:
             f"Got:\n{result.stdout}"
         )
 
-    def test_bare_validate_invocation_is_a_usage_error_not_success(
-        self, tmp_path: Path, runner: CliRunner
-    ) -> None:
-        """Invoking the command path must not accidentally succeed.
-
-        RED expected form: the subcommand is absent, so click/typer answer
-        with a usage error and exit 2. We pin the exit code (2) and the
-        absence of the success line — NOT the exact usage-error text, which
-        is typer's business (plan: do not pin usage-error wording).
-        """
-        path = _write(tmp_path, "tools.yaml", VALID_TWO_TOOLS)
-        result = runner.invoke(app, ["validate", "--config", str(path)])
-
-        assert result.exit_code == 2, (
-            f"Expected exit 2 (validate absent = usage error), got "
-            f"{result.exit_code}. stdout: {result.stdout!r} "
-            f"stderr: {result.stderr!r}"
-        )
-        assert _OK_LINE.format(str(path)) not in result.stdout
-
 
 # ---------------------------------------------------------------------------
 # Success paths (whole file)
@@ -450,8 +416,7 @@ class TestSuccess:
             f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
         )
         assert _OK_LINE.format(str(path)) in result.stdout, (
-            f"Expected the exact success line on stdout. "
-            f"stdout: {result.stdout!r}"
+            f"Expected the exact success line on stdout. stdout: {result.stdout!r}"
         )
         assert result.stderr == ""
 
@@ -499,8 +464,7 @@ class TestSuccess:
             f"stderr: {result.stderr!r}"
         )
         assert "error(s)" not in result.stdout, (
-            "No summary line may appear on a successful run. "
-            f"stdout: {result.stdout!r}"
+            f"No summary line may appear on a successful run. stdout: {result.stdout!r}"
         )
 
     def test_missing_file_exits_two_with_c000(
@@ -595,8 +559,7 @@ class TestFailure:
         assert "TSWAP-C601" in result.stderr
         assert _SUMMARY_ONE_ONE in result.stderr
         assert "OK " not in result.stdout, (
-            "No success line may appear on a failing run. "
-            f"stdout: {result.stdout!r}"
+            f"No success line may appear on a failing run. stdout: {result.stdout!r}"
         )
 
     def test_failure_keeps_diagnostics_out_of_stdout(
@@ -614,8 +577,7 @@ class TestFailure:
         assert result.exit_code == 1
         for token in ("TSWAP-C511", "TSWAP-C601", _SUMMARY_ONE_ONE):
             assert token not in result.stdout, (
-                f"{token!r} must not appear on stdout. "
-                f"stdout: {result.stdout!r}"
+                f"{token!r} must not appear on stdout. stdout: {result.stdout!r}"
             )
 
 
@@ -687,9 +649,10 @@ class TestJson:
             "Human rendering must go to stderr in --json mode. "
             f"stderr: {result.stderr!r}"
         )
-        assert "TSWAP-C511" not in result.stdout.replace(
-            '"TSWAP-C511"', ""
-        ) or "remedy" in result.stdout  # code appears only inside JSON fields
+        assert (
+            "TSWAP-C511" not in result.stdout.replace('"TSWAP-C511"', "")
+            or "remedy" in result.stdout
+        )  # code appears only inside JSON fields
         for entry in payload:
             assert entry["severity"] in {"error", "warning"}
 
@@ -704,8 +667,7 @@ class TestJson:
         payload = json.loads(result.stdout)
         codes = {entry["code"] for entry in payload}
         assert codes == {"TSWAP-C511", "TSWAP-C601"}, (
-            f"Expected exactly the C511 and C601 codes in the JSON, "
-            f"got {codes!r}"
+            f"Expected exactly the C511 and C601 codes in the JSON, got {codes!r}"
         )
 
 
@@ -911,9 +873,7 @@ class TestExceptionGuard:
             def check(self, config: object) -> list[object]:
                 raise RuntimeError("boom from a registered rule")
 
-        register(
-            _RaisingRule(id="TSWAP-C998", remedy="test rule that raises")
-        )
+        register(_RaisingRule(id="TSWAP-C998", remedy="test rule that raises"))
         try:
             result = _invoke(runner, path)
         finally:
@@ -930,7 +890,9 @@ class TestExceptionGuard:
         assert "Traceback" not in result.stderr
 
     def test_internal_failure_exits_two_without_traceback(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         runner: CliRunner,
     ) -> None:
         """A failure outside the rule loop is the CLI guard's (item 13b).
@@ -945,19 +907,7 @@ class TestExceptionGuard:
         def _raise(*_args: object, **_kwargs: object) -> object:
             raise ValueError("simulated internal failure")
 
-        try:
-            monkeypatch.setattr(
-                "tool_swap.cli.validate.compile_tool_schema", _raise
-            )
-        except (AttributeError, ImportError):
-            # RED phase: tool_swap.cli.validate does not exist yet, so
-            # monkeypatch cannot import it (ImportError, caused by
-            # ModuleNotFoundError) and the injection point is absent.
-            # The invocation below still fails (the subcommand is missing)
-            # and the pinned "internal error while validating" assertions
-            # fail. Once 21.0/21 land, the patch takes effect and this
-            # fallback is dead code.
-            pass
+        monkeypatch.setattr("tool_swap.cli.validate.compile_tool_schema", _raise)
 
         result = _invoke(runner, path)
 
@@ -1078,8 +1028,7 @@ class TestAllowMissingDescriptions:
             f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
         )
         assert result.stderr.startswith(_FLAG_BANNER), (
-            f"The banner must be the FIRST line on stderr. "
-            f"stderr: {result.stderr!r}"
+            f"The banner must be the FIRST line on stderr. stderr: {result.stderr!r}"
         )
         assert result.stderr.count(_FLAG_BANNER) >= 1
 
@@ -1110,10 +1059,7 @@ class TestAllowMissingDescriptions:
         # The downgraded diagnostic is still VISIBLE (severity WARNING)
         # and carries the per-diagnostic banner appended to its message.
         assert "TSWAP-C300" in with_flag.stderr
-        assert (
-            "downgraded by --allow-missing-descriptions"
-            in with_flag.stderr
-        )
+        assert "downgraded by --allow-missing-descriptions" in with_flag.stderr
 
     def test_flag_downgrades_c300_and_c301_but_schema_error_remains(
         self, tmp_path: Path, runner: CliRunner
@@ -1139,9 +1085,7 @@ class TestAllowMissingDescriptions:
         assert "TSWAP-C300" in result.stderr
         assert "TSWAP-C301" in result.stderr
         assert "TSWAP-S120" in result.stderr
-        assert (
-            "downgraded by --allow-missing-descriptions" in result.stderr
-        )
+        assert "downgraded by --allow-missing-descriptions" in result.stderr
         assert _FLAG_BANNER in result.stderr
         assert "WARNING TSWAP-C300" in result.stderr
         assert "WARNING TSWAP-C301" in result.stderr
@@ -1161,9 +1105,7 @@ class TestAllowMissingDescriptions:
         alone = _invoke(runner, path, "--allow-missing-descriptions")
         assert alone.exit_code == 0
 
-        result = _invoke(
-            runner, path, "--allow-missing-descriptions", "--strict"
-        )
+        result = _invoke(runner, path, "--allow-missing-descriptions", "--strict")
 
         assert result.exit_code == 1, (
             "--strict must win over the downgrade. "
