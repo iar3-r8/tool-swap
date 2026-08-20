@@ -2351,7 +2351,7 @@ Load, resolve and validate the **whole** file (the ledger's reason: cross-tool r
 - **Stated cost, honestly: cross-tool diagnostics implicating X are NOT shown under `tswap validate X`.** `C211` (duplicate names), `C530` (shared port) and `C612` (groups sharing a device) locate at bare `tools` or `groups`; `C610`/`C613` locate at `groups.<name>.max_resident`. None is reported per-tool. **This contradicts the ledger's line** *"Cross-tool diagnostics implicating the named tool are reported"* — recorded as **A22** (item 12), because the alternative is a per-message heuristic. The mitigation is real and cheap: the filter is applied to the *report*, so the whole-file report is still computed, and **when the unfiltered report has errors that the filter hid, the command appends one line to stderr**: `note: <k> diagnostic(s) elsewhere in <file> are not shown by 'tswap validate <tool>'; run 'tswap validate' for the whole file` — so the user is never left believing the file is clean.
 - **The exit code follows the FILTERED report**, otherwise `tswap validate X` would fail for a mistake in Y, which the note line makes discoverable instead.
 - **An unknown tool name is checked BEFORE the filter** (item 7), so `tswap validate typo` never prints an empty, exit-0 report.
-- **Behaviour 23's golden path is unaffected** — it runs the whole-file form (`tswap validate` with one tool) and asserts zero diagnostics, so no filter is exercised. **Behaviour 22 must reuse this same filter** for `tswap config show <tool>`; it is pinned here as a shared helper `reported_for(report, tool) -> ConfigReport` in `cli/validate.py`, imported by `config_show.py`, so the two commands cannot disagree about what "restricted to one tool" means.
+- **Behaviour 23's golden path is unaffected** — it runs the whole-file form (`tswap validate` with one tool) and asserts zero diagnostics, so no filter is exercised. **Behaviour 22 must reuse this same filter** for `tswap config show <tool>`; it is pinned here as a shared helper `reported_for(report, tool) -> ConfigReport` in `cli/validate.py`, imported by `config_show.py`, so the two commands cannot disagree about what "restricted to one tool" means. ~~in `cli/validate.py`~~ **Relocated (2026-08-20, behaviour 22's contract block, item 10):** the helper moves to the new `cli/_pipeline.py` alongside the extracted call chain, so the *display* command does not import from the *checking* command. Same function, same semantics, one import site for 22. The shipped B21 code has it inline as [`_implicates`](src/tool_swap/cli/validate.py:179) rather than as `reported_for`; sub-step 21b lifts it as-is.
 
 **7. The unknown-tool error — a usage error, not a config finding**
 
@@ -2507,13 +2507,316 @@ The minimal corpus the red step needs, as module-level constants:
   - **Every value is printed with its origin** (§4.1 — *"the origin of each value"*), e.g. `ttl: 600            # tools.yaml:143 (inline)` and `shm_size: 1g         # built-in default`.
   - `--verbose` additionally shows the shadowed values (`# overrides 900 from built-in default`), which is what actually answers *"why is it not using my setting?"*
   - `env` shows a per-key origin; `mounts` shows a per-entry origin and the explicit `:ro` default made visible (behaviour 17).
-  - The router and backend blocks are shown too, with origins.
-  - `--json` emits a machine-readable structure `{tool: {field: {value, origin}}}`, and nothing else on stdout.
-  - Warnings from validation are **shown** (so `config show` is never more optimistic than `validate`), but errors do not suppress the resolved output where resolution succeeded — seeing the partial resolution is often how a user finds the mistake. Exit code follows `validate`'s scheme.
+  - The router and backend blocks are shown too, with origins. **Narrowed (2026-08-20):** they are shown **once, as two top-level blocks read from the raw config**, not inside each tool section. The 17 router/backend keys are in `BUILT_IN_DEFAULTS` and therefore in every `ResolvedTool.values`, but **no layer the resolver sees can supply them**, so a per-tool rendering would print `port: 8600 # built-in default` under a config that plainly says `router: {port: 9000}`. Their origin annotation is `(router)` / `(backend)` computed in the renderer, not an `OriginLevel`. See the contract block, item 4 — assumption **A24**.
+  - `--json` emits a machine-readable structure `{tool: {field: {value, origin}}}`, and nothing else on stdout. **Pinned precisely (2026-08-20):** `origin` is a structured object `{level, source, line}` (never the human phrase), and the payload is wrapped in a `{config, router, backend, tools}` envelope — the bare `{tool: …}` map has nowhere to put the router/backend blocks and would collide with a tool named `router`. Contract block, item 8.
+  - Warnings from validation are **shown** (so `config show` is never more optimistic than `validate`), but errors do not suppress the resolved output where resolution succeeded — seeing the partial resolution is often how a user finds the mistake. Exit code follows `validate`'s scheme. **Narrowed (2026-08-20):** the rule pass runs in full, but the **schema compiler does not** (`config show` displays no compiled schema), so `config show` can exit 0 where `validate` fails with an `S1xx`. The summary line names `validate` for that reason. Contract block, item 11.
   - Output ordering is stable: config-declaration order for tools, and a fixed field order within a tool (not dict-insertion order, not alphabetical-by-accident).
-- **Edge cases:** a secret-looking value (`auth_token`, anything under `env` whose key matches `TOKEN|SECRET|KEY|PASSWORD`) is **redacted** to `***` with its origin still shown, and `--show-secrets` opts out. `config show` output is exactly the thing a user pastes into an issue; leaking `HF_TOKEN` by default would be our bug. *(Flagged as assumption A12 — not in the spec, proposed.)*
+- **Edge cases:** a secret-looking value (`auth_token`, anything under `env` whose key matches `TOKEN|SECRET|KEY|PASSWORD`) is **redacted** to `***` with its origin still shown, and `--show-secrets` opts out. `config show` output is exactly the thing a user pastes into an issue; leaking `HF_TOKEN` by default would be our bug. *(Flagged as assumption A12 — not in the spec, proposed; **confirmed 2026-08-17**.)* **Sharpened (2026-08-20):** the env-key match is **case-insensitive substring** (`hf_token` and `HF_TOKEN` are the same secret), and a `None` value is printed as `null`, never `***` — `***` would claim a token is configured when none is. Contract block, item 9.
 - **Error behaviour:** unknown tool name → nearest-match suggestion, exit `1`. An unreadable config → the same `C0xx` diagnostic and exit `2` as `validate`.
-- **Files:** `src/tool_swap/cli/config_show.py` (new), `tests/unit/cli/test_config_show_cli.py`.
+- **Files:** `src/tool_swap/cli/config_show.py` (new), `src/tool_swap/cli/_pipeline.py` (new — the shared call chain extracted in sub-step **21b**, contract block item 10), `src/tool_swap/cli/validate.py` (21b's cut), `src/tool_swap/cli/main.py` (the `add_typer` line and its hand-written help list), `tests/unit/cli/test_config_show_cli.py`.
+
+#### Confirmed contract details (2026-08-20)
+
+Behaviour 22 is behaviour 21's twin: the same pipeline, a different renderer. **Nothing in it is a new algorithm either** — the whole green step is (a) the B21 call chain, reused not retyped, (b) a deterministic text renderer over `ResolvedTool.values` + `OriginMap`, (c) a JSON view of the same data, (d) a redaction filter. The risk is identical to 21's — unpinned choices multiplying across a display surface — so every choice is pinned below against the shipped code.
+
+Three facts discovered while pinning govern everything and are stated once, because each contradicts a reasonable reading of the ledger:
+
+1. **The spec's worked example is illustrative, not a snapshot.** [`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md:274) §4.1 contains **one sentence** and **no rendered output** (*"`tswap config show <model>` must print the fully-resolved effective config with the origin of each value"*), and [`plan/07_CLI_AND_OPS.md`](plan/07_CLI_AND_OPS.md:82) §2 has a one-cell table row. There is no §8.4-style snapshot to adopt (contrast behaviour 20). **The format below is therefore pinned here and the tests assert it exactly.**
+2. **The resolver records no line numbers.** [`_fixed_origin`](src/tool_swap/config/resolver.py:417) stores the literal sources `"inline"`, `"tool.yaml"`, `"defaults"` and `"groups.<name>.<field>"` — the resolver is a pure function of dicts and has no file or line. The ledger's `# tools.yaml:143 (inline)` is reachable only because the **CLI** holds `loaded.line_for`. Item 1 pins exactly which levels get a line and which cannot.
+3. **The 17 `router:`/`backend:` keys are in the 47, but a tool can never resolve them from the user's config.** They are in [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:59), so every `ResolvedTool.values` carries them — but no layer the resolver sees can supply them: [`RouterConfig`](src/tool_swap/config/schema.py:43)/[`BackendConfig`](src/tool_swap/config/schema.py:58) are **nested root blocks**, [`DefaultsConfig`](src/tool_swap/config/schema.py:73) has none of them, [`ToolConfig`](src/tool_swap/config/schema.py:151) has none of them (`extra="forbid"`), and only the five [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28) keys flatten out of a `tool.yaml`. So `router: {port: 9000}` in `tools.yaml` yields `tool.values["port"] == 8600, origin BUILT_IN` for **every** tool. **Printing the router/backend fields per tool would therefore print a confident lie.** Item 4 pins them as top-level blocks read from the raw config instead — assumption **A24**.
+
+**1. The rendered line format — pinned, with the origin vocabulary**
+
+One value is one line. The left half is `  <name>: <value>`; the right half is `# <origin annotation>`, aligned to a **fixed** column:
+
+```
+_ORIGIN_COLUMN: Final[int] = 40      # module constant in cli/config_show.py
+line = f"  {name}: {rendered_value}".ljust(_ORIGIN_COLUMN) + f"# {annotation}"
+```
+
+- **Fixed column, not data-derived width.** A width computed from the widest line in the block would make a snapshot flap whenever an unrelated fixture value changes length; 40 is the constant (two-space indent + the longest field name `max_consecutive_failures` at 24 + `": "` = 28, leaving room for short values). **When the left half is ≥ 40 characters it is followed by exactly one space** and then the `#` — no wrapping, no truncation, ever: `config show` output is what a user pastes into an issue, and a truncated value would be a lie in the same paste.
+- **Values are rendered by a pinned total function** `_render_value(obj) -> str`: `None` → `null`; `True`/`False` → `true`/`false`; `str` → **as authored, unquoted** (`shm_size: 1g`, not `'1g'`); `int`/`float` → `repr`; `list` → `[a, b, c]` with each element recursively rendered; `dict` → handled by the `env` block (item 5), never inline. YAML-ish rather than Python-ish (`true`, not `True`) because the user's next action is editing YAML.
+- **The origin annotation, per level**, computed by `_annotate(origin, *, field, key, loaded, path)`:
+
+| Winning `OriginLevel` | `Origin.source` | Annotation | Line from |
+|---|---|---|---|
+| `INLINE` | `"inline"` | `<file>:<line> (inline)` | `loaded.line_for(f"tools.{key}.{field}")` |
+| `TOOL_YAML` | `"tool.yaml"` | `<tool.yaml path> (tool.yaml)` | **none available** |
+| `DEFAULTS` | `"defaults"` | `<file>:<line> (defaults)` | `loaded.line_for(f"defaults.{field}")` |
+| `DEFAULTS` | `"groups.<n>.<f>"` | `<file>:<line> (group '<n>')` | `loaded.line_for(origin.source)` |
+| `BUILT_IN` | *(any)* | `built-in default` | — |
+
+- **`<file>` is `str(config)` as the user typed it**, identical to B21's item 1 pin, so the output is CWD-independent.
+- **A `None` line degrades to the file alone**: `tools.yaml (inline)`. This is [`Location.render`](src/tool_swap/config/errors.py:44)'s shipped discipline, reused rather than reinvented. It is the normal case for a `ttl` that reached a tool through `defaults: {ttl: -1}`-style inheritance where the winning layer's key is absent from the root document, and for **every** `tool.yaml` field.
+- **The `tool.yaml` layer has no line number and this is pinned, not deferred.** [`LoadedConfig._line_map`](src/tool_swap/config/loader.py:491) is built from the ROOT document only; `tool_yaml(key)` returns `(path, mapping)` with no line data. So a `tool.yaml`-sourced value annotates `tools/t/tool.yaml (tool.yaml)`. **The path IS shown** (from `loaded.tool_yaml(key)[0]`) because "which file" is the question the user actually asked; only "which line" is missing. A per-`tool.yaml` line map is a loader change and is **out of scope for 22**.
+- **The annotation vocabulary is a THIRD renderer, deliberately.** [`Origin.render()`](src/tool_swap/config/origin.py:60) produces `"inline (inline)"` with the resolver's fixed sources — the doubled word reads as a bug — and [`_origin_phrase`](src/tool_swap/config/validate.py:2764) produces sentence-embedded prose (`"set in the tool's tool.yaml"`) that does not fit a trailing comment. `config_show` therefore owns `_annotate`, **reusing the WORDS** (`(inline)`, `(tool.yaml)`, `(defaults)`, `built-in default`) so the three agree on vocabulary while differing on shape. The four literals are module constants shared by import from [`origin.py`](src/tool_swap/config/origin.py:32) where they already exist (`_RENDER_SUFFIX`, `_BUILT_IN_SOURCE` — promoted to public names in 22's green, additive, no shipped test reads them by name).
+- **The origin lookup is TOTAL**: `OriginMap.winning` raises `KeyError` for an unrecorded path and two real cases hit it — a tool whose merged `env` is empty (`_resolve_env` records nothing when the key union is empty) and an empty `mounts` list. `_origin_of(tool, path)` returns `Origin.built_in()` on `KeyError`, which is the *truth* for every one of the 30 displayed fields (`BUILT_IN_DEFAULTS` covers all of them) and mirrors `_origin_phrase`'s totality rather than letting a `KeyError` escape into the exception guard.
+
+**2. `--verbose`: the shadowed values — the API exists, and one half must be synthesised**
+
+**No resolver change is required, and none is permitted.** [`OriginMap.shadowed(field_path)`](src/tool_swap/config/origin.py:137) is shipped and populated: [`_resolve_wholesale`](src/tool_swap/config/resolver.py:698), [`_resolve_ttl`](src/tool_swap/config/resolver.py:734) (all three arms), [`_resolve_env`](src/tool_swap/config/resolver.py:817) (per `env.<KEY>`) and [`_apply_batching_disabled_override`](src/tool_swap/config/resolver.py:553) all pass `overrides=`, most specific first.
+
+Two gaps, each pinned rather than fixed:
+
+- **The built-in baseline is deliberately excluded from the shadow list.** [`_shadowed`](src/tool_swap/config/resolver.py:673) slices `layers[winner_index + 1 : -1]` — the built-in layer is the baseline, not a loser. So the ledger's own example, `# overrides 900 from built-in default`, is **not** in `shadowed("ttl")`. **`config_show` synthesises it**: when the winning origin is not `BUILT_IN` and `field in BUILT_IN_DEFAULTS`, one final shadow entry `(BUILT_IN_DEFAULTS[field], Origin.built_in())` is appended to the rendered list. This is pure, correct by construction (the built-in layer always carries every one of the 47 fields), and — decisively — **changing the resolver instead would break a shipped test**: [`test_scalar_precedence_all_layers_present_inline_wins`](tests/unit/config/test_resolver.py:145) asserts `[o.level for o in shadowed("ttl")] == [TOOL_YAML, DEFAULTS]` exactly.
+- **`OriginMap` stores shadowed ORIGINS, not shadowed VALUES.** The value must be recovered from the raw layer. Pinned, total, three cases (an `INLINE` shadow is impossible — inline is layer 0 and can only ever win):
+
+| Shadowed level / source | Value looked up in | Rendered |
+|---|---|---|
+| `BUILT_IN` (synthesised) | `BUILT_IN_DEFAULTS[field]` | `# overrides <v> from built-in default` |
+| `DEFAULTS` / `"defaults"` | `raw["defaults"][field]` | `# overrides <v> from <file>:<line> (defaults)` |
+| `DEFAULTS` / `"groups.<n>.<f>"` | `effective_groups(raw)[n][field]` | `# overrides <v> from <file>:<line> (group '<n>')` |
+| `TOOL_YAML` | **not looked up** | `# overrides the value in <path> (tool.yaml)` |
+
+  **The `tool.yaml` value is omitted on purpose.** Recovering it means re-applying [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28) (`lifecycle.ttl` → `ttl`), which is private to the resolver, and a second flattening implementation in the CLI is exactly the drift this milestone keeps deleting. The origin still names the file, which answers *"where do I go to change it?"* — the actual question. Recorded as assumption **A25** with the clean fix named (teach `OriginMap` to carry `ResolvedValue`s rather than bare `Origin`s) and deferred.
+- **`--verbose` shows the FULL history, not just the immediate loser** — every entry of `shadowed(path)` in recorded order (most specific first), plus the synthesised built-in tail. *"Why is it not using my setting?"* is answered by seeing your setting in the list, wherever it sits.
+- **Shadow lines are separate lines, indented to the origin column**, so the value column stays scannable:
+  ```
+  ttl: 600                              # tools.yaml:14 (inline)
+                                        # overrides 900 from built-in default
+  ```
+- **Carrier fields carry no shadows in M1.** `description` / `image` / `handler` / `requirements` / `build` / `inputs` / `outputs` / `params` / `json_schema` are recorded with `origins.record(key, origin)` and **no** `overrides=` ([resolver.py:258](src/tool_swap/config/resolver.py:258), [:276](src/tool_swap/config/resolver.py:276), [:290](src/tool_swap/config/resolver.py:290)), even though `description`/`image`/`handler`/`requirements` are genuinely layered. `shadowed()` returns `[]` for them and `--verbose` prints no shadow line. Recorded under **A25**; **do not "fix" it in 22's green** — it is a resolver change with its own red step.
+- **`mounts[i]` shadows are `[]` and that is correct**, not a gap: mounts concatenate, so no layer loses.
+
+**3. The fixed field order — `BUILT_IN_DEFAULTS` declaration order, and the section order**
+
+**The order is [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:20)' declaration order**, which is semantically grouped (lifecycle → resources → batching → timeouts → health → image → env/mounts) and already the resolver's own iteration order (`for field in BUILT_IN_DEFAULTS`). Not alphabetical (which would scatter the timeouts), not `values` insertion order (which *is* the same today but is an implementation detail of a dict comprehension, not a promise).
+
+The **30 tool-level fields**, verbatim and in order:
+
+```
+ttl, keep_warm, autostart, evict_cost, max_concurrent, restart_backoff,
+max_consecutive_failures, group, devices, cpus, memory, shm_size,
+max_batch_size, max_wait_ms, workers, runtime_server, start_timeout,
+ready_timeout, queue_timeout, request_timeout, drain_timeout, stop_timeout,
+max_queue_depth, health_path, ready_path, probe_interval, container_port,
+expose_host_port, env, mounts
+```
+
+- **A test asserts the display order is derived, not copied**: `TOOL_FIELDS == [f for f in BUILT_IN_DEFAULTS if f not in ROUTER_FIELDS | BACKEND_FIELDS]`, and `len(TOOL_FIELDS) == 30`, `len(ROUTER_FIELDS) == 9`, `len(BACKEND_FIELDS) == 8`, `30 + 9 + 8 == len(BUILT_IN_DEFAULTS) == 47`. A hand-copied list would rot the first time a field is added; the partition constants are the only hand-written part and the arithmetic test guards them.
+- **The per-tool section order**, pinned:
+
+```
+tool: <name>                          # <file>:<line of tools.<name>>
+  description: <text>                 # <annotation>          [omitted when None]
+  <the 30 fields, in the order above; env and mounts expand per items 5 and 6>
+  image: <ref>                        # <annotation>          [omitted when None]
+  handler: <file.py:Cls>              # <annotation>          [omitted when None]
+  requirements: <path>                # <annotation>          [omitted when None]
+  build: <n> keys                     # <annotation>          [omitted when None]
+  inputs: <n> entries                 # <annotation>          [omitted when None]
+  outputs: <n> entries                # <annotation>          [omitted when None]
+  params: <n> entries                 # <annotation>          [omitted when None]
+  json_schema: present (passed through)  # <annotation>       [omitted when None]
+```
+
+- **`description` first** (it is the human answer to *"what is this tool?"*), then the 30 resolved fields, then the carriers. The carriers are last because they are authored blocks, not resolved values, and a reader scanning for *"which ttl won"* should not wade through a schema first.
+- **An absent carrier prints NOTHING** — no `description: null` line. `None` means the author wrote no such key, and the resolver's `None`-vs-absent distinction ([`_carrier_value`](src/tool_swap/config/resolver.py:311)) is preserved in the display rather than flattened into a fake value. A resolved field whose *value* is `None` (`cpus`, `memory`, `max_concurrent`, `auth_token`) **is** printed, as `null` — it is one of the 47 and always has an origin.
+- **`reserved_keys` is never displayed.** It is a diagnostic carrier ([resolver.py:96](src/tool_swap/config/resolver.py:96)); the C4xx errors already report it and `config show` showing a key the config is being told to remove would be actively confusing.
+- **Tools are printed in `config.tools` iteration order = config-declaration order** (the ledger), with one blank line between tool sections. B21's chain builds `tools` by iterating `raw["tools"]`, so this is free — and it is pinned so a snapshot cannot flap.
+
+**4. The `router:` and `backend:` blocks — top-level, raw, and NOT per tool (assumption A24)**
+
+The ledger says *"The router and backend blocks are shown too, with origins"*. Per the preamble's fact 3, the 17 fields in `ResolvedTool.values` are **unreachable** from any user layer, so a per-tool rendering would print `port: 8600 # built-in default` next to a `tools.yaml` that plainly says `router: {port: 9000}`. Pinned instead:
+
+- **They are printed ONCE, as two top-level blocks, before the tool sections**, in `BUILT_IN_DEFAULTS` order within each block:
+  - `ROUTER_FIELDS` (9): `host, port, log_level, log_dir, log_json, cors_origins, auth_token, status_page, log_output`
+  - `BACKEND_FIELDS` (8): `type, network, container_prefix, label_namespace, gpu_runtime, orphans, port_range, registry_prefix`
+- **The value is `raw["router"].get(field, BUILT_IN_DEFAULTS[field])`** — a two-layer resolution (raw block over built-in) done **in the renderer**, not in the resolver. It is two layers, not four: `defaults:`, `tool.yaml` and inline cannot supply these keys ([`RouterConfig`](src/tool_swap/config/schema.py:43)/[`BackendConfig`](src/tool_swap/config/schema.py:58) are the only models that own them).
+- **The origin annotation is computed directly, not read from an `OriginMap`**: present in the raw block → `<file>:<line> (<block>)` with `line = loaded.line_for(f"router.{field}")`; absent → `built-in default`. The level word is the block name (`(router)` / `(backend)`), which is honest — there is no `OriginLevel` for it and inventing one would be a resolver change for a display concern.
+- **`log_output` is in `BUILT_IN_DEFAULTS` but NOT in `RouterConfig`.** It is documented as `router.log_output` ([`plan/07`](plan/07_CLI_AND_OPS.md:101) §2.1) and [`defaults.py`](src/tool_swap/config/defaults.py:68) files it under router, but the schema model has no such field, so writing it is a `TSWAP-C101` today. It is **displayed in the router block** (it is a router setting) and will always read `built-in default` in M1. Recorded under **A24**; adding the field is a schema change with its own red step, not 22's business.
+- **The two blocks are printed even when the config has neither** (every field then reads `built-in default`) — *"what is my effective config?"* has an answer whether or not the user wrote the block.
+- **Under `tswap config show <tool>` the router/backend blocks are STILL printed.** They are not tool-scoped, and suppressing them would make the per-tool view claim a smaller effective config than exists. This is the one place `config show <tool>` shows more than `tools.<tool>` — pinned because it is a display of *global* state, not a diagnostic filter (contrast item 11).
+
+**5. `env` — per key, with per-key origins (the origin map already records them)**
+
+[`_resolve_env`](src/tool_swap/config/resolver.py:784) merges key-by-key and records **`env.<KEY>`** per key, so the per-key origin the ledger asks for is shipped data, not a synthesis:
+
+```
+  env:                                # (no annotation on the header line)
+    HF_HOME: /weights                 # tools.yaml:12 (inline)
+    HF_TOKEN: ***                     # tools/t/tool.yaml (tool.yaml)
+```
+
+- **The header line carries no annotation** — the block as a whole has no single origin once the keys are merged, and annotating it with the winning key's origin would be a lie for every other key.
+- **Key order is the resolver's merged order** (`_union_of_keys`: most-specific layer first, first-seen within a layer), preserved by `values["env"]` being a plain dict. **Not sorted**: the order shows which layer contributed what, which is the whole point of the display. Pinned so a snapshot cannot flap.
+- **An empty merged env prints `env: {}` on one line**, annotated `built-in default` (the built-in layer's `{}` is what won). The `KeyError` totality of item 1 covers the unrecorded-path case.
+- **The non-mapping case is real and pinned**: `_resolve_env` short-circuits when the winning layer's `env` is not a Mapping (e.g. an explicit `env: null`), recording a **whole-block** origin at `env` and storing the raw value. The renderer therefore checks `isinstance(values["env"], dict)` first and otherwise prints the one-line form `env: null   # <annotation from origins.winning("env")>`.
+- **`--verbose` shows per-key shadows** from `shadowed(f"env.{key}")`, which `_resolve_env` populates ([resolver.py:820](src/tool_swap/config/resolver.py:820)). The shadowed *value* comes from the losing layer's env mapping, recoverable because `env` needs no flattening — this is the one place item 2's value-recovery gap does not bite.
+
+**6. `mounts` — per entry, with the defaulted `:ro` made explicit (behaviour 17's block already pinned this; 22 adopts it verbatim)**
+
+Behaviour 17 shipped [`parse_mount(entry, *, config_dir, home)`](src/tool_swap/config/validate.py:2486) returning a frozen [`ParsedMount(host, container, mode, mode_defaulted, resolved_host)`](src/tool_swap/config/validate.py:2433) whose docstring already names behaviour 22 as a consumer, **and its contract block, item 2 ("What `config show` reads, pinned so 17 and 22 cannot drift"), already pinned the three-row source table and the note phrase.** That pin is landed and 22 does not re-decide it. `config_show` imports and calls `parse_mount` — no second parser:
+
+```
+  mounts:                             # (no annotation on the header line)
+    - /home/u/.cache/hf:/weights/hf:ro  # tools.yaml:114 (defaults); mode defaulted to ro
+    - /cache:/cache:rw                  # tools.yaml:15 (inline)
+```
+
+- **Every entry renders as `f"{m.resolved_host}:{m.container}:{m.mode}"` with the mode ALWAYS shown**, which is the ledger's *"the explicit `:ro` default made visible"*. **`resolved_host`, not `host`** — behaviour 17's table row says so explicitly, and the reason is sound: the resolved form is what the Docker daemon will receive, and a relative `./data` printed as authored hides the very host-vs-router path confusion [`plan/07`](plan/07_CLI_AND_OPS.md:348) §7 sends users to `config show` to diagnose. The resolution is lexical (`normpath`, no disk, no CWD), so it is deterministic under `tmp_path`.
+- **The defaulted-mode note is the pinned phrase `mode defaulted to ro`**, appended to the annotation after `; ` — behaviour 17's block states a test may assert that substring, so it is a shared constant, not a marker of 22's own invention.
+- **`config_dir` is `config.parent`** — the config file's directory, matching the C54x rules' base ([behaviour 17's pin](src/tool_swap/config/validate.py:2501): never a tool's `base_dir`). **`home=None`** (the real `$HOME`), consistent with B21's `ValidatedConfig` construction leaving `home` defaulted; behaviour 17's table passes `config.home`, which is the same value through the `ValidatedConfig` 22 already holds — **pass `config.home`**, so an injected home reaches both consumers identically.
+- **An unparseable entry (`parse_mount` returns `None`, `TSWAP-C540`) is rendered VERBATIM AS AUTHORED, with its origin and NO note** — behaviour 17's wording exactly. The renderer must not crash on the config the user came to debug, and the `C540` diagnostic is already on stderr saying why. **No `[unparseable]` marker**: the raw string next to a `C540` on stderr already says it, and inventing a second signal is the drift item 2 of behaviour 17 exists to prevent.
+- **Entry order is the resolver's concatenation order — built-in first, inline LAST** ([`_resolve_mounts`](src/tool_swap/config/resolver.py:865) iterates `reversed(range(len(layers)))`). This is the opposite of every other field's most-specific-first convention and is pinned here so nobody "fixes" the display into descending order: it is Docker's application order, and for mounts the later entry wins.
+- **The origin comes from `origins.winning(f"mounts[{i}]")`** — bracket-indexed, the convention [`OriginMap`](src/tool_swap/config/origin.py:100) documents and `_resolve_mounts` uses. **Not** dotted; `mounts.0` would find nothing.
+- **An empty `mounts` prints `mounts: []` on one line**, annotated `built-in default`.
+
+**7. `inputs` / `outputs` / `params` / `json_schema` — a count, not the content**
+
+The ledger is silent, so this is pinned from first principles and from what the data supports:
+
+- **A one-line summary each, with the block's origin**: `inputs: 3 entries`, `params: 1 entry` (singular at 1), `json_schema: present (passed through)`. **Not** the YAML content.
+- **Why not the content:** these blocks are `tool.yaml`-authored and passed through verbatim ([`_tool_yaml_carrier_list`](src/tool_swap/config/resolver.py:378)); re-emitting them would mean writing a YAML serialiser in the CLI to print back, unchanged, a file the user already has open — and `config show`'s job is *"which value won and from where"*, which for a whole block is answered by the origin alone. The one thing a reader cannot get by opening the file is **whether the block was picked up at all**, and the count answers exactly that.
+- **The origin is the block's own recorded origin** (`origins.winning("inputs")` etc.), which the resolver records as the fixed `tool.yaml` origin ([resolver.py:290](src/tool_swap/config/resolver.py:290)) — so the annotation names the `tool.yaml` path.
+- **`--json` carries the FULL blocks, not the count** (item 8). A machine consumer has no rendering problem, and truncating data in a machine format to match a human summary would be the wrong trade.
+- **The compiled JSON Schema is not shown, in either mode.** `compile_tool_schema` is behaviour 20's, `tswap config show` is about the *config*, and a compiled-schema view is a different command (M3's `/tools`).
+
+**8. `--json` — the exact shape**
+
+```jsonc
+{
+  "config": "tools.yaml",
+  "router":  {"port": {"value": 9000, "origin": {"level": "router",  "source": "tools.yaml", "line": 3}}, ...},
+  "backend": {"type": {"value": "docker", "origin": {"level": "built-in", "source": "built-in default", "line": null}}, ...},
+  "tools": {
+    "predict": {
+      "ttl":   {"value": 600, "origin": {"level": "inline", "source": "tools.yaml", "line": 14},
+                "shadowed": [{"value": 900, "origin": {"level": "built-in", "source": "built-in default", "line": null}}]},
+      "env":   {"HF_TOKEN": {"value": "***", "origin": {...}, "shadowed": []}},
+      "mounts": [{"value": "/data:/weights:ro", "mode_defaulted": true, "origin": {...}}],
+      "description": {"value": "...", "origin": {...}},
+      "inputs": {"value": [ ...the block verbatim... ], "origin": {...}}
+    }
+  }
+}
+```
+
+- **`origin` is a STRUCTURED OBJECT `{level, source, line}`, never the human phrase.** *Machine-readable* is the ledger's own word; a consumer asking *"is this value from the built-in defaults?"* should test `origin.level == "built-in"`, not regex a sentence. `level` is `OriginLevel.value` verbatim (`"inline"` / `"tool.yaml"` / `"defaults"` / `"built-in"`), plus `"router"` / `"backend"` for the two raw blocks; `source` is the file path (or `"built-in default"`); `line` is the int or `null`.
+- **A `{"config": ..., "router": ..., "backend": ..., "tools": {...}}` envelope, not a bare `{tool: {field: ...}}` map.** The ledger's `{tool: {field: {value, origin}}}` describes the *tools* half; the router/backend blocks and the config path have nowhere to live in a bare map, and a top-level key named after a tool called `router` would collide. The envelope is one key deeper and unambiguous.
+- **`shadowed` is ALWAYS present** (`[]` when empty) rather than appearing only under `--verbose`: a machine consumer should not have to re-run with a different flag to get the field, and `--verbose` is a *rendering* concern. **`--verbose` therefore has no effect on `--json`**, pinned and tested (`show --json` and `show --json --verbose` produce byte-identical stdout).
+- **`json.dumps(payload, indent=2, sort_keys=False)`** — key order is the pinned display order (item 3), so the JSON reads in the same order as the text and a snapshot test can diff it. `sort_keys=True` would destroy the semantic grouping for no gain.
+- **Nothing but the JSON on stdout**, all human output on stderr — B21's item 9 discipline verbatim, so `tswap config show --json | jq` works.
+- **Redaction applies in `--json` exactly as in the text** (item 9). The JSON is the *more* likely thing to be pasted into a ticket.
+
+**9. Secret redaction (A12) — the exact rule**
+
+- **Two triggers, and only two:** (a) the resolved field named exactly **`auth_token`** (the router block's, per item 4); (b) any **`env` key** matching `TOKEN|SECRET|KEY|PASSWORD`.
+- **The env-key match is case-INSENSITIVE substring**, i.e. `re.search(r"TOKEN|SECRET|KEY|PASSWORD", key, re.IGNORECASE)`. A12 writes the alternation in capitals because env vars are conventionally upper-case, not as a case rule; `hf_token`, `api_secret` and `Aws_Access_Key` are the same secret as their upper-case spellings, and a redactor that leaks on `hf_token` is a redactor that failed. **Substring, not equality**, because the real names are `HF_TOKEN`, `OPENAI_API_KEY`, `DB_PASSWORD` — never the bare word. Recorded as a refinement of **A12** (the maintainer confirmed the alternation, not its case sensitivity).
+- **Accepted false positives, deliberately:** `KEY` matches `KEYSTONE_URL`, `MONKEY_PATCH` and `PRIMARY_KEY_COLUMN`. Over-redaction costs one `--show-secrets` re-run; under-redaction is the bug A12 exists to prevent. The asymmetry decides it.
+- **The redacted value is exactly `***`** and **the origin annotation is unchanged** — *"where is this set?"* is the question that survives redaction, and answering it leaks nothing.
+- **Absent is not redacted.** `auth_token` resolves to `None` by default; a `None` value prints `null`, **not** `***`, because `***` would tell the reader a token is configured when none is. Redaction applies only to a non-`None` value. An empty string `""` **is** redacted (A10: empty-but-set is set).
+- **Shadowed secret values are redacted too** (`# overrides *** from ...`), or the `--verbose` view would leak the value the winning line just hid.
+- **`--show-secrets` opts out globally** — real values in both text and JSON, no marker, no banner. **No banner**, deliberately: unlike `--allow-missing-descriptions` (a correctness escape hatch CI must never use), `--show-secrets` is a legitimate local action, and a warning line printed into the output a user is about to paste is noise. The flag's help text carries the caution instead.
+- **Redaction is a pure function applied at RENDER time**, never to `ResolvedTool.values`. The resolved data stays intact for every other consumer, and a test asserts the same in-process resolution renders redacted then unredacted depending only on the flag.
+
+**10. The call chain — extract ONE shared helper, in a new module**
+
+**Decision: 22's green extracts the B21 call chain into a new `src/tool_swap/cli/_pipeline.py`, and both commands call it.** The signature:
+
+```python
+@dataclass(frozen=True)
+class Pipeline:
+    loaded: LoadedConfig
+    tools: dict[str, ResolvedTool]
+    config: ValidatedConfig
+    diagnostics: list[Diagnostic]      # loader + root schema + resolver, in collection order
+
+def run_pipeline(path: Path, *, env: Mapping[str, str], env_file: Path | None) -> Pipeline:
+    """register_builtin_rules(); load; validate_root; two-pass resolve; ValidatedConfig."""
+```
+
+- **The DRY argument wins because the chain is not 40 lines of glue but 40 lines of *decisions*** — the two-pass group probe, `{**groups[gname], "name": gname}`, discarding the probe's diagnostics, `env=os.environ` passed explicitly, `path` un-`resolve()`d. A duplicated copy would drift on the first change to any of them, and the failure mode is silent (`config show` would display a config `validate` never validated) — the single worst outcome for a command whose entire purpose is *"show me the truth"*.
+- **A new module, not a helper inside `cli/validate.py`.** `config_show` importing from `validate` would make the *display* command depend on the *checking* command, and B21's [`reported_for` pin](plans/m1-configuration.md:2354) already has 22 importing the filter from there; adding the pipeline too inverts the natural layering. `_pipeline.py` is underscore-private to `cli/` and both are peers of it. **`reported_for` moves there as well**, so 22 imports exactly one module.
+- **The extraction is BEHAVIOUR-PRESERVING and that is the hard constraint.** It is `21b`, a **test-only-safe pure refactor with its own commit, landed BEFORE 22's red step**, on the 21.0 / 12a / 15.0 / 19b precedent: cut the chain out of [`validate`](src/tool_swap/cli/validate.py:368) into `run_pipeline`, call it, run the suite, commit. **The whole of B21's test file must stay green with zero edits** — if any assertion has to move, the extraction is wrong and the fallback (below) applies.
+- **One shipped pin constrains the move and must be honoured**: [`test_validate_cli.py:910`](tests/unit/cli/test_validate_cli.py:910) monkeypatches `"tool_swap.cli.validate.compile_tool_schema"`. So **`_schema_diagnostics` and its `compile_tool_schema` import STAY in `cli/validate.py`** and are *not* part of `run_pipeline` — which is correct on the merits anyway: schema compilation is a validation concern, and `config show` does not compile schemas (item 7). `run_pipeline` stops at `ValidatedConfig`; `validate` then adds `validate_config(...)` and `_schema_diagnostics(...)` on top.
+- **`register_builtin_rules()` stays inside `run_pipeline`, first**, so `config show` gets the same once-and-idempotent guarantee. `config show` does not run the rules for their own sake but **does** run `validate_config` (item 11 — warnings must be shown), so the registry must be populated.
+- **The `try` / `except ConfigError` / `except typer.Exit: raise` / `except Exception` guard stays in EACH command**, not in `run_pipeline`: the guard's message names the command (`internal error while validating <f>` vs `internal error while showing <f>`) and its exit codes are a CLI concern. `run_pipeline` raises `ConfigError` and nothing else it invents.
+- **The fallback, if 21b turns red:** duplicate the chain in `config_show.py` with a comment naming the drift risk and this item. **Do not** reshape B21's tests to make an extraction fit — that trades a real guarantee for a stylistic one.
+
+**11. Warnings, diagnostics and the output discipline**
+
+- **`config show` runs the FULL validation** — `run_pipeline`, then `validate_config(config).diagnostics` — and prints the diagnostics on **stderr** via `report.render()`, exactly as `validate` does. The ledger's *"never more optimistic than `validate`"* is mechanical: same rules, same rendering.
+- **`_schema_diagnostics` is NOT run.** The S1xx codes are about the compiled schema, `config show` does not display it (item 7), and running the compiler here would put the B21 monkeypatch seam in two commands. **Stated cost, honestly:** `tswap config show` can exit 0 on a config `tswap validate` fails with an `S1xx`. Mitigated by the summary line naming `validate` (below), and pinned rather than discovered.
+- **The resolved output goes to stdout, ALWAYS, even when there are errors** — the ledger's *"errors do not suppress the resolved output where resolution succeeded"*. Order: **stdout is complete and self-contained; stderr carries the diagnostics.** No interleaving (the two streams are separately captured in tests, and interleaving is not reproducible when redirected).
+- **Per-tool resolution never fails partially.** `resolve_tool` is total over the 47 fields — every field falls through to the built-in layer — so there is no "tool that half-resolved". A tool with a `C501` bad ttl still prints its (bad) value with its origin, which is precisely the display that explains the diagnostic. **The one case that could skip a section is an exception escaping `resolve_tool`**, which `run_pipeline` does not catch: it reaches item 10's guard and exits 2 with the internal-error line. **No per-tool skip-with-a-note path is specified** — inventing one for a case the resolver's totality makes unreachable is speculative.
+- **The summary line, on stderr, only when there are diagnostics**: `<e> error(s), <w> warning(s) — run 'tswap validate' for details`. It reuses B21's `(s)` pluralisation verbatim (item 5's table there) and adds the pointer clause, because `config show` deliberately renders no remedies-first view and the S1xx gap above is real. **On a clean config there is NO summary and NO `OK` line** — stdout is the config, which is the result; B21 prints `OK …` because it has nothing else to say.
+- **`--strict` does not exist on `config show`.** It is a CI gate for a checker; `config show` is a viewer.
+
+**12. Exit codes**
+
+| # | Situation | Exit | Where decided |
+|---|---|---|---|
+| 1 | Resolved; no errors (warnings allowed) | **0** | `not report.errors` |
+| 2 | Resolved; one or more ERRORs | **1** | the config is shown anyway (item 11) |
+| 3 | Unknown tool name | **1** | before any output, via B21's `_unknown_tool` |
+| 4 | `ConfigError` from the loader (any of the twelve C0xx) | **2** | `except ConfigError` |
+| 5 | Any other unexpected exception | **2** | item 10's guard |
+| 6 | `--help` | **0** | typer |
+| 7 | Bad CLI usage | **2** | click's `UsageError.exit_code` |
+
+- **This is B21's table minus the `--strict` and `--allow-missing-descriptions` rows** (neither flag exists here), which is what *"follows `validate`'s scheme"* means concretely.
+- **Row 2 is the deliberate one**: exit 1 **and** a full config on stdout. A shell doing `tswap config show > snapshot.txt` gets the snapshot *and* a non-zero status telling it the config is not deployable.
+- **`--allow-missing-descriptions` is NOT accepted** — it is a downgrade for a *gate*, and `config show` gates nothing. A missing description shows up as a `C300` on stderr either way.
+- **Row 3 reuses `_unknown_tool(tool, tools)` from `cli/validate.py`** verbatim: same message, same `nearest_alternative` threshold, same exit 1. The ledger already requires them to agree.
+
+**13. The typer surface — a `config` sub-app**
+
+The spec writes `tswap config show [model]` ([`plan/07`](plan/07_CLI_AND_OPS.md:82) §2), so it is a **sub-group**, not a `config-show` command:
+
+```python
+# cli/config_show.py
+config_app = typer.Typer(name="config", help="Inspect the effective configuration.")
+config_app.command("show")(show)          # `show` is the plain function, B21's registration idiom
+
+def show(
+    tool: Annotated[str | None, typer.Argument(metavar="TOOL", help="Show only this tool.")] = None,
+    config: Annotated[Path, typer.Option("--config", help="Config file to read.")] = Path("tools.yaml"),
+    env_file: Annotated[Path | None, typer.Option("--env-file", help="Env file, replacing .env discovery.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Also show the values each setting overrode.")] = False,
+    json_: Annotated[bool, typer.Option("--json", help="Emit the resolved config as JSON on stdout.")] = False,
+    show_secrets: Annotated[bool, typer.Option("--show-secrets", help="Print secret values instead of ***. Local use only.")] = False,
+) -> None:
+# cli/main.py
+app.add_typer(config_app, name="config")
+```
+
+- **`add_typer`, not a flat `config-show` command**: it matches the spec's spelling, and it is the extension point `tswap config diff` / `tswap config path` would use later.
+- **The function is defined in `config_show.py` and registered in `main.py`**, mirroring B21's `app.command()(_validate)` pin — `main.py` stays the single registration point and no import cycle appears. (`config_app` itself is constructed in `config_show.py`; `main.py` only adds it.)
+- **`--all` is NOT offered.** B21 accepts it because [`plan/07`](plan/07_CLI_AND_OPS.md:74) §2 spells `tswap validate [model|--all]`; the same table spells `tswap config show [model]` with no `--all`. Following the spec exactly in both places.
+- **No shipped help test breaks — verified.** [`test_module_help_is_consistent_with_app`](tests/unit/test_cli.py:160) asserts only the substrings `usage:`, `tool` and `version` are present in the combined help; [`TestHelpFlag`](tests/unit/test_cli.py:65) asserts `Usage:`, `tswap` and `tool`. **No test enumerates the command list or compares the help text as a whole** (lines 174–175 slice off the first line but never assert `app_lines == proc_lines`). Adding a `config` group is therefore safe. **`main.py`'s `help=` string lists the commands by hand** ([main.py:18](src/tool_swap/cli/main.py:18)) and **must gain a `config show` line** — a hand-maintained list that omits the new command is exactly the rot a reader trips over.
+- **A `--help` test asserts each of the six surface names** (`TOOL`, `--config`, `--env-file`, `--verbose`, `--json`, `--show-secrets`) appears with a help string of at least 10 characters, on B21's item 12 precedent.
+- **`tswap config` with no subcommand** falls to typer's group behaviour (help, exit 0). No callback of our own — the root app's callback already handles the no-args case and a second one here would be a second thing to keep in sync.
+
+**14. Fixture strategy**
+
+**`tmp_path` + a module-level `_write(tmp_path, name, text) -> Path`, and `_make_runner()` copied verbatim from [`tests/unit/test_cli.py`](tests/unit/test_cli.py:25)** — B21's item 14/15 pins, unchanged and for the same reasons (the leaf test dirs carry no `__init__.py`, so a cross-directory import is unavailable; `--config <tmp_path>/tools.yaml` on every invocation, never the CWD).
+
+| Constant | Shape | Exercises |
+|---|---|---|
+| `SHADOW_TTL` | one `path:` tool; `tool.yaml` has `lifecycle: {ttl: 600}`; root has `defaults: {ttl: 300}` | the ledger's headline case: `ttl: 600 # <p>/t/tool.yaml (tool.yaml)`, `--verbose` showing the `defaults` shadow **and** the synthesised `overrides 900 from built-in default` |
+| `INLINE_TTL` | the same tool with `ttl: 600` written **inline** | the `(inline)` annotation **with a real line number** from `line_for("tools.t.ttl")` — the one level where the ledger's `tools.yaml:143` form is achievable |
+| `GROUP_DEVICES` | `groups: {gpu0: {devices: [0]}}` and a tool with `group: gpu0` | the `(group 'gpu0')` annotation, proving B21's `{**groups[gname], "name": gname}` injection reaches the display (without it: `groups.unnamed.devices`) |
+| `ENV_SECRET` | `env: {HF_HOME: /w, HF_TOKEN: t, hf_token: t2, KEYSTONE_URL: u}` split across `tool.yaml` and inline | per-key origins; `HF_TOKEN` **and** `hf_token` → `***` (case-insensitivity); `KEYSTONE_URL` → `***` (the accepted false positive); `HF_HOME` untouched; `--show-secrets` restores all |
+| `ROUTER_AUTH` | `router: {port: 9000, auth_token: s3cr3t}` | the router block: `port` `(router)` with a line, `auth_token` `***`, the other 7 `built-in default`; and that **no tool section** shows `port` |
+| `MOUNTS` | `mounts: ["/data:/weights", "/cache:/cache:rw"]` at two layers | `:ro` made explicit + the `mode defaulted to ro` note; concatenation order **built-in-first/inline-last**; per-entry `mounts[i]` origins |
+| `CARRIERS` | a `tool.yaml` with `inputs:` (3 entries), `params:` (1), a `description:` | `inputs: 3 entries` / `params: 1 entry` (singular) with `tool.yaml` origins; JSON carries the blocks verbatim |
+| `MINIMAL` | one tool, nothing else set | all 30 fields present, all `built-in default`; the empty-`env` / empty-`mounts` `KeyError` totality path |
+| `TWO_TOOLS_ERROR` | two tools, one with no image source (`C511`) | stdout carries **both** full tool sections, stderr the diagnostic, exit **1** |
+| `NEAREST_NAME` | tools `echo` and `predict`; invoked as `config show preidt` | the shared `_unknown_tool` line, `'predict'` suggested, exit 1 |
+| *(no file written)* | `--config` names a path that does not exist | `TSWAP-C000`, exit **2**, nothing on stdout |
+
+- **A `tool.yaml`-bearing fixture is a directory** (`_write` the root config, then `tmp_path/"t"/"tool.yaml"`, `path: ./t`), per B21.
+- **Every wording assertion is against a module-level constant imported from `cli/config_show.py`** — `_ORIGIN_COLUMN`, the annotation suffixes, `_REDACTED = "***"`, the `mode defaulted to ro` note, the summary template. B21's item 14 pin.
+- **The `tool.yaml`-path annotation is asserted as `str(loaded.tool_yaml("t")[0])`-shaped, not as a literal** — the path is `tmp_path`-dependent and absolute (`tool_yaml` stores `.resolve()`d paths, [loader.py:467](src/tool_swap/config/loader.py:467)). Tests assert the **suffix** `t/tool.yaml (tool.yaml)`, which is stable.
+- **One golden snapshot test over `MINIMAL`** — the whole stdout, character for character — because the alignment column, the field order and the "all 30 present" promise are exactly the properties that rot silently. Every other test asserts targeted lines.
+
+**15. What this behaviour must NOT do**
+
+- **No changes to `resolver.py`, `origin.py`, `defaults.py`, `validate.py`, `errors.py`, `loader.py` or `schema.py`.** The only source files 22 touches are `cli/config_show.py` (new), `cli/_pipeline.py` (new, in 21b), `cli/validate.py` (21b's cut, plus nothing) and `cli/main.py` (the `add_typer` line + the help string). **The one permitted exception is promoting `origin.py`'s two private render constants to public names** (item 1) — additive, no shipped test reads them.
+- **No new diagnostic code.** 22 emits no `TSWAP-*`; it renders what the pipeline produced.
+- **No YAML serialiser, no compiled-schema view, no path resolution display, no `--strict`, no `--all`, no colour.**
+- **No filesystem writes, no network, no Docker.** `ValidatedConfig.probe` defaults to `REAL_FILESYSTEM` for the rule pass (identical to B21), which reads but never writes.
 
 ### Behaviour 23 — the five-line minimal config works end to end
 
@@ -2639,7 +2942,8 @@ src/tool_swap/cli/
 ├── __init__.py        (exists — docstring only today)
 ├── main.py            the typer app (moved from __main__.py)                       [B21]
 ├── validate.py        tswap validate                                               [B21]
-└── config_show.py     tswap config show                                            [B22]
+├── config_show.py     tswap config show                                            [B22]
+└── _pipeline.py       shared load/resolve chain + reported_for               [B21b, B22]
 
 scripts/
 └── gen_config_reference.py   generates docs/configuration.md                       [B25]
@@ -2730,7 +3034,8 @@ graph TD
     B12a --> B21[21 tswap validate]
     B19 --> B21
     B20 --> B21
-    B21 --> B22[22 tswap config show]
+    B21 --> B21b[21b extract cli/_pipeline.py]
+    B21b --> B22[22 tswap config show]
     B22 --> B23[23 five-line config]
     B23 --> B24[24 tools.example.yaml in CI]
     B24 --> B25[25 generated docs]
@@ -2746,6 +3051,8 @@ Behaviours 12–19 are siblings and could be reordered or parallelised; the list
 **Behaviours 16, 17, 18 and 19 need NO such sub-step (verified 2026-08-19).** Each predecessor's append-order test was checked and is index-anchored: behaviour 16's block verified 15's, behaviour 17's verified 16's, behaviour 18's block item 10 verified [`test_builtin_rules_append_the_behaviour_17_codes_in_code_order`](tests/unit/config/test_validate_mounts.py:1234), and **behaviour 19's block item 10 has now run the same check against behaviour 18's** [`test_c6xx_rules_are_appended_to_builtin_rules_after_behaviour_17`](tests/unit/config/test_validate_contradictions.py:1118) — index-anchored, forward-sliced, with no tail slice and no `len(BUILTIN_RULES)` assertion (a suite-wide grep for `len(BUILTIN_RULES)`, `ids[-` and `BUILTIN_RULES[-` returns zero hits). The plan-line-1848 hazard is discharged for the whole 15–19 range.
 
 **Behaviour 19b — collapse the two builtin-id constants (added 2026-08-19). Test-only, its own commit, immediately after 19's green.** Behaviour 19 is the last rule-growth behaviour, so `_EXPECTED_BUILTIN_IDS` / `_LANDED_BUILTIN_IDS` stop growing there and the duplication behaviours 14–18 each recorded is finally worth collapsing. It is **not** part of 19's green (a refactor of two committed test files must not ride inside a make-the-red-test-pass commit) and **not** the first action of behaviour 20 (which shares no file with the registry). Sequence: **19 red → 19 green → 19b → 20.** Precedents: 12a and 15.0. Full shape in behaviour 19's contract block, item 9a.
+
+**Behaviour 21b — extract the shared load/resolve chain (added 2026-08-20). Source-only pure refactor, its own commit, immediately after 21's green and BEFORE 22's red.** Behaviour 22 needs the *same* forty lines of call chain behaviour 21 landed inline — including the two-pass group probe, the `{**groups[gname], "name": gname}` injection and the discarded probe diagnostics. Duplicating them would drift, and the drift is **silent**: `config show` would display a config `validate` never validated, the worst possible failure for a command whose whole purpose is *"show me the truth"*. 21b cuts the chain into [`src/tool_swap/cli/_pipeline.py`](src/tool_swap/cli/_pipeline.py) as `run_pipeline(path, *, env, env_file) -> Pipeline`, moves the per-tool filter ([`_implicates`](src/tool_swap/cli/validate.py:179)) there too, and has `validate` call it. **The whole of [`test_validate_cli.py`](tests/unit/cli/test_validate_cli.py:1) must stay green with zero edits** — if an assertion has to move, the extraction is wrong and behaviour 22's contract block item 10 fallback (duplicate the chain, with a comment naming the risk) applies. **One shipped pin constrains the cut and the design already honours it:** [line 910](tests/unit/cli/test_validate_cli.py:910) monkeypatches `tool_swap.cli.validate.compile_tool_schema`, so `_schema_diagnostics` and its import **stay in `cli/validate.py`** and are not part of `run_pipeline` — which is right on the merits too, since `config show` compiles no schemas. Precedents: 21.0, 12a, 15.0, 19b. Sequence: **21 red → 21 green → 21b → 22 red → 22 green.**
 
 ---
 
@@ -2807,6 +3114,27 @@ The alternative — deciding "implicates X" from the diagnostic's **message text
 
 **No shipped test is affected** (no CLI test exists for `validate` yet; [`tests/unit/test_cli.py`](tests/unit/test_cli.py:1) covers only `--help`, no-args and `python -m` parity). The user-visible consequence to confirm: in M1, `tswap validate my_tool` reports only diagnostics located under `tools.my_tool`, plus a note naming how many were hidden; `tswap validate` (the default, `--all`) reports everything, and is what CI should run.
 
+**A23 — deliberately not allocated.** The number is skipped so that nothing in the ledger, the PR description or [issue #2](https://github.com/iar3-r8/tool-swap/issues/2) can confuse an assumption with **behaviour 23**, whose golden-path promises (*"`tswap config show` prints a fully-populated resolved config in which every value not written above has origin `built-in default`"*) are asserted directly against behaviour 22's renderer. That sentence is now mechanically checkable: item 3's 30 fields, item 1's `built-in default` annotation, and item 14's `MINIMAL` snapshot are the same three pins behaviour 23 will assert.
+
+**A24 (new, 2026-08-20) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 22's contract block **narrows the ledger's sentence** *"The router and backend blocks are shown too, with origins"*. They are shown **once, as two top-level blocks resolved in the renderer from `raw["router"]` / `raw["backend"]` over `BUILT_IN_DEFAULTS`**, annotated `(router)` / `(backend)` — **not** inside each tool section and **not** from `ResolvedTool.values`.
+
+The reason is a property of the shipped code, not a preference. The 17 router/backend keys **are** in [`BUILT_IN_DEFAULTS`](src/tool_swap/config/defaults.py:59) and therefore in every `ResolvedTool.values` — but **no layer `resolve_tool` sees can supply them**: [`RouterConfig`](src/tool_swap/config/schema.py:43) and [`BackendConfig`](src/tool_swap/config/schema.py:58) are nested root blocks, [`DefaultsConfig`](src/tool_swap/config/schema.py:73) declares none of them, [`ToolConfig`](src/tool_swap/config/schema.py:151) declares none of them (`extra="forbid"` rejects them inline), and only the five [`_FLATTENING_TABLE`](src/tool_swap/config/resolver.py:28) keys flatten out of a `tool.yaml`. So a config saying `router: {port: 9000}` resolves `tool.values["port"] == 8600` with origin `BUILT_IN` for **every** tool. A per-tool rendering would print a confident, well-formatted lie in the one command whose entire purpose is *"show me the truth"*. Behaviour 16's contract block already reached the same conclusion for the same data and recorded it as item 3 (*"`port_range` — read from `config.raw["backend"]`, NOT from `values`"*); A24 is that decision generalised to the display and given a number because it visibly changes the shape of the output the ledger describes.
+
+Two consequences ride along. **`log_output` is displayed in the router block but can never be set**: it is in `BUILT_IN_DEFAULTS` and documented as `router.log_output` ([`plan/07`](plan/07_CLI_AND_OPS.md:101) §2.1), yet `RouterConfig` has no such field, so writing it is a `TSWAP-C101` today and the block will always show `built-in default` for it. Adding the field is a schema change with its own red step, **not** behaviour 22's. And **the two blocks are printed under `tswap config show <tool>` as well** — they are global state, not tool-scoped, and hiding them would make the per-tool view claim a smaller effective config than exists.
+
+**No shipped test is affected** (no `config show` exists yet, and no test asserts anything about the 17 keys inside a `ResolvedTool`). The user-visible consequences to confirm: `tswap config show` prints `router:` and `backend:` once at the top, each field annotated `(router)`/`(backend)` when the raw block sets it and `built-in default` otherwise; no tool section lists `port`, `host`, `type` or the other 14; and `router.log_output` remains unsettable in M1.
+
+**A25 (new, 2026-08-20) — NOT yet confirmed by the intake source; two known gaps in `--verbose`, recorded rather than fixed.** Behaviour 22's `--verbose` view (*"`# overrides 900 from built-in default`"*) is served by the shipped [`OriginMap.shadowed`](src/tool_swap/config/origin.py:137), which **is** populated by [`_resolve_wholesale`](src/tool_swap/config/resolver.py:698), [`_resolve_ttl`](src/tool_swap/config/resolver.py:734), [`_resolve_env`](src/tool_swap/config/resolver.py:817) and [`_apply_batching_disabled_override`](src/tool_swap/config/resolver.py:553). **No resolver change is required for behaviour 22, and none is permitted in its green step.** Two gaps remain and are pinned as-is:
+
+1. **`OriginMap` records shadowed ORIGINS, not shadowed VALUES**, so `config show` recovers each losing value from the raw layer (`BUILT_IN_DEFAULTS[field]`, `raw["defaults"][field]`, `effective_groups(raw)[n][field]`). The **`tool.yaml` layer's value is not recovered** — doing so means re-applying the resolver-private `_FLATTENING_TABLE` in the CLI, a second flattening implementation and exactly the drift this milestone keeps deleting. That shadow renders as `# overrides the value in <path> (tool.yaml)`: the file is named, the value is not. The clean fix is to have `OriginMap` carry [`ResolvedValue`](src/tool_swap/config/origin.py:73)s rather than bare `Origin`s — the type already exists and is currently used by nothing outside its own tests — which is a behaviour-9/10 change with its own red step.
+2. **The carrier fields record no shadows at all.** `description`, `image`, `handler` and `requirements` are genuinely layered (inline > `tool.yaml` > `defaults`) yet are recorded with `origins.record(key, origin)` and **no** `overrides=` ([resolver.py:258](src/tool_swap/config/resolver.py:258), [:276](src/tool_swap/config/resolver.py:276)), so `--verbose` prints no shadow line for them even when a `tool.yaml` `description:` was overridden inline. Same fix, same red step, same deferral.
+
+A third item is **not** a gap and is recorded so nobody "fixes" it: [`_shadowed`](src/tool_swap/config/resolver.py:673) slices `layers[winner_index + 1 : -1]`, deliberately excluding the built-in baseline, so the ledger's own `overrides 900 from built-in default` is **synthesised by the renderer** from `BUILT_IN_DEFAULTS[field]` rather than read from the map. Changing the resolver to include it would break the shipped [`test_scalar_precedence_all_layers_present_inline_wins`](tests/unit/config/test_resolver.py:145), which asserts `shadowed("ttl") == [TOOL_YAML, DEFAULTS]` exactly. The synthesis is total and correct by construction: the built-in layer carries every one of the 47 fields.
+
+The user-visible consequences to confirm: in M1, `tswap config show --verbose` shows the overridden **value** for `defaults:`, group and built-in layers, shows only the **file** for a `tool.yaml` layer, and shows nothing for an overridden `description:` / `image:` / `handler:` / `requirements:`.
+
+**A12 sharpened (2026-08-20) — a refinement of a confirmed assumption, not a new one.** A12 was confirmed on 2026-08-17 with the alternation written `TOKEN|SECRET|KEY|PASSWORD`. Behaviour 22 pins the match as **case-insensitive substring** on the env key (`re.search(..., re.IGNORECASE)`), because the capitals are an env-var convention rather than a case rule and a redactor that leaks on `hf_token` has failed at its one job; and it pins that a **`None` value is never redacted** (it prints `null`, since `***` would tell a reader a token is configured when none is), while an empty string **is** (A10: empty-but-set is set). Both directions were checked: over-redaction (`KEYSTONE_URL` matches `KEY`) costs one `--show-secrets` re-run, under-redaction is the bug A12 exists to prevent, and the asymmetry decides it. Nothing about the confirmed surface changes — the trigger set, the `***` marker, the origin-still-shown rule and the `--show-secrets` opt-out are all as approved — so this needs no new confirmation and takes no new `A`-number.
+
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
 - The synthesised `default` group carries `eviction: "lru"` as well as `max_resident: 4`. Plan line 219 mentions only `max_resident: 4`; the value matches [`GroupConfig`](src/tool_swap/config/schema.py:120)'s defaults and `plan/02_CONFIGURATION.md`'s `groups:` example, so it is consistent rather than invented.
@@ -2825,10 +3153,12 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A9** | The generated reference's location | `docs/configuration.md`, generated, with a regenerate-and-diff test so it cannot rot | 25 |
 | **A10** | POSIX `:-` substitutes on unset **or empty** | We treat **empty-but-set as set**, so `TSWAP_TOKEN=""` means "explicitly no token" and does not resurrect a default. Documented and pinned by a test | 5 |
 | **A11** | Where group-supplied `devices` sit in precedence | §4.1 lists four levels and does not place the group. Assumed **between `defaults:` and built-in** | 10 |
-| **A12** | Secret redaction in `config show` | Not in the spec. Proposed: redact `auth_token` and `env` keys matching `TOKEN\|SECRET\|KEY\|PASSWORD`, with `--show-secrets` to opt out, because this output is what users paste into issues | 22 |
+| **A12** | Secret redaction in `config show` | Not in the spec. Proposed: redact `auth_token` and `env` keys matching `TOKEN\|SECRET\|KEY\|PASSWORD`, with `--show-secrets` to opt out, because this output is what users paste into issues. **Confirmed 2026-08-17; sharpened 2026-08-20** — the env-key match is case-insensitive substring, and a `None` value prints `null` rather than `***` | 22 |
 | **A20** | The DoD's D9 line: *"no members or all members share the same device"* | **Narrowed to the §6 rules it points at.** *No members* → the already-shipped `C223`, so **`C611` is withdrawn and never allocated**; *all members on one device* → **no diagnostic** (it is the documented intent of `groups:`), with the device dimension covered by `C612`'s two-or-more-groups overlap; D9 proper → `C610`. Behaviour 19 ships **three** rules, total **41** | 19; DoD |
 | **A21** | Behaviour 20's ledger lists **eight** S1xx codes | **Six more are added** (`S104` non-string `semantic`, `S105` non-list block / non-mapping entry, `S106` bad `name`, `S107` non-bool `required`, `S108` non-string `description`, `S109` `array` without `items`), for **fourteen**. They are the consequence of the compiler being **total and never raising**: each malformed entry must yield a message rather than silence. Turns silence into a diagnostic; narrows nothing | 20, 25 |
 | **A22** | The ledger's *"cross-tool diagnostics implicating the named tool are reported"* under `tswap validate <tool>` | **Narrowed to a `yaml_path` prefix test** (`tools.<X>` / `tools.<X>.…`). Cross-tool findings at bare `tools` (`C211`, `C530`) or under `groups.…` (`C223`, `C610`, `C612`, `C613`) are not shown per-tool; a note line names how many were hidden and points at the whole-file run. Message-substring matching was rejected as untestable and fragile | 21, 22 |
+| **A24** | The ledger's *"The router and backend blocks are shown too, with origins"* | **Narrowed to two top-level blocks read from `raw`**, annotated `(router)`/`(backend)`, **not** per tool: the 17 keys are in `ResolvedTool.values` but no layer the resolver sees can supply them, so a per-tool view would print `port: 8600 # built-in default` under a config saying `router: {port: 9000}`. Generalises behaviour 16's shipped `port_range`-from-`raw` decision. `router.log_output` is displayed but unsettable in M1 | 22 |
+| **A25** | `config show --verbose`'s shadowed values | **The shipped `OriginMap.shadowed` suffices — no resolver change.** Two gaps pinned, not fixed: a `tool.yaml` shadow shows the **file but not the value** (recovering it needs the resolver-private `_FLATTENING_TABLE`), and the **carrier fields record no shadows at all**. The built-in tail is **synthesised** by the renderer, because including it in the resolver would break a shipped `test_resolver.py` assertion | 22 |
 
 ### Scope boundaries recorded deliberately
 
