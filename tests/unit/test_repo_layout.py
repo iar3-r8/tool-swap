@@ -49,6 +49,7 @@ SRC_RUNTIME_PACKAGES: list[str] = [
 # ---------------------------------------------------------------------------
 TEST_DIRS: list[str] = [
     "tests/unit/config",
+    "tests/unit/schema",
     "tests/unit/scheduler",
     "tests/unit/lifecycle",
     "tests/unit/proxy",
