@@ -234,18 +234,41 @@ class TestCompileInputs:
         assert list_diags == []
 
     def test_required_keeps_declaration_order(self) -> None:
-        """required contains exactly the required:true names, in order (item 2)."""
+        """required contains exactly the required:true names, in order (item 2).
+
+        Non-alphabetic declaration order (zeta before gamma) so the
+        order assertion cannot be an alphabetical accident; the
+        omitted-key entry and the ``required: false`` entry must not
+        appear in ``required`` (opt-in: an absent ``required:`` key is
+        not required — plan line 1826, "exactly the inputs with
+        ``required: true``").
+        """
         schema, diags = compile_inputs(
             [
-                _entry("a", description="first"),
-                _entry("b", required=False, description="second"),
-                _entry("c", required=True, description="third"),
+                _entry("zeta", required=True, description="first"),
+                _entry("alpha", description="second"),
+                _entry("beta", required=False, description="third"),
+                _entry("gamma", required=True, description="fourth"),
             ]
         )
         assert schema is not None
         assert diags == []
-        assert schema["required"] == ["a", "c"]
-        assert list(schema["properties"]) == ["a", "b", "c"]
+        assert schema["required"] == ["zeta", "gamma"]
+        assert list(schema["properties"]) == ["zeta", "alpha", "beta", "gamma"]
+
+    def test_omitted_required_key_means_not_required(self) -> None:
+        """An entry with no ``required:`` key is NOT required (opt-in, item 2).
+
+        Pins the default: an omitted ``required:`` key is not required,
+        so the property is emitted but its name is absent from
+        ``required``; as the only input, the ``required`` key is
+        omitted entirely (never emitted as ``[]``).
+        """
+        schema, diags = compile_inputs([_entry("a", description="d")])
+        assert schema is not None
+        assert diags == []
+        assert "a" in schema["properties"]
+        assert "required" not in schema
 
     def test_single_optional_input_omits_required_key(self) -> None:
         """A single required:false input omits 'required' entirely (item 2)."""
