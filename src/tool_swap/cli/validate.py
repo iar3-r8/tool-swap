@@ -25,6 +25,7 @@ from typing import Annotated, Final
 
 import typer
 
+from tool_swap.cli._pipeline import _implicates, run_pipeline
 from tool_swap.config.errors import (
     ConfigError,
     ConfigReport,
@@ -32,16 +33,12 @@ from tool_swap.config.errors import (
     Location,
     Severity,
 )
-from tool_swap.config.loader import LoadedConfig, load_config
-from tool_swap.config.resolver import ResolvedTool, resolve_tool
-from tool_swap.config.schema import validate_root
+from tool_swap.config.loader import LoadedConfig
+from tool_swap.config.resolver import ResolvedTool
 from tool_swap.config.suggest import nearest_alternative
 from tool_swap.config.validate import (
     ValidatedConfig,
     downgrade_missing_descriptions,
-    effective_groups,
-    register_builtin_rules,
-    validate_config,
 )
 from tool_swap.schema.compile import (
     SchemaDiagnostic,
@@ -174,31 +171,6 @@ def _schema_diagnostics(
             for sd in sds
         ]
     return out
-
-
-def _implicates(diagnostic: Diagnostic, tool: str) -> bool:
-    """Whether a diagnostic is reported under ``tswap validate <tool>``.
-
-    A pure yaml_path prefix test with a segment-boundary guard (A22): the
-    path is ``tools.<tool>`` exactly or starts with ``tools.<tool>.``, so
-    that ``validate app`` does not sweep up ``tools.app_v2``'s findings.  A
-    ``None`` yaml_path (or a bare ``tools`` / ``groups.*`` path) is never
-    implicated.
-
-    Args:
-        diagnostic: The diagnostic to test.
-        tool: The requested tool name.
-
-    Returns:
-        True when the diagnostic's yaml_path names the tool (or a nested
-        path under it), else False.
-    """
-    path = diagnostic.location.yaml_path
-    if path is None:
-        return False
-    if path == f"tools.{tool}":
-        return True
-    return path.startswith(f"tools.{tool}.")
 
 
 def _unknown_tool(tool: str, tools: dict[str, ResolvedTool]) -> None:
@@ -367,52 +339,15 @@ def validate(
 
     collected: list[Diagnostic] = []
     try:
-        register_builtin_rules()
-        loaded = load_config(config, env=os.environ, env_file=env_file)
-        collected += loaded.diagnostics
-        collected += validate_root(loaded.data)
-
-        raw = loaded.data
-        groups = effective_groups(raw)
-        defaults_raw = raw.get("defaults")
-        defaults: dict[str, object] | None = (
-            defaults_raw if isinstance(defaults_raw, dict) else None
+        pipeline = run_pipeline(
+            config, env=os.environ, env_file=env_file, collected=collected
         )
-        tools: dict[str, ResolvedTool] = {}
-        tools_raw = raw.get("tools")
-        if isinstance(tools_raw, dict):
-            for key, entry in tools_raw.items():
-                # A non-mapping tool entry is reported by validate_root
-                # (C104); the resolver is only called with a mapping.
-                inline: dict[str, object] = entry
-                layer = loaded.tool_yaml(key)
-                tool_yaml = layer[1] if layer else None
-                base_dir = layer[0].parent if layer else None
-                probe = resolve_tool(
-                    key,
-                    inline=inline,
-                    tool_yaml=tool_yaml,
-                    defaults=defaults,
-                    base_dir=base_dir,
-                )
-                gname = probe.values["group"]
-                gblock: dict[str, object] | None = None
-                if isinstance(gname, str) and gname in groups:
-                    gblock = {**groups[gname], "name": gname}
-                tools[key] = resolve_tool(
-                    key,
-                    inline=inline,
-                    tool_yaml=tool_yaml,
-                    defaults=defaults,
-                    group=gblock,
-                    base_dir=base_dir,
-                )
-                collected += tools[key].diagnostics
-
-        validated = ValidatedConfig(
-            tools=tools, raw=raw, line_for=loaded.line_for, path=config
-        )
-        collected += validate_config(validated).diagnostics
+        loaded = pipeline.loaded
+        tools = pipeline.tools
+        validated = pipeline.config
+        # The shared chain stops at the rule pass; the schema-layer step is
+        # a validation concern kept in this module (behaviour 21b, plan item
+        # 10) and is appended AFTER the pipeline call.
         collected += _schema_diagnostics(validated, loaded)
         report = ConfigReport(diagnostics=tuple(sorted(collected)))
 
