@@ -2167,11 +2167,11 @@ Two further details are pinned by this block rather than by the spec, flagged fo
 - **Expected outputs:**
   - **`register_builtin_rules()` (behaviour 11a) is called exactly once, at the start of the validate command**, before any rule runs. This is the deterministic "every rule registered exactly once" guarantee the full report depends on. A test asserts the reported code set covers every rule in `BUILTIN_RULES`, and that invoking the CLI twice in one process does not raise a duplicate-id `ValueError`.
   - `tswap validate` validates `./tools.yaml`; `--config <path>` overrides; `--env-file <path>` overrides `.env`.
-  - `tswap validate <tool>` restricts **reporting** to one tool, but still loads and resolves the whole file — cross-tool rules (duplicate ports, group starvation) cannot be evaluated otherwise, and a per-tool validate that misses them would be misleading. Cross-tool diagnostics implicating the named tool are reported.
+  - `tswap validate <tool>` restricts **reporting** to one tool, but still loads and resolves the whole file — cross-tool rules (duplicate ports, group starvation) cannot be evaluated otherwise, and a per-tool validate that misses them would be misleading. ~~Cross-tool diagnostics implicating the named tool are reported.~~ **Narrowed (2026-08-20):** the filter is a `yaml_path` prefix test (`tools.<X>` / `tools.<X>.…`), so a cross-tool diagnostic located at bare `tools` or at `groups.…` is **not** reported per-tool; a note line points the user at the whole-file run instead. Determining "implicates X" from message prose was rejected. See the contract block, item 6 — assumption **A22**.
   - `--all` is accepted as an explicit synonym of the default (it appears in `plan/07_CLI_AND_OPS.md` §2).
   - On success: a one-line confirmation naming the file and the tool count, plus any warnings. Exit `0`.
   - On validation failure: every diagnostic rendered per behaviour 2, then a summary line (`3 errors, 1 warning`). Exit `1`.
-  - On unreadable/unparseable config or an unresolvable env var: the single `C0xx` diagnostic. Exit `2`. This distinction lets CI tell "your config is wrong" from "your config is missing".
+  - On unreadable/unparseable config or an unresolvable env var: the single `C0xx` diagnostic. Exit `2`. This distinction lets CI tell "your config is wrong" from "your config is missing". **Pinned precisely (2026-08-20):** exit 2 is *every* `ConfigError` the loader raises — all **twelve** C0xx codes, including behaviour 8's include errors (`C005`/`C006`/`C007`) and `C201` — because the test is `except ConfigError`, not a code allow-list that would drift. Contract block, item 1.
   - `--strict` promotes warnings to errors (exit `1`); `--json` emits `ConfigReport.to_json()` to stdout with **nothing else on stdout**, so it pipes to `jq`; human output goes to stderr in that mode.
   - `--allow-missing-descriptions` behaves per behaviour 13 and prints the never-in-CI banner.
   - Diagnostics go to **stderr**, the success line to stdout, so `tswap validate && ...` composes in a shell.
@@ -2180,7 +2180,324 @@ Two further details are pinned by this block rather than by the spec, flagged fo
   - Output must be deterministic and colour-free under `NO_COLOR=1` (the existing CLI tests already pin `NO_COLOR`/`COLUMNS`; new tests follow that pattern).
   - `--help` for the subcommand lists every flag with a one-line description.
 - **Error behaviour:** an unexpected internal exception prints a short message plus the diagnostic codes gathered so far and exits `2` — never a bare traceback, since `validate` is the command a stranger runs first.
-- **Files:** `src/tool_swap/cli/main.py` (new — see assumption **A5**), `src/tool_swap/cli/validate.py` (new), `src/tool_swap/__main__.py` (reduced to re-exports), `tests/unit/cli/test_validate_cli.py`.
+- **Files:** `src/tool_swap/cli/main.py` (new — see assumption **A5**), `src/tool_swap/cli/validate.py` (new), `src/tool_swap/__main__.py` (reduced to re-exports), `tests/unit/cli/test_validate_cli.py`; optionally `src/tool_swap/config/schema.py` (one keyword-only `file` parameter on `validate_root` — sub-step 21.0b, additive, no shipped test asserts `location.file`).
+
+#### Confirmed contract details (2026-08-20)
+
+Behaviour 21 is the **first behaviour in M1 that composes the whole pipeline**. Every behaviour before it pinned one pure function against injected data; this one pins the *wiring* — which shipped function is called in which order, what carries the diagnostics between them, and what the process prints and exits with. Nothing here is a new algorithm: the entire green step is a call sequence, a filter, four output strings and an exception guard. That is why this block is long — the risk in 21 is not difficulty, it is **unpinned choices multiplying across a 12-flag surface**.
+
+Two properties govern everything below and are stated once:
+
+- **The CLI is the ONLY layer allowed to touch the ambient environment.** [`load_config`](src/tool_swap/config/loader.py:579) takes an injected `env`, every rule is pinned pure, and every purity test in behaviours 15–19 injects. `os.environ` is therefore read **exactly once, in `cli/validate.py`**, and passed down. No other M1 module reads it, and the tests drive it through `CliRunner(env=...)`.
+- **The CLI assembles the report; it never re-implements a check.** Five layers produce diagnostics and the command's job is to concatenate them, not to judge them.
+
+**0. A prep step and an optional second one, both test-only-safe, both their own commit — on the 12a / 15.0 / 19b precedent**
+
+**21.0 (mandatory, no red step, pure refactor): the A5 move.** Create [`src/tool_swap/cli/main.py`](src/tool_swap/cli/main.py) holding the `typer.Typer` app, the `@app.callback(invoke_without_command=True)` callback and the `version` command **verbatim** as they stand in [`__main__.py`](src/tool_swap/__main__.py:1); reduce `__main__.py` to `from tool_swap.cli.main import app, main` plus the `if __name__ == "__main__": main()` block. **Verified against every shipped test — no red step is needed:**
+
+| Shipped pin | Verdict under the move |
+|---|---|
+| [`from tool_swap.__main__ import app`](tests/unit/test_cli.py:16) | **Safe** — the re-export binds the *same object*; the import path is unchanged |
+| [`test_app_is_typer_app`](tests/unit/test_cli.py:49) | **Safe** — `isinstance(app, typer.Typer)`; a type check, not an identity or `__module__` check. **A suite-wide grep confirms no test compares the app by identity (`is`) or reads `app.__module__` / `app.registered_commands`** |
+| [`test_no_args_exits_zero`](tests/unit/test_cli.py:100) / [`test_no_args_prints_help`](tests/unit/test_cli.py:109) | **Safe only if the callback moves verbatim** — they depend on `invoke_without_command=True` + `SystemExit(0)`. Copy it; do not "improve" it into `no_args_is_help=True`, which exits 2 in some click versions |
+| [`TestModuleHelpParity`](tests/unit/test_cli.py:124)'s three `python -m tool_swap --help` subprocess tests | **Safe only if `__main__.py` keeps the `if __name__ == "__main__": main()` guard.** Keep it |
+| [`test_module_help_is_consistent_with_app`](tests/unit/test_cli.py:160) | **Safe** — it asserts the substrings `usage:`, `tool` and `version` are present, not that the command list is exhaustive, so adding `validate` cannot break it |
+| [`pyproject.toml`](pyproject.toml:48) `tswap = "tool_swap.__main__:main"` | **Safe** — `main` is re-exported. The entry point is deliberately **not** repointed at `cli.main`; leaving it means the console script and the tests exercise the same path |
+| [`test_repo_layout.py`](tests/unit/test_repo_layout.py:35) `tool_swap/cli` and [line 57](tests/unit/test_repo_layout.py:57) `tests/unit/cli` | **Safe** — both directories already exist and are already listed; `TEST_DIRS` needs **no** new entry (contrast behaviour 20, which had to add `tests/unit/schema`). `tests/unit/cli/.gitkeep` may stay; **no test asserts anything about `.gitkeep`** (grep: zero hits) |
+
+Land 21.0 on its own, run the suite green, commit. The move is then *proven* by the shipped CLI tests before any new behaviour rides on it.
+
+**21.0b (recommended, additive, no shipped test breaks): give `validate_root` the real filename.** [`schema.py`](src/tool_swap/config/schema.py:35) hardcodes `_DEFAULT_FILE = "tools.yaml"` into all four of its `Location(file=...)` constructions, with the comment *"the real path once it exists"*. It exists now: `tswap validate --config prod.yaml` would otherwise print `prod.yaml`'s unknown-key error as `tools.yaml (tools.x.oops)` — a wrong filename in the first command a stranger runs. The fix is a keyword-only, defaulted parameter, `validate_root(data: dict, *, file: str = _DEFAULT_FILE)`, threaded into the four builders. **Verified safe: no shipped test asserts `location.file` anywhere in [`test_schema.py`](tests/unit/config/test_schema.py:1)** (grep for `location.file` and `.file ==`: zero hits), so this is additive. If the pipeline prefers to keep 21 minimal, skip it and leave the wrong filename recorded here rather than discovered later — but do not "fix" it inside 21's green step by rewriting frozen diagnostics after the fact.
+
+**1. The call chain, exactly**
+
+```python
+def _run_validate(...) -> int:            # returns the exit code; raises nothing but ConfigError
+    register_builtin_rules()                                          # 11a, once, first
+    loaded = load_config(path, env=os.environ, env_file=env_file)     # 6/7/8 — ConfigError => exit 2
+    collected: list[Diagnostic] = []
+    collected += loaded.diagnostics                                   # C202 (WARNING), non-fatal
+    collected += validate_root(loaded.data)                           # 4 — C001/C101/C104/C105
+    raw = loaded.data
+    groups = effective_groups(raw)
+    defaults = raw.get("defaults")
+    tools: dict[str, ResolvedTool] = {}
+    for key, inline in (raw.get("tools") or {}).items():
+        layer = loaded.tool_yaml(key)                                 # (path, mapping) | None
+        tool_yaml = layer[1] if layer else None
+        base_dir = layer[0].parent if layer else None
+        probe = resolve_tool(key, inline=inline, tool_yaml=tool_yaml,  # pass 1: learn the group
+                             defaults=defaults, base_dir=base_dir)
+        gname = probe.values["group"]
+        gblock = {**groups[gname], "name": gname} if gname in groups else None
+        tools[key] = resolve_tool(key, inline=inline, tool_yaml=tool_yaml,
+                                  defaults=defaults, group=gblock, base_dir=base_dir)
+        collected += tools[key].diagnostics                           # C501 / C503 / C106
+    config = ValidatedConfig(tools=tools, raw=raw,
+                             line_for=loaded.line_for, path=path)
+    collected += validate_config(config).diagnostics                  # 11–19, all 41 rules
+    collected += _schema_diagnostics(config, loaded)                  # 20, converted (item 3)
+    report = ConfigReport(diagnostics=tuple(sorted(collected)))
+    ...                                                               # downgrade / filter / render
+```
+
+Each link is pinned against the shipped signature, and the five non-obvious ones carry their reason:
+
+- **`register_builtin_rules()` is the first statement of the command body**, inside the try (item 11), before the loader — so even a config that fails to load has run it, which is what makes "invoke the CLI twice in one process" a no-op rather than a `ValueError`. It is [idempotent by object identity](src/tool_swap/config/validate.py:3428); the ledger's twice-in-one-process test is a direct consequence.
+- **The loader is [`load_config(path, *, env, env_file)`](src/tool_swap/config/loader.py:579), and its `ConfigError` is the whole exit-2 surface.** It raises `ConfigError` carrying a report of exactly one ERROR for **twelve** codes — `C000` missing file, `C001` syntax, `C002` duplicate key, `C003` empty, `C004` non-mapping root, `C005`/`C006`/`C007` include errors, `C010` missing variable, `C011` missing explicit env file, `C012` unparseable `.env` line, `C201` name mismatch — and returns `C202` (shared `path:`, WARNING) in `loaded.diagnostics` non-fatally. **Every one of the twelve is exit 2**, which is broader than the ledger's *"unreadable/unparseable config or an unresolvable env var"* but is the only defensible line: the pinned test is `except ConfigError → exit 2`, not a code allow-list that would drift the moment behaviour 8 gains a code. Item 4 states the consequence honestly.
+- **`env=os.environ` is passed explicitly**, never left to default. `load_config`'s default is `None` = *the empty mapping*, so omitting it would make `${HOME}` unresolvable in a real shell — the opposite of what a user expects from the CLI. This is the single ambient read named in the preamble.
+- **`validate_root(loaded.data)` runs BEFORE the resolver and its diagnostics are collected, never raised.** It [returns a list](src/tool_swap/config/schema.py:308) and never raises for config content. It is **not** short-circuiting: a `C101` unknown key does not stop the run, because the ledger's promise is one pass reporting everything. Behaviour 16's block already pinned this ordering (*"`validate_root` before the rules, per behaviour 21's pipeline"*) and the accepted consequence that one mistake can yield both a `C105` and a `C520`.
+- **`resolve_tool` is called TWICE per tool, and this is the one genuinely new mechanism in 21.** [`resolve_tool`](src/tool_swap/config/resolver.py:155) takes `group=<the group's own dict>`, but *which* group a tool is in is itself a resolved value (`values["group"]`, layered inline > tool.yaml > defaults > built-in `"default"`). The first call, with `group=None`, learns the group; the second supplies it. **Why not the alternatives:** reading `inline.get("group")` would ignore a `defaults: {group: gpu0}`, silently dropping the group layer for every tool that inherits its group — a wrong resolved config, reported by nothing. Teaching `resolve_tool` to look groups up itself would give a per-tool pure function knowledge of the whole file. Two calls of a pure, deep-copying function is the cheap, obviously-correct option; a config has tens of tools, not thousands. **The probe call's diagnostics are DISCARDED** (only the second call's are collected) — otherwise every `C501`/`C503`/`C106` would be reported twice.
+- **The group dict handed over is `{**groups[gname], "name": gname}`.** [`_group_layer`](src/tool_swap/config/resolver.py:436) reads `group["name"]` to build the origin source `groups.<name>.<field>` and falls back to the literal `"unnamed"` when it is absent — and `effective_groups` returns the block **as authored**, whose entries carry no `name` key. Without the injection every group-supplied origin would read `groups.unnamed.devices`, which behaviour 22 would then print. A group **absent** from the block passes `group=None` (the tool is a dangling reference [`TSWAP-C220`](src/tool_swap/config/validate.py:505) already reports; inventing a layer for it would be worse).
+- **`ValidatedConfig` is built with the four shipped fields only** — `tools`, `raw`, `line_for=loaded.line_for`, `path=path`. `probe` defaults to [`REAL_FILESYSTEM`](src/tool_swap/config/validate.py:218), which is correct for the CLI: `tswap validate` genuinely should check whether `handler.py` exists. `home` defaults to `None` = the real `$HOME`, likewise correct. **`gpu_count` is left `None`** — behaviour 16's block explicitly placed no obligation on 21 to populate it, so `C521` stays silent in production and 21 acquires no GPU dependency.
+- **`path` is the path as the user typed it** (`Path("tools.yaml")` or the `--config` value), not `.resolve()`d, so `Location.file` echoes what the user wrote and the output is CWD-independent for the tests. Note the deliberate inconsistency to *not* "fix" here: the loader's own C0xx diagnostics carry `str(path.resolve())` (an absolute path), because [`load_config`](src/tool_swap/config/loader.py:627) resolves for its own messages. A missing-file error therefore prints an absolute path while a rule violation prints a relative one — correct in both cases (the first answers *"where did you look?"*), and unifying them would mean rewriting frozen diagnostics.
+
+**2. Where the schema diagnostics enter the report — the seam question, answered**
+
+**Decision: `cli/validate.py` builds a plain `list[Diagnostic]` and constructs ONE `ConfigReport` at the end.** No new method on `ConfigReport`, no synthetic rule, no mutation.
+
+- **Not a new `ConfigReport` method** (`.extend()` / `.with_diagnostics()`): [`ConfigReport`](src/tool_swap/config/errors.py:101) is `@dataclass(frozen=True)` with a single `diagnostics` field, and behaviour 2's shipped tests pin exactly that surface. Adding a method to serve one caller that can trivially concatenate lists first is API growth for nothing.
+- **Not a synthetic rule wrapping the compiler.** A `Rule` receives only `ValidatedConfig`, which carries **no `tool.yaml` path** — so a rule could not build the `file` the conversion needs, and behaviour 20's item 14 rejected inventing one. It would also make the compiler's reachability depend on registry state, and `BUILTIN_RULES` is pinned as *the list M5 moves*; an S1xx rule in it would move the wrong thing.
+- **Not "call `validate_config`, then append to its report":** identical in effect but constructs two reports where one will do, and invites a reader to think the second is the "real" one.
+- **The single construction point is what makes the sort total.** `ConfigReport.__post_init__` does not sort; [`render`](src/tool_swap/config/errors.py:140) and [`to_json`](src/tool_swap/config/errors.py:159) sort their own views, and [`validate_config`](src/tool_swap/config/validate.py:3474) passes pre-sorted. The CLI does the same — `tuple(sorted(collected))` — so the report is sorted at rest and a future consumer reading `.diagnostics` directly gets the same order the user saw.
+- **`Diagnostic.__lt__` orders by `(file, line or 0, code)`**, so schema findings with `line=None` sort to the top of their file's block, interleaved with the config findings by code. That is accepted: the alternative (a "schema diagnostics last" section) would need a second sort key the shipped `__lt__` does not have.
+
+**3. `to_diagnostic` — the S1xx conversion, exactly**
+
+```python
+def to_diagnostic(
+    sd: SchemaDiagnostic, *, file: str, yaml_path: str, line: int | None
+) -> Diagnostic:
+    """Convert a compiler SchemaDiagnostic into a located config Diagnostic."""
+    return Diagnostic(
+        code=sd.code,                                    # carried verbatim
+        severity=(Severity.ERROR if sd.severity is SchemaSeverity.ERROR
+                  else Severity.WARNING),                # the one-to-one enum map
+        message=sd.message,                              # carried verbatim
+        location=Location(file=file, yaml_path=yaml_path, line=line),
+        remedy=sd.remedy,                                # carried verbatim
+    )
+```
+
+- **Pure, and it lives in `cli/validate.py`** as behaviour 20's item 14 named it. Three of the five fields are carried **verbatim**: the compiler already wrote a message naming the entry and a non-empty remedy, and re-wording either here would put two authors on one sentence. `code` is carried unchanged — [`SchemaDiagnostic.code`](src/tool_swap/schema/compile.py:65) already matches the shipped `TSWAP-[CS]\d{3}` regex, which is exactly why behaviour 20 reused it.
+- **`SchemaSeverity` → `Severity` is a two-arm expression, not a dict lookup or `Severity(sd.severity.value)`.** The `.value` strings coincide today (`"error"`/`"warning"`), and a conversion that silently depends on that coincidence is the kind of coupling the separate-enum decision existed to avoid.
+- **`yaml_path`, pinned exhaustively** — the loader's dotted-numeric convention (behaviour 13's table), never brackets:
+
+| `sd.block` | `sd.entry_index` | `yaml_path` |
+|---|---|---|
+| `"inputs"` | `i` | `tools.<key>.inputs.<i>` |
+| `"inputs"` | `None` | `tools.<key>.inputs` |
+| `"outputs"` | `i` | `tools.<key>.outputs.<i>` |
+| `"outputs"` | `None` | `tools.<key>.outputs` |
+| `"json_schema"` | *(any)* | `tools.<key>.json_schema` |
+| `None` | *(any)* | `tools.<key>` |
+
+  The block-level and `None` rows are load-bearing rather than defensive: `S130` (both `json_schema:` and `inputs:`) is emitted with `block="inputs"` and **no** `entry_index`, and every `S140` from `validate_against_metaschema` carries **neither** — [`_diagnostic`](src/tool_swap/schema/compile.py:723) defaults both to `None`. The `S140` case is handled by the caller supplying the block explicitly (item 4), so the bare `tools.<key>` row is reached only by a future codeless-block diagnostic. **No `.description` suffix is appended** — unlike `C301`, whose path points at the missing key, an S1xx may concern the entry's `type`, `items` or `name`, so the entry itself is the honest location.
+- **`line` is `config.line_for(<that same yaml_path>)`, with no special-casing**, exactly as every rule from behaviour 12 onward does. It returns `None` for any list-indexed path today ([`line_for`](src/tool_swap/config/loader.py:494) bails at the first non-dict) **and** `None` for any `tool.yaml`-authored block (the line map belongs to the root config), so in practice S1xx lines are `None` — which behaviour 2's [`Location.render`](src/tool_swap/config/errors.py:44) degrades to `file (yaml_path)`. **The tests assert `location.line == config.line_for(location.yaml_path)`, never a literal**, which is behaviour 13's shipped pattern and keeps the eventual list-walking `line_for` improvement a loader-only change.
+- **`file` is `str(config.path)`, the ROOT config** — not the `tool.yaml`, even though that is where `inputs:` usually lives. `ValidatedConfig` carries no per-tool path, and behaviour 13 already pinned this deferral and its mitigation (the remedy must be self-sufficient). The compiler's remedies are: *"add a non-blank 'description' to 'inputs[0]'"* and similar — they name the block and index, not a file, so they survive the imprecision. **The one place the CLI knows better is the loop itself**, since `loaded.tool_yaml(key)[0]` IS the tool.yaml path; passing it would make S1xx locations *more* accurate than every C3xx location for the same block, and the two would then disagree about where the same `inputs:` entry lives. **Consistency wins: use `str(config.path)` for both**, and carry the improvement as a whole-milestone change when `ResolvedTool` gains the path.
+
+**4. The per-tool schema step, and the meta-validation order**
+
+```python
+def _schema_diagnostics(config, loaded) -> list[Diagnostic]:
+    out = []
+    for key, tool in config.tools.items():
+        compiled = compile_tool_schema(inputs=tool.inputs, outputs=tool.outputs,
+                                       params=tool.params, json_schema=tool.json_schema)
+        sds = list(compiled.diagnostics)
+        for half, block in ((compiled.inputs, "inputs"), (compiled.outputs, "outputs")):
+            if half is not None:
+                sds += [replace(sd, block=sd.block or block)
+                        for sd in validate_against_metaschema(half)]
+        out += [to_diagnostic(sd, file=str(config.path),
+                              yaml_path=_yaml_path(key, sd),
+                              line=config.line_for(_yaml_path(key, sd)))
+                for sd in sds]
+    return out
+```
+
+- **Compile first, then meta-validate every non-`None` half — compiled AND passed-through.** Behaviour 20's item 9 pinned this order so 21 has nothing to decide; the passed-through `json_schema:` is the case that matters, since it is the only schema no compiler checked.
+- **A `None` half is not meta-validated** (there is nothing to validate), which is also why an ERROR-nulled inputs half yields no `S140` piled on top of the `S1xx` that nulled it — one mistake, one code.
+- **The `block` back-fill on `S140` is the CLI's, not the compiler's.** `validate_against_metaschema` is a standalone function over an anonymous dict and cannot know which half it was handed; the caller does. `replace(sd, block=sd.block or block)` is the minimal fix and keeps the compiler's own diagnostics untouched.
+- **Tool iteration order is `config.tools` order = config-declaration order**, and the report's sort makes it irrelevant to the output. It is pinned anyway so a `--json` snapshot test cannot flap.
+- **A tool with no schema blocks at all costs one `compile_tool_schema` call returning `(None, None, ())`** — cheap, and uniform. No `if tool.inputs is None: continue` fast path, which would skip the `params`-only `S101` check.
+
+**5. Output — the four strings, pinned verbatim**
+
+`plan/07` §2 pins **no** example of the success or summary line (checked: its `validate` row reads only *"Config + handler + schema checks. No Docker needed — runs in CI"*), so these are pinned here, in the simplest defensible form, and the tests assert them exactly.
+
+| Situation | Stream | Exact text |
+|---|---|---|
+| Success | **stdout** | `OK <file> — <n> tools, no problems found` |
+| Success with warnings | **stdout** (after the rendered warnings on stderr) | `OK <file> — <n> tools, <m> warning(s)` |
+| Any diagnostics | **stderr** | `report.render()` verbatim, then the summary line |
+| Summary | **stderr** | `<e> error(s), <w> warning(s)` |
+| `--allow-missing-descriptions` | **stderr**, first line, before everything | `WARNING: --allow-missing-descriptions is for local prototyping and is never permitted in CI` |
+
+- **`<file>` is `str(path)` as typed**; `<n>` is `len(config.tools)`; under `tswap validate <tool>` the counts are **the filtered ones** (item 6) and `<n>` is `1`.
+- **Pluralisation is by `(s)`, not by branching.** `1 error(s), 0 warning(s)` is mildly ugly and is chosen deliberately: the ledger writes `3 errors, 1 warning` illustratively, and inflecting four nouns across a strict/filtered matrix is four more branches and four more test cases for cosmetics. **The ledger's `(3 errors, 1 warning)` is an illustration, not a pinned string** — read as such here.
+- **`render()` already emits the diagnostic blocks and NOT the summary.** [`ConfigReport.render`](src/tool_swap/config/errors.py:140) returns `SEVERITY CODE location` / message / `  remedy: …` blocks joined by blank lines, with a trailing newline, and `""` for an empty report — its docstring says *"the caller owns the success message"*. So the CLI prints `render()` then the summary line it composes itself. **No summary logic goes into `errors.py`**: it depends on `--strict`, which is a CLI concern.
+- **Diagnostics on stderr, the success line on stdout**, per the ledger, so `tswap validate && deploy` composes. The banner is on stderr because it is not the result.
+- **`echo` goes through `typer.echo(..., err=True)`** for stderr, not `print(file=sys.stderr)`, so click's stream handling and `CliRunner`'s capture behave identically in tests and in a real terminal.
+
+**6. `tswap validate <tool>` — the reporting filter**
+
+Load, resolve and validate the **whole** file (the ledger's reason: cross-tool rules cannot run otherwise); filter only what is **printed and counted**.
+
+**A diagnostic is reported under `tswap validate X` iff `location.yaml_path` is `tools.X` or starts with `tools.X.`** — a pure prefix test on the path, plus a **segment-boundary guard** so that `tswap validate app` does not sweep up `tools.app_v2`'s findings. Everything else is dropped, **including group-level and root-level diagnostics**.
+
+- **Why the strict reading, and not "block-level diagnostics are shown for all tools":** the ledger says the restriction is *to one tool*. Showing every `groups.*` and bare `tools` finding under a per-tool invocation would mean `tswap validate a` and `tswap validate b` both print the same `C530` duplicate-port error, and a user fixing "a's problem" would find it still there. The command answers *"is X well-formed?"*; whole-file questions have `--all`, which is the default.
+- **Why not "or the message names X":** message-substring matching is a fragile predicate over prose written by 41 independent rules, would match a tool named `default` or `test` against unrelated text, and would silently change behaviour whenever a rule's wording is edited. Rejected on the same grounds as every other stringly-typed check in this milestone.
+- **Stated cost, honestly: cross-tool diagnostics implicating X are NOT shown under `tswap validate X`.** `C211` (duplicate names), `C530` (shared port) and `C612` (groups sharing a device) locate at bare `tools` or `groups`; `C610`/`C613` locate at `groups.<name>.max_resident`. None is reported per-tool. **This contradicts the ledger's line** *"Cross-tool diagnostics implicating the named tool are reported"* — recorded as **A22** (item 12), because the alternative is a per-message heuristic. The mitigation is real and cheap: the filter is applied to the *report*, so the whole-file report is still computed, and **when the unfiltered report has errors that the filter hid, the command appends one line to stderr**: `note: <k> diagnostic(s) elsewhere in <file> are not shown by 'tswap validate <tool>'; run 'tswap validate' for the whole file` — so the user is never left believing the file is clean.
+- **The exit code follows the FILTERED report**, otherwise `tswap validate X` would fail for a mistake in Y, which the note line makes discoverable instead.
+- **An unknown tool name is checked BEFORE the filter** (item 7), so `tswap validate typo` never prints an empty, exit-0 report.
+- **Behaviour 23's golden path is unaffected** — it runs the whole-file form (`tswap validate` with one tool) and asserts zero diagnostics, so no filter is exercised. **Behaviour 22 must reuse this same filter** for `tswap config show <tool>`; it is pinned here as a shared helper `reported_for(report, tool) -> ConfigReport` in `cli/validate.py`, imported by `config_show.py`, so the two commands cannot disagree about what "restricted to one tool" means.
+
+**7. The unknown-tool error — a usage error, not a config finding**
+
+`tswap validate preidt` with tools `echo` and `predict`:
+
+```
+error: unknown tool 'preidt'; did you mean 'predict'?
+```
+
+on **stderr**, exit **1**, and with no nearest match within threshold: `error: unknown tool 'zzz'; defined tools are: 'echo', 'predict'`.
+
+- **It carries NO `TSWAP-` code and is not a `Diagnostic`.** Every code in the table describes something wrong with the *config*; here the config may be perfect and the *command line* is wrong. Minting a `C9xx` for it would put a code in behaviour 25's troubleshooting table whose "fix" is *"type the name correctly"*, and would make it filterable/serialisable as a config finding, which it is not. `C999` is emphatically not reused — it is [pinned as the internal "a rule raised" code](src/tool_swap/config/validate.py:52).
+- **Exit 1, per the ledger.** Not 2: the config was read fine. Consistent with `tswap config show`'s identical case (behaviour 22 already says *"unknown tool name → nearest-match suggestion, exit 1"*).
+- **The suggestion reuses [`nearest_alternative(name, candidates)`](src/tool_swap/config/suggest.py:45)** — the same helper `C101` (unknown key) and `C220` (unknown group) use, with the same 0.3-fraction threshold and the same no-suggestion fallback of listing the valid names. **No `difflib`**: a second nearest-name implementation with a different threshold is exactly the drift this milestone keeps eliminating. `'preidt'` vs `'predict'` is distance 2 over length 7 → `2 <= 0.3*7 = 2.1` → suggested, which the fixture in item 13 is chosen to satisfy.
+- **Candidates are `sorted(config.tools)`** — the *resolved* tool names, sorted, so the message and any tie-break are deterministic.
+- **Under `--json` it is still a plain stderr line** and stdout stays empty (item 9): it is not part of the report, and emitting a lone fake diagnostic into the JSON to keep the shape uniform would be inventing a config finding.
+
+**8. The exit-code table, exhaustive**
+
+| # | Situation | Exit | Where decided |
+|---|---|---|---|
+| 1 | No errors, no warnings | **0** | `report.ok` |
+| 2 | No errors, some warnings, no `--strict` | **0** | warnings never fail |
+| 3 | One or more ERRORs after all post-processing | **1** | `report.ok` is False |
+| 4 | `--strict` and one or more warnings (zero errors) | **1** | the strict gate (item 10) |
+| 5 | `--allow-missing-descriptions` downgraded the only errors, no `--strict` | **0** | the flag's whole purpose |
+| 6 | `--allow-missing-descriptions` **and** `--strict` | **1** | downgrade first, strict second — behaviour 13 pinned it |
+| 7 | Unknown tool name | **1** | item 7, before any report is printed |
+| 8 | `ConfigError` from the loader (any of the twelve C0xx) | **2** | `except ConfigError` |
+| 9 | Any other unexpected exception | **2** | item 11's guard |
+| 10 | `--help`, or the app's no-subcommand callback | **0** | typer / the shipped callback |
+| 11 | Bad CLI usage (unknown flag, missing value) | **2** | click's own `UsageError.exit_code = 2`, unchanged |
+
+- **Row 11 is a happy coincidence worth stating**: click already exits 2 for usage errors, which matches our "the invocation or the file is broken" reading of 2 rather than colliding with it. Nothing is overridden.
+- **Rows 8 and 9 print the same shape of thing** — one report (or a short message) plus, in case 9, the codes gathered so far.
+- **How the process exits: `raise typer.Exit(code)`**, never `sys.exit`, never a bare `SystemExit`. [`typer.Exit`](.venv/lib/python3.11/site-packages/typer/_click/exceptions.py:252) is a `RuntimeError` subclass click catches and converts, so `CliRunner` records `result.exit_code` and the exception does not escape into the test. The shipped callback's `raise SystemExit(0)` ([`__main__.py`](src/tool_swap/__main__.py:17)) is left exactly as it is — it works and its tests pin it — but `validate` uses `typer.Exit`, and the difference is recorded here so nobody "harmonises" the callback and breaks [`test_no_args_exits_zero`](tests/unit/test_cli.py:100).
+- **`typer.Exit` is raised from a single tail position**, after all output, never from inside the try's body where item 11's `except Exception` could swallow it (it would not — `Exit` is a `RuntimeError`, so **the guard must re-raise `typer.Exit` explicitly**; pinned in item 11).
+
+**9. `--json`**
+
+- **`report.to_json()` and nothing else on stdout.** [`to_json`](src/tool_swap/config/errors.py:159) already emits a JSON list of objects with exactly `code, severity, message, file, yaml_path, line, remedy`, sorted, `"[]"` when empty — so `tswap validate --json | jq` works on a clean config too. The CLI adds no envelope, no counts object, no trailing newline beyond `echo`'s.
+- **In `--json` mode the human output — `render()`, the summary line, the success line, the banner, the unknown-tool error, the truncation note — all go to stderr, and stdout carries only the JSON.** The pinned test reads `json.loads(result.stdout)` with no stripping other than whitespace.
+- **The exit codes are the table above, unchanged.** The JSON carries `severity` per diagnostic, so `--strict` still gates the exit even though the JSON body is identical with and without it. That is deliberate: a machine consumer reads the exit code for pass/fail and the severities for detail, and rewriting severities in the payload would make the JSON disagree with the rules that produced it.
+- **`--json` composes with the per-tool filter**: the serialised report is the *filtered* one, so `tswap validate x --json` matches what `tswap validate x` printed.
+
+**10. `--strict`**
+
+**The report is computed normally; `--strict` changes only the EXIT DECISION and the SUMMARY COUNT. No severity is mutated.**
+
+- **Not a mutation**, for three reasons: `Diagnostic` is frozen and rewriting 40 of them to change one boolean outcome is work for nothing; the `--json` payload would then claim a rule emitted an ERROR when it emitted a WARNING, contradicting behaviour 19's `C613` (a *"harmless"* finding whose text says so); and behaviour 13's downgrade is already the one legitimate severity rewrite, whose banner explains itself in the message — strict has no equivalent explanation to attach.
+- **The gate is one line:** `failed = bool(report.errors) or (strict and bool(report.warnings))`.
+- **The summary line under `--strict` with 0 errors and 1 warning reads `0 error(s), 1 warning(s) — failing due to --strict`.** It does **not** print `1 error(s), 0 warning(s)`: that would be a lie about what the rules found, and a user grepping for the code would find a WARNING line above a summary claiming an error. The trailing clause names the cause, which is the actionable half. Without `--strict` the same report prints `0 error(s), 1 warning(s)` and exits 0.
+- **Ordering with `--allow-missing-descriptions` is behaviour 13's, unchanged: downgrade first, then strict.** So the two together fail (row 6), which is what *"never permitted in CI"* means mechanically.
+
+**11. `--allow-missing-descriptions`**
+
+- **The mechanism is already shipped and the CLI merely calls it**: `report = downgrade_missing_descriptions(report)`, [the pure post-processor](src/tool_swap/config/validate.py:3503) behaviour 13 pinned as mechanism (a). **There is no flag parameter on `validate_config`, and no rule is unregistered or skipped** — behaviour 13's block rejected both explicitly (a flag-bearing rule would have to be constructed per invocation, colliding with `BUILTIN_RULES`' module-level singleton identity that `register_builtin_rules()` relies on).
+- **It is applied to the FULL report, before the per-tool filter and before the strict gate.** The function is idempotent and pure, so ordering against the filter is a free choice; doing it first keeps one report shape flowing through the pipeline.
+- **The per-diagnostic banner is `ALLOW_MISSING_DESCRIPTIONS_BANNER`**, already appended to each downgraded `message` by the shipped function and therefore already surviving `--json`. The CLI **does not** append it a second time.
+- **The additional command-level banner** is the ledger's *"prints the never-in-CI banner"*, pinned in item 5's table: `WARNING: --allow-missing-descriptions is for local prototyping and is never permitted in CI`, on stderr, printed **once, first, whether or not any diagnostic was actually downgraded** — the flag being *present* is what CI must not do, and a banner that appears only sometimes teaches the wrong lesson. It is close to the shipped per-diagnostic banner's wording deliberately, but it is a distinct string with its own constant in `cli/validate.py`; the test asserts both appear exactly once each per run.
+
+**12. `--help`, and the flag surface**
+
+The command signature, pinned so the help text is deterministic:
+
+```python
+@app.command()
+def validate(
+    tool: Annotated[str | None, typer.Argument(help="Validate only this tool.")] = None,
+    config: Annotated[Path, typer.Option("--config", help="Config file to read.")] = Path("tools.yaml"),
+    env_file: Annotated[Path | None, typer.Option("--env-file", help="Env file, replacing .env discovery.")] = None,
+    all_: Annotated[bool, typer.Option("--all", help="Validate every tool (the default).")] = False,
+    strict: Annotated[bool, typer.Option("--strict", help="Treat warnings as errors.")] = False,
+    json_: Annotated[bool, typer.Option("--json", help="Emit the report as JSON on stdout.")] = False,
+    allow_missing_descriptions: Annotated[bool, typer.Option(
+        "--allow-missing-descriptions",
+        help="Downgrade missing-description errors. Local prototyping only; never in CI.")] = False,
+) -> None:
+```
+
+- **`--all` is accepted and is a no-op synonym of the default** (the ledger; it appears in `plan/07` §2). `--all` **with** a tool argument is a contradiction: pinned as **exit 2 with `error: --all cannot be combined with a tool name`**, a usage error, matching row 11's class.
+- **The `--help` test asserts each of the seven surface names appears — `--config`, `--env-file`, `--all`, `--strict`, `--json`, `--allow-missing-descriptions` and the `TOOL` argument — and that each flag's line is non-trivial** (a help string of at least 10 characters follows the flag). Asserting presence alone would pass against `help=""`, which is exactly the failure mode the ledger's *"lists every flag with a one-line description"* is guarding.
+- **Trailing underscores on `all_` / `json_` avoid shadowing builtins** (ruff's `A` rules are enabled in [`pyproject.toml`](pyproject.toml:57)); typer takes the flag spelling from the explicit `"--all"` / `"--json"` strings, so the user-facing surface is unaffected.
+
+**13. The unexpected-exception guard**
+
+```python
+try:
+    ...                                   # the whole command body, from register_builtin_rules()
+except ConfigError as exc:                # the twelve loader codes
+    _emit(exc.report); raise typer.Exit(2)
+except typer.Exit:                        # our own exits are not "unexpected"
+    raise
+except Exception as exc:                  # noqa: BLE001 — the last line of defence
+    typer.echo(f"internal error while validating {path}: {exc}", err=True)
+    if collected:
+        typer.echo("diagnostics gathered before the failure: "
+                   + ", ".join(sorted({d.code for d in collected})), err=True)
+    raise typer.Exit(2)
+```
+
+- **`except typer.Exit: raise` comes first among the catch-alls**, because `typer.Exit` is a `RuntimeError` subclass and a bare `except Exception` would otherwise swallow every deliberate exit into a fake internal error. This is the single most likely implementation bug in the whole behaviour, and it has its own test: a config with one ERROR exits **1**, not 2.
+- **The message is one line, names the file, and quotes `str(exc)` only** — never a traceback, never `repr`. The ledger's reason stands as written: `validate` is the command a stranger runs first.
+- **Partial diagnostics ARE included, as a sorted, de-duplicated code list**, not as rendered blocks: the run is known to be incomplete, so printing full remedies would invite the user to treat a truncated report as the report. `collected` is initialised before the `try` so it is always in scope, and the line is omitted entirely when it is empty.
+- **`validate_config` already contains its own per-rule guard** ([`TSWAP-C999`](src/tool_swap/config/validate.py:3449)), so a raising *rule* never reaches this handler — it becomes a C999 ERROR and exits **1**. **Both paths get a test, and they are different tests**: (a) a rule registered by the test that raises → exit 1, output contains `TSWAP-C999`, no `Traceback`; (b) a genuine internal failure outside the rule loop → exit 2, output contains `internal error while validating`, no `Traceback`. For (b) the injection point is `monkeypatch.setattr(tool_swap.cli.validate, "compile_tool_schema", <raises>)` — outside `validate_config`'s guard, inside ours, and it needs no fake rule.
+- **`# noqa: BLE001`** is expected on the blind `except Exception`; it is deliberate and the comment says so.
+
+**14. Determinism, and the test conventions**
+
+- **The shipped CLI test pattern is [`tests/unit/test_cli.py`](tests/unit/test_cli.py:25)'s `_make_runner`**, which builds `CliRunner(env={**os.environ, "COLUMNS": "80", "TERM": "linux", "NO_COLOR": "1"})`, plus a module-level `_ENV_WITH_TTY = dict(os.environ, COLUMNS="80", TERM="linux")` for its `python -m` subprocess tests. **`tests/unit/cli/test_validate_cli.py` copies this fixture verbatim**; it is deliberately *copied*, not imported from `tests/unit/test_cli.py` — the leaf test dirs carry no `__init__.py` ([`test_repo_layout.py`](tests/unit/test_repo_layout.py:182) asserts it), so a cross-directory test import is not available.
+- **The `env=` mapping is also how each test supplies the config's `${VAR}` values**, since the CLI reads `os.environ` and `CliRunner` patches it for the duration of the call. No test mutates `os.environ` directly.
+- **`typer`'s `CliRunner` separates the streams**: `result.stdout` and `result.stderr` are distinct properties ([`testing.py`](.venv/lib/python3.11/site-packages/typer/testing.py:109)), so the "nothing but JSON on stdout" and "diagnostics on stderr" pins are directly assertable. No `mix_stderr` argument is passed — the installed version does not take one.
+- **No `warnings.warn` anywhere in the CLI** (A7; [`filterwarnings = ["error"]`](pyproject.toml:73) turns any warning into a test failure). Warnings reach the user as WARNING-severity diagnostics and banner lines, never through the `warnings` module.
+- **Every assertion on wording is against a module-level constant imported from `cli/validate.py`** (the success-line template, the summary template, the strict clause, the banner, the note line, the unknown-tool template), on the `ALLOW_MISSING_DESCRIPTIONS_BANNER` precedent. A literal in both source and test is how a typo ships.
+
+**15. Fixture strategy**
+
+**`tmp_path`, built by a module-level `_write(tmp_path, name, text) -> Path` helper — no committed fixture files.** This is [`test_loader.py`](tests/unit/config/test_loader.py:105)'s shipped pattern, used by every on-disk config test in the suite, and it keeps each test's config visible in the test that reads it. Committed fixtures would also collide with behaviour 23/24's real `tools/example_echo/` tree, which is a *different* concern (a fixture the docs point at).
+
+The minimal corpus the red step needs, as module-level constants:
+
+| Constant | Shape | Exercises |
+|---|---|---|
+| `VALID_TWO_TOOLS` | `echo` and `predict`, each `image:` + `description:`, one `groups:` entry | success line, tool count, exit 0, the nearest-name candidates |
+| `VALID_WITH_INPUTS` | a `path:` tool whose `tools/t/tool.yaml` has a well-formed `inputs:` with descriptions | the S1xx path end to end with **zero** S-diagnostics — the negative control |
+| `BAD_INPUTS` | same, but one entry `{name: x, type: enum}` | `TSWAP-S103` reaching the report as an ERROR through `to_diagnostic`; `yaml_path == "tools.t.inputs.0"` |
+| `RAW_JSON_SCHEMA_BAD` | a `tool.yaml` with `json_schema: {properties: {p: {type: 5}}}` | `TSWAP-S140` from the **passed-through** half, proving meta-validation is not compiled-only |
+| `ONE_ERROR_ONE_WARNING` | a tool with no image source (`C511` ERROR) plus a defined-but-unreferenced group (`C223` WARNING) | `1 error(s), 1 warning(s)`, exit 1; under `--strict` still exit 1; the render/summary split |
+| `WARNING_ONLY` | a defined-but-unreferenced group, everything else clean | exit **0** plain, exit **1** under `--strict`, and the strict summary clause |
+| `MISSING_DESCRIPTIONS` | a `path:` tool with no `description:` and an `inputs:` entry with none | `C300`+`C301` → exit 1; with the flag → exit 0 + both banners; with the flag **and** `--strict` → exit 1 |
+| *(no file written)* | `--config` names a path that does not exist | `TSWAP-C000`, exit **2** |
+| `UNRESOLVABLE_ENV` | `image: ${TSWAP_TEST_MISSING}` with the var absent from the runner env | `TSWAP-C010`, exit **2** |
+| `NEAREST_NAME` | tools `echo` and `predict`; invoked as `tswap validate preidt` | the unknown-tool line, `'predict'` suggested, exit 1, no `TSWAP-` code in the output |
+| `CROSS_TOOL` | two tools sharing `expose_host_port: 9000` (`C530` at bare `tools`) | the filter: whole-file reports it; `tswap validate a` does not, and prints the note line |
+
+- A `tool.yaml`-bearing fixture is a **directory**: `_write` the root config, then `tmp_path/"t"/"tool.yaml"`, and point `path: ./t` at it. Behaviour 8's loader resolves `path:` against the **root config file's directory**, so `tmp_path` isolation holds and no test needs to `chdir`.
+- **`--config <tmp_path>/tools.yaml` is passed on every invocation** rather than relying on the CWD; `CliRunner` does not change directory, and a test that depended on the process CWD would be order-dependent.
+- **The `--env-file` test** writes a second file and asserts a variable defined only there resolves — the flag's whole contract, and it needs no new fixture shape.
+- **The `register_builtin_rules()` twice-in-one-process test** invokes the runner twice against `VALID_TWO_TOOLS` and asserts both exit 0; the completeness test asserts `set(registered_rule_ids()) == {r.id for r in BUILTIN_RULES}` after one invocation.
+
+**16. What this behaviour must NOT do**
+
+- **No `warnings.warn`, no `logging` configuration, no colour codes** of its own (rich renders typer's help; our own output is plain text, which is why `NO_COLOR` suffices).
+- **No new diagnostic code.** 21 emits no `TSWAP-*` of its own; it renders what the five layers produced. The unknown-tool and `--all` conflicts are codeless usage errors by design (item 7).
+- **No filesystem writes**, no network, no Docker, no handler import (§ *Scope boundaries recorded deliberately*).
+- **No changes to `errors.py`, `validate.py`, `loader.py`, `resolver.py` or `compile.py`.** The only source files 21 touches are `cli/main.py` (new), `cli/validate.py` (new) and `__main__.py` (reduced) — plus, if 21.0b is taken, the one keyword-only parameter on `validate_root`. If the green step finds itself editing a config-layer module, the design has drifted.
 
 ### Behaviour 22 — `tswap config show`
 
@@ -2482,6 +2799,14 @@ Subtasks: treat this section as settled fact. Do not re-litigate; do not ask aga
 
 **A21 (new, 2026-08-19) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 20's contract block adds **six** `TSWAP-S1xx` codes to the eight the ledger lists, for fourteen in total. The full argument is in that block, item 16; in summary: the compiler is pinned **total and never-raising** (so behaviour 21 can report every config *and* schema problem in one pass), and totality means every malformed `inputs:`/`outputs:` entry must produce *some* diagnostic. The ledger's eight cover the well-formed-but-wrong cases (duplicate names, bad types, nesting, missing descriptions); the six new ones cover the malformed-shape cases (`S104`–`S109`), which today produce **no** diagnostic at all because `tool.yaml` is deliberately not schema-validated by the loader. Every one turns silence into a message, so nothing that validates today stops validating. Six codes rather than one catch-all were chosen because behaviour 25's troubleshooting table is code → cause → fix, one-to-one. The user-visible consequences to confirm: a malformed `inputs:` entry now yields a `TSWAP-S1xx` error rather than a silently schema-less tool, and the troubleshooting table lists fourteen S-codes.
 
+**A22 (new, 2026-08-20) — NOT yet confirmed by the intake source; worth one line in the PR description.** Behaviour 21's contract block **narrows the ledger's own sentence** *"Cross-tool diagnostics implicating the named tool are reported"*. The reporting filter for `tswap validate <X>` is pinned as a `yaml_path` prefix test — a diagnostic is shown iff its path is `tools.<X>` or begins `tools.<X>.` — so a **cross-tool** finding located at bare `tools` (`TSWAP-C211` duplicate names, `TSWAP-C530` shared host port) or under `groups.…` (`TSWAP-C610`, `TSWAP-C612`, `TSWAP-C613`, `TSWAP-C223`) is **not** printed and does **not** affect the per-tool exit code. The whole file is still loaded, resolved and validated, exactly as the ledger requires — only the *printing* is restricted.
+
+The alternative — deciding "implicates X" from the diagnostic's **message text** — was rejected on three grounds: it is a substring predicate over prose written independently by 41 rules, so a rule re-wording silently changes CLI behaviour; it false-matches ordinary words for tools named `default`, `test` or `echo`; and it has no defensible test, since the assertion would have to encode each rule's current sentence. The alternative *"show group-level and block-level diagnostics under every tool"* was also rejected: `tswap validate a` and `tswap validate b` would then both print the same `C530`, and a user who "fixed a's problem" would find it unchanged.
+
+**The mitigation is pinned with the filter, not left implicit:** when the unfiltered report contains diagnostics the filter hid, the command prints one extra stderr line — *"note: N diagnostic(s) elsewhere in `<file>` are not shown by `tswap validate <tool>`; run `tswap validate` for the whole file"* — so a per-tool run can never leave a user believing the file is clean. The same filter is pinned as a shared helper that behaviour 22 must reuse for `tswap config show <tool>`, so the two commands cannot disagree.
+
+**No shipped test is affected** (no CLI test exists for `validate` yet; [`tests/unit/test_cli.py`](tests/unit/test_cli.py:1) covers only `--help`, no-args and `python -m` parity). The user-visible consequence to confirm: in M1, `tswap validate my_tool` reports only diagnostics located under `tools.my_tool`, plus a note naming how many were hidden; `tswap validate` (the default, `--all`) reports everything, and is what CI should run.
+
 Two further details are pinned by committed tests rather than by the spec, and are flagged for the same visibility:
 
 - The synthesised `default` group carries `eviction: "lru"` as well as `max_resident: 4`. Plan line 219 mentions only `max_resident: 4`; the value matches [`GroupConfig`](src/tool_swap/config/schema.py:120)'s defaults and `plan/02_CONFIGURATION.md`'s `groups:` example, so it is consistent rather than invented.
@@ -2503,6 +2828,7 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A12** | Secret redaction in `config show` | Not in the spec. Proposed: redact `auth_token` and `env` keys matching `TOKEN\|SECRET\|KEY\|PASSWORD`, with `--show-secrets` to opt out, because this output is what users paste into issues | 22 |
 | **A20** | The DoD's D9 line: *"no members or all members share the same device"* | **Narrowed to the §6 rules it points at.** *No members* → the already-shipped `C223`, so **`C611` is withdrawn and never allocated**; *all members on one device* → **no diagnostic** (it is the documented intent of `groups:`), with the device dimension covered by `C612`'s two-or-more-groups overlap; D9 proper → `C610`. Behaviour 19 ships **three** rules, total **41** | 19; DoD |
 | **A21** | Behaviour 20's ledger lists **eight** S1xx codes | **Six more are added** (`S104` non-string `semantic`, `S105` non-list block / non-mapping entry, `S106` bad `name`, `S107` non-bool `required`, `S108` non-string `description`, `S109` `array` without `items`), for **fourteen**. They are the consequence of the compiler being **total and never raising**: each malformed entry must yield a message rather than silence. Turns silence into a diagnostic; narrows nothing | 20, 25 |
+| **A22** | The ledger's *"cross-tool diagnostics implicating the named tool are reported"* under `tswap validate <tool>` | **Narrowed to a `yaml_path` prefix test** (`tools.<X>` / `tools.<X>.…`). Cross-tool findings at bare `tools` (`C211`, `C530`) or under `groups.…` (`C223`, `C610`, `C612`, `C613`) are not shown per-tool; a note line names how many were hidden and points at the whole-file run. Message-substring matching was rejected as untestable and fragile | 21, 22 |
 
 ### Scope boundaries recorded deliberately
 
