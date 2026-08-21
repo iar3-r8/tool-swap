@@ -75,6 +75,8 @@ OTHER_DIRS: list[str] = [
     "deploy/prometheus",
     "deploy/grafana",
     "models",
+    "tools",
+    "tools/example_echo",
 ]
 
 # ---------------------------------------------------------------------------
