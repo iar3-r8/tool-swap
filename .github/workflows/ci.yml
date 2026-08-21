@@ -32,6 +32,9 @@ jobs:
       - name: Run lint
         run: make lint
 
+      - name: Validate the example config
+        run: tswap validate --config tools.example.yaml --strict
+
       - name: Run import-linter
         # Use python -c to invoke lint_imports_command directly since
         # the entry point script may not be on PATH in GitHub Actions.

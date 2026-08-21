@@ -77,6 +77,8 @@ OTHER_DIRS: list[str] = [
     "models",
     "tools",
     "tools/example_echo",
+    "tools/example_add",
+    "tools/example_build",
 ]
 
 # ---------------------------------------------------------------------------
