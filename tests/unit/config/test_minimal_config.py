@@ -13,17 +13,19 @@ interpreted):
 - ``test_committed_fixture_files_exist`` fails: the three fixture files
   are absent from the repo;
 - every ``_plant``-based test fails with ``FileNotFoundError`` from
-  ``shutil.copytree`` — the committed tool directory is missing;
-- the two tests that drive the pipeline/CLI directly against a
-  ``tmp_path`` config (no copy of the committed directory) fail with
-  exactly ``TSWAP-C300`` + ``TSWAP-C511`` — a ``path:`` directory that
-  does not exist is skipped silently at ``loader.py:452`` (no ``C005``),
-  so the tool resolves with no ``tool.yaml`` layer: no description
-  (C300) and no image source (C511). Verified against the shipped
-  pipeline, both at ERROR severity;
+  ``shutil.copytree`` — the committed tool directory is missing (either
+  way the failure is unambiguous — plan item 10);
+- the one test that drives the pipeline directly against a ``tmp_path``
+  config WITHOUT copying the committed directory
+  (``test_no_group_diagnostic_when_groups_is_absent``) still passes at
+  red: the missing ``path:`` directory is skipped silently at
+  ``loader.py:452`` (no ``C005``), yielding exactly ``TSWAP-C300`` +
+  ``TSWAP-C511`` — neither a C2xx code — and the synthesised ``default``
+  group is a property of the raw config;
 - two tests pass by design at red: ``test_the_minimal_config_is_at_most_
   five_lines`` (a property of the constant, not the fixtures — the R4
-  mechanical check) and nothing else should pass.
+  mechanical check) and ``test_no_group_diagnostic_when_groups_is_
+  absent``.
 
 GREEN lands the three fixture files plus the ``OTHER_DIRS`` amendment in
 ``test_repo_layout.py`` (plan item 10) — neither belongs in this file.
@@ -170,7 +172,7 @@ def _plant(tmp_path: Path) -> Path:
 def _write_config(tmp_path: Path) -> Path:
     """Write ``MINIMAL_CONFIG`` to ``tmp_path/tools.yaml`` (no fixtures).
 
-    For the two tests that must observe the MISSING-directory red shape
+    For the one test that must observe the MISSING-directory shape
     directly (C300 + C511, not the ``_plant`` copy failure): the config
     exists, its ``path:`` directory does not, and the loader skips a
     non-existent ``path:`` directory silently (no ``C005``).
@@ -263,9 +265,10 @@ def test_pipeline_reports_zero_diagnostics(tmp_path: Path) -> None:
     severity-blind by construction — a future WARNING cannot slip past an
     exit-code check (plan items 2, 9). The env is EMPTY (not
     ``os.environ``): the golden config interpolates nothing, and a clean
-    env proves it. RED: the missing directory yields exactly C300 + C511.
+    env proves it. RED: ``_plant``'s ``shutil.copytree`` raises
+    ``FileNotFoundError`` — the committed tool directory is missing.
     """
-    config = _write_config(tmp_path)
+    config = _plant(tmp_path)
 
     pipeline = run_pipeline(config, env={}, env_file=None)
 
@@ -344,9 +347,9 @@ def test_validate_exits_zero_with_empty_stderr(
     on stderr on the success path and still exits 0 (plan item 9). The
     stdout success line is the zero-warning ``_ok_line`` form with the
     config path as typed (absolute, since the test passes it absolute).
-    RED: exit 1 with C300 + C511 on stderr.
+    RED: ``_plant``'s ``shutil.copytree`` raises ``FileNotFoundError``.
     """
-    config = _write_config(tmp_path)
+    config = _plant(tmp_path)
 
     result = _invoke_validate(runner, config)
 
@@ -369,10 +372,10 @@ def test_validate_json_report_is_empty(tmp_path: Path, runner: CliRunner) -> Non
 
     The schema-layer diagnostics are appended by the command after
     ``run_pipeline`` returns, so the pipeline form cannot see them; an
-    empty report JSON is ``[]`` (plan item 9, table row 3). RED: exit 1
-    with a two-element array on stdout.
+    empty report JSON is ``[]`` (plan item 9, table row 3). RED:
+    ``_plant``'s ``shutil.copytree`` raises ``FileNotFoundError``.
     """
-    config = _write_config(tmp_path)
+    config = _plant(tmp_path)
 
     result = _invoke_validate(runner, config, "--json")
 
@@ -393,10 +396,10 @@ def test_validate_strict_also_exits_zero(tmp_path: Path, runner: CliRunner) -> N
 
     ``--strict`` promotes any warning to a failure, so this is the third
     independent warning-freedom angle and it anticipates behaviour 24's
-    ``--strict`` gate (plan item 9, table row 5). RED: exit 1 (C300 + C511
-    are errors; even without them, any warning would fail under strict).
+    ``--strict`` gate (plan item 9, table row 5). RED: ``_plant``'s
+    ``shutil.copytree`` raises ``FileNotFoundError``.
     """
-    config = _write_config(tmp_path)
+    config = _plant(tmp_path)
 
     result = _invoke_validate(runner, config, "--strict")
 
@@ -424,7 +427,9 @@ def test_config_show_is_fully_populated_with_builtin_origins(
     ``description`` line carries the ``(tool.yaml)`` suffix (never the
     ``tmp_path``-dependent absolute path); the concrete ``ttl: 900``
     ledger example; ``inputs: 1 entry``; no redaction firing; the
-    router/backend blocks once each; no tool section lists ``port:``.
+    router/backend blocks once each; the router's ``port: 8600`` line
+    exactly once — ``port`` is a router field, never a tool-section
+    line.
     """
     config = _plant(tmp_path)
 
@@ -476,8 +481,17 @@ def test_config_show_is_fully_populated_with_builtin_origins(
     # No secret-shaped value, so the redaction path must not fire.
     assert "***" not in stdout
 
-    # The router and backend blocks appear exactly once each (A24); no
-    # tool section lists ``port:`` (it is a backend field).
+    # The router and backend blocks appear exactly once each (A24).
+    # ``port`` is a ROUTER field: a tool section must not render a port
+    # line. The guard is VALUE-scoped, matching B22's shipped precedent
+    # (test_config_show_cli.py:1188 pins ``stdout.count("port: 9000") ==
+    # 1`` on the raw router value): the router's own rendered line
+    # ``port: 8600`` (built-in default) appears exactly once, so no tool
+    # section can carry a second one. A bare ``"port:"`` substring count
+    # cannot work — the tool-level fields ``container_port:`` and
+    # ``expose_host_port:`` each contain ``port:`` as a substring — nor
+    # can ``"  port:" not in stdout``, because the router block itself
+    # renders ``  port: 8600  # built-in default``.
     assert stdout.count("router:") == 1
     assert stdout.count("backend:") == 1
-    assert "  port:" not in stdout
+    assert stdout.count("port: 8600") == 1
