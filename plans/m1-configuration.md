@@ -3577,6 +3577,434 @@ The user-visible consequences to confirm: the repository gains a root `tools.exa
 - **Error behaviour:** the generator exits non-zero with a clear message if a field lacks a description.
 - **Files:** `docs/configuration.md` (new, generated), `scripts/gen_config_reference.py` (new), `README.md`, module docstrings, `tests/unit/config/test_docs_generated.py`.
 
+#### Confirmed contract details (2026-08-21)
+
+Behaviour 25 is the milestone's **documentation** item, and the first whose deliverable is split across **two commits owned by two different modes**. Everything below is pinned against the shipped models, the shipped rule registry and the shipped compiler so that the red step needs no guessing and the green step is a transcription.
+
+**0. The division of labour — what is in the green, and what is NOT**
+
+The ledger's five bullets do **not** all belong to the RED/GREEN cycle. Pinned, explicitly, because the green's scope is otherwise ambiguous:
+
+| Deliverable | Owner | Lands in |
+|---|---|---|
+| `scripts/gen_config_reference.py` (the generator) | the RED/GREEN cycle | **B25 green** (one commit) |
+| `docs/configuration.md` (the generated document, committed) | the RED/GREEN cycle | **B25 green** (same commit) |
+| The `Field(description=...)` additions the completeness test forces (**72 of them**, item 2) | the RED/GREEN cycle | **B25 green** (same commit) |
+| `tests/unit/config/test_docs_generated.py` | the RED/GREEN cycle | **B25 red** |
+| The `README.md` configuration section | **docs-manager** | the **step-9 docs handoff** — a separate docs commit |
+| The module docstrings on the nine modules | **docs-manager** | the **step-9 docs handoff** — the same docs commit |
+
+The reason is the pipeline's own rule, not taste: the RED/GREEN cycle covers *testable guarantees*, and the two docs items have none that is worth writing. A test asserting *"`README.md` contains the substring `tswap validate`"* pins a substring, not a section, and would then have to be maintained against prose it cannot judge; a test asserting *"`loader.py` has a module docstring"* is [`test_repo_layout.py`'s](tests/unit/test_repo_layout.py:113) job and is already true for all nine (item 8). Items 7 and 8 below are therefore written as a **specification for docs-manager**, paragraph-level, not verbatim — docs-manager writes the prose.
+
+**1. What the shipped code forces before any choice is made**
+
+| Fact | Where | Consequence for B25 |
+|---|---|---|
+| **72 of the 85 model fields carry no `Field(description=...)`** (item 2 has the full list) | [`schema.py`](src/tool_swap/config/schema.py:43-306) | The completeness test **fails at red** with 72 offenders, and the green's largest single edit is 72 description strings. This is the behaviour's real weight — not the script |
+| `Rule` carries a **mandatory, non-empty, static `remedy`** and a per-class docstring | [`Rule`](src/tool_swap/config/validate.py:107-141) — fields are `id`, `remedy`, `severity`, plus `check()` | The troubleshooting table's **fix** column for the 41 rule rows is `rule.remedy`, **verbatim from code**, and its **cause** column is the rule class's docstring summary. Those 41 rows are genuinely *generated* (item 5) |
+| **`SchemaDiagnostic` carries no static remedy** — message and remedy are built per finding | [`_diagnostic`](src/tool_swap/schema/compile.py:723) | The 14 S-code rows **cannot** be derived; they are authored data in the generator (item 5) |
+| The **non-rule** C-codes are module-private `_CODE_*` constants in five modules, not a registry | [loader.py:59-70](src/tool_swap/config/loader.py:59); [interpolate.py:23-24](src/tool_swap/config/interpolate.py:23); [schema.py:37-40](src/tool_swap/config/schema.py:37); [resolver.py:23-25](src/tool_swap/config/resolver.py:23); [validate.py:52](src/tool_swap/config/validate.py:52) | There is **no** single shipped constant naming every code. Item 4 pins the enumeration and the independent cross-check that keeps it complete |
+| `BUILTIN_RULES` is a `Final[tuple[Rule, ...]]` of **41** rules | [validate.py:3383-3425](src/tool_swap/config/validate.py:3383) | The one registry that is already a first-class list. **Importing `validate.py` registers nothing** (behaviour 11a), so the generator may import it freely — no `register_builtin_rules()` call, no global mutation |
+| The 14 S-codes **are** module-level `Final[str]` constants named `TSWAP_S1xx` | [compile.py:38-51](src/tool_swap/schema/compile.py:38) | Enumerable programmatically by name pattern over the module's namespace — no text scan needed for this third |
+| `pythonpath = ["src", "."]` and [`conftest.py`](tests/conftest.py:15-18) both put the **repo root** on `sys.path` | [pyproject.toml:66](pyproject.toml:66) | `from scripts.gen_config_reference import render_reference` works as an **implicit namespace package**. `scripts/__init__.py` is **not** created (item 3) |
+| `.importlinter` declares `root_packages = tool_swap, tool_swap_runtime` only | [.importlinter:2-4](.importlinter:2) | `scripts/` is **outside the graph**: import-linter never analyses it, so the generator importing `tool_swap.config.schema` violates nothing and **needs no new contract**. B26's planned contract constrains what `config`/`schema` *import*, not who imports them (item 9) |
+| `make lint` is `src/`-only and `pytest` collects `tests/` only | [Makefile:14-17](Makefile:14); [pyproject.toml:65](pyproject.toml:65) | `scripts/gen_config_reference.py` is neither linted, type-checked nor collected. It is still written to the house style, because it is the one script a contributor will copy |
+| **`OTHER_DIRS` already contains `"docs"`** | [test_repo_layout.py:73](tests/unit/test_repo_layout.py:73) | **No layout-test amendment is needed** — `docs/` predates B23's `tools` additions. `"scripts"` is deliberately **not** added: the list pins *directories the layout promises*, and one generator script is not a promised directory (item 9) |
+| `.gitignore` matches nothing under `docs/` or `scripts/` | [.gitignore](.gitignore:1) | Both artifacts are committable with no `.gitignore` change |
+| `filterwarnings = ["error"]` | [pyproject.toml:73](pyproject.toml:73) | Pydantic's `model_fields` access on the **class** is warning-free in the pinned pydantic v2 (`>=2.7`, [pyproject.toml:26](pyproject.toml:26)); the deprecated form is the *instance* attribute. The generator and the tests use `Model.model_fields`, never `instance.model_fields` |
+
+**2. The field-description gap — the exact list, and the pinned string for each**
+
+Counted from [`schema.py`](src/tool_swap/config/schema.py:43-306): **85 fields across 8 models; 13 carry a description; 72 do not.** The 13 that already have one are behaviour 14's reserved keys (`soft_ttl` ×3, `scalar_inputs` ×2, `max_batch_bytes` ×3) and behaviour 15/16/18's five `ToolConfig` fields (`image`, `workers`, `expose_host_port`, `autostart`, `max_concurrent`) — **all 13 stay exactly as they are**; the green adds, never rewrites.
+
+The strings below are the pinned text. They are the user-facing reference, so the architect writes them; the green transcribes them into `Field(description=...)` with the surrounding default preserved (a bare `x: int = 900` becomes `x: int = Field(default=900, description="…")`).
+
+**`RouterConfig` — 8 of 8 missing** ([schema.py:43](src/tool_swap/config/schema.py:43))
+
+| Field | Pinned description |
+|---|---|
+| `host` | Interface the router's HTTP server binds to; 0.0.0.0 accepts connections on every interface. |
+| `port` | TCP port the router listens on. |
+| `log_level` | Minimum severity the router logs: DEBUG, INFO, WARNING, ERROR or CRITICAL. |
+| `log_dir` | Directory holding the router log and one subdirectory per tool. |
+| `log_json` | Also write structured JSONL logs alongside the human-readable console output. |
+| `cors_origins` | Browser origins allowed to call the API; ["*"] allows any, which suits the status page and local clients. |
+| `auth_token` | When set, every request must carry an Authorization: Bearer header with this token; null disables authentication. |
+| `status_page` | Serve the HTML status page at /ui. |
+
+**`BackendConfig` — 8 of 8 missing** ([schema.py:58](src/tool_swap/config/schema.py:58))
+
+| Field | Pinned description |
+|---|---|
+| `type` | Container backend to drive: docker for real containers, fake for tests. |
+| `network` | Docker network every tool container joins; created if absent. |
+| `container_prefix` | Prefix for managed container names — a container is named <prefix><tool name>. |
+| `label_namespace` | Label namespace stamped on managed containers, used for reconciliation and pruning. |
+| `gpu_runtime` | GPU runtime requested from the backend when a tool declares devices. |
+| `orphans` | What to do with a running container whose tool left the config: stop, adopt or ignore. |
+| `port_range` | Inclusive [low, high] host-port range used when a tool asks for an auto-allocated debug port. |
+| `registry_prefix` | Image-name prefix for the images tool-swap builds. |
+
+**`DefaultsConfig` — 24 of 26 missing** ([schema.py:73](src/tool_swap/config/schema.py:73); `soft_ttl` and `max_batch_bytes` already have theirs)
+
+| Field | Pinned description |
+|---|---|
+| `ttl` | Idle seconds before a tool's container is stopped: -1 inherits, 0 never stops, above 0 is a timeout. The only idle timer in v1 (ADR-0004). |
+| `keep_warm` | Start every tool at boot and exempt it from TTL. |
+| `autostart` | Start a stopped tool on its first request; false returns 503 instead of starting it. |
+| `group` | Scheduling group a tool joins when it names none; the group must exist in groups:. |
+| `devices` | GPU indices visible to a tool, e.g. [0] or [0,1]; [] means CPU-only. Set here it outranks every group's devices:. |
+| `cpus` | Docker CPU quota per tool, e.g. 4.0; null leaves it unlimited. |
+| `memory` | Docker memory limit per tool, e.g. "16g"; null leaves it unlimited. |
+| `shm_size` | Shared-memory size for each container, e.g. "1g"; raise it for torch DataLoader workers. |
+| `max_batch_size` | Upper bound on how many requests the runtime groups into one batch. |
+| `max_wait_ms` | Latency target the adaptive batcher aims to keep, in milliseconds; not a fixed wait. |
+| `workers` | In-container worker processes per tool; above 1 with devices: set, VRAM multiplies. |
+| `runtime_server` | In-container serving backend: bentoml is implemented, native is reserved and rejected in v1. |
+| `start_timeout` | Seconds to wait for a container to start before declaring the tool failed. |
+| `ready_timeout` | Seconds to wait for a started container to report ready; measure a cold start and add margin. |
+| `queue_timeout` | Seconds a request may wait in the queue before it is rejected. |
+| `request_timeout` | Seconds a single request may take once dispatched to the tool. |
+| `drain_timeout` | Seconds to let in-flight requests finish when a tool is being stopped. |
+| `stop_timeout` | Seconds to wait for a container to stop before it is killed. |
+| `max_queue_depth` | Maximum queued requests per tool; beyond it, new requests are rejected. |
+| `health_path` | HTTP path the router probes for container liveness. |
+| `ready_path` | HTTP path the router probes to decide a tool is ready to serve. |
+| `probe_interval` | Seconds between health and readiness probes. |
+| `env` | Environment variables applied to every tool; merged with a tool's own env, the tool winning. |
+| `mounts` | Mounts applied to every tool as host:container[:ro|rw]; concatenated with a tool's own mounts. |
+
+**`GroupConfig` — 3 of 3 missing** ([schema.py:127](src/tool_swap/config/schema.py:127))
+
+| Field | Pinned description |
+|---|---|
+| `max_resident` | How many of this group's tools may run at once; the rest are evicted or wait. |
+| `eviction` | Which resident tool to evict when the group is full: lru, lifo or none. |
+| `devices` | GPU indices shared by this group's tools; null leaves each tool's own devices: in force. |
+
+**`BuildConfig` — 2 of 2 missing** ([schema.py:142](src/tool_swap/config/schema.py:142))
+
+| Field | Pinned description |
+|---|---|
+| `context` | Directory used as the Docker build context, relative to the config file. |
+| `dockerfile` | Dockerfile to build, resolved inside the context; it must install tool-swap-runtime. |
+
+**`ToolConfig` — 13 of 21 missing** ([schema.py:151](src/tool_swap/config/schema.py:151); `image`, `workers`, `expose_host_port`, `autostart`, `max_concurrent`, `soft_ttl`, `scalar_inputs`, `max_batch_bytes` already have theirs)
+
+Every one of these is *"override the defaults: value for this tool"*, and each description says so in its own words rather than repeating the `DefaultsConfig` text verbatim — the reference is read per block, and a reader in the `tools:` section needs to know the key is an override.
+
+| Field | Pinned description |
+|---|---|
+| `path` | Directory holding this tool's tool.yaml; everything in it is inherited by this entry. |
+| `handler` | Entry point as file.py:ClassName, resolved against the tool directory or the config file. |
+| `requirements` | Requirements file installed into this tool's image. |
+| `build` | Build this tool's image from a Dockerfile the author supplies, instead of the managed build. |
+| `group` | Scheduling group for this tool; overrides defaults.group and must exist in groups:. |
+| `ttl` | Idle seconds for this tool; overrides defaults.ttl. -1 inherits, 0 never stops. |
+| `devices` | GPU indices for this tool; overrides both its group's devices: and defaults.devices. |
+| `keep_warm` | Keep this tool started and TTL-exempt; overrides defaults.keep_warm. |
+| `max_batch_size` | Batch-size cap for this tool; overrides defaults.max_batch_size. Lower it for large payloads. |
+| `max_wait_ms` | Batching latency target for this tool, in milliseconds; overrides defaults.max_wait_ms. |
+| `mounts` | Extra mounts for this tool; concatenated after defaults.mounts, not replacing them. |
+| `env` | Extra environment variables for this tool; merged over defaults.env, this tool winning. |
+| `description` | What this tool does. Required, and the text an LLM agent reads to decide whether to call it. |
+
+**`ToolYamlConfig` — 8 of 11 missing** ([schema.py:247](src/tool_swap/config/schema.py:247); the three reserved keys already have theirs)
+
+| Field | Pinned description |
+|---|---|
+| `name` | The tool's own name; it must equal the key this tool has in the config's tools: map. |
+| `version` | The tool author's version string for this tool; informational. |
+| `description` | What this tool does. Required, and the text an LLM agent reads to decide whether to call it. |
+| `handler` | Entry point as file.py:ClassName, resolved against this tool's own directory. |
+| `inputs` | Per-request inputs, each with name, type and description; compiled into the tool's JSON Schema. |
+| `outputs` | Per-request outputs, each with name, type and description; compiled into the tool's JSON Schema. |
+| `params` | Load-time values passed to the handler's constructor; not per-request, and not agent-visible. |
+| `json_schema` | Raw JSON Schema for the inputs, passed through untouched; the escape hatch instead of inputs:. |
+
+**`RootConfig` — 6 of 6 missing** ([schema.py:295](src/tool_swap/config/schema.py:295))
+
+| Field | Pinned description |
+|---|---|
+| `version` | Config schema version; this build understands version 1 only. |
+| `router` | The router block: the always-on HTTP entry point's own settings. |
+| `backend` | The backend block: how containers are named, networked and cleaned up. |
+| `defaults` | The defaults block: values every tool inherits unless it overrides them. |
+| `groups` | Scheduling groups by name; each caps how many of its member tools run at once. |
+| `tools` | The tools this router serves, by name; each entry is one tool. |
+
+**Tally: 8 + 8 + 24 + 3 + 2 + 13 + 8 + 6 = 72.** The completeness test therefore **fails at red with 72 offenders** and passes only once all 72 land.
+
+**3. The generator — `scripts/gen_config_reference.py`**
+
+**CLI shape.** `scripts/` has no precedent in this repo, so the simplest workable shape is pinned: a **plain `main()` behind `if __name__ == "__main__":`**, driven by `argparse` from the standard library.
+
+```
+python scripts/gen_config_reference.py            # write docs/configuration.md
+python scripts/gen_config_reference.py --check    # write nothing; exit 1 on drift
+```
+
+- **`argparse`, not `typer`.** `typer` is a *runtime* dependency of the router ([pyproject.toml:25](pyproject.toml:25)) and using it here would make a docs script share the CLI's dependency surface for one flag. `argparse` is stdlib and the flag set is two.
+- **`--check` exits `1` on drift** and prints a unified diff header line naming the file; it exits `0` when the committed file already equals the rendered text. It is not used by CI in M1 (no CI step is added — item 9), but it is the mechanism the identity test's failure tells a developer to run, and adding the flag now costs four lines.
+- **The generator exits non-zero with a clear message if a field lacks a description** — the ledger's error behaviour. Pinned shape: `render_reference()` raises `ValueError` listing every `Model.field` that has no non-empty description, and `main()` catches it, prints it to `stderr` and returns `1`. It is a **`ValueError`, not a `SystemExit`**, so the pure function stays callable from a test without process semantics.
+
+**Importability, and the pure function.** The module has **no side effects at import**: no file is written, no argument is parsed, nothing is registered. Two public callables:
+
+```python
+def render_reference() -> str:
+    """Render the whole of docs/configuration.md as a string."""
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: write the file, or --check it. Returns an exit code."""
+```
+
+`render_reference()` is the identity test's operand (item 6). `scripts/__init__.py` is **not** created: the repo root is on `sys.path` from both [pyproject.toml:66](pyproject.toml:66) and [conftest.py:15-18](tests/conftest.py:15), so `scripts.gen_config_reference` imports as an implicit namespace package, and adding an `__init__.py` would make `scripts` a real package that [`test_repo_layout.py`](tests/unit/test_repo_layout.py:99) would then reasonably be expected to pin.
+
+**Model traversal.** Via **`Model.model_fields`** — pydantic v2's mapping of name → `FieldInfo`, which carries `annotation`, `default` and `description`, all three the document needs. `model_json_schema()` was considered and **rejected**: it resolves `$ref`s and `anyOf` into a shape the renderer would have to un-resolve to print `a string or null`, and [`_describe_type`](src/tool_swap/config/schema.py:542) already turns an annotation into exactly the prose this document wants.
+
+**The generator reuses [`_describe_type`](src/tool_swap/config/schema.py:542) for the type column** — importing it despite the leading underscore. Pinned deliberately: the alternative is a second type-prose function that drifts from the one users see in `TSWAP-C105` messages, and *"the reference says `a list of integers`, the error says something else"* is precisely the rot this behaviour exists to prevent. The green may promote it to `describe_type` (a public alias, the underscore name kept) — that is a source change inside B25's scope, and the test asserts the reference's type column for one known field so the coupling is pinned.
+
+**Model order — a fixed pipeline order, not alphabetical:**
+
+```
+RootConfig → RouterConfig → BackendConfig → DefaultsConfig → GroupConfig → ToolConfig → BuildConfig → ToolYamlConfig
+```
+
+**Field order within a model: `model_fields` declaration order.** Pydantic v2 preserves declaration order, and declaration order is what groups `start_timeout`…`stop_timeout` together under the *timeouts* comment in the source. Alphabetical ordering would interleave the timeout, batching and health fields into one undifferentiated run, which is worse to read and no more stable. This is the reading of the ledger's *"sorted"* that is pinned: **deterministic and declaration-ordered**, not lexicographic. `Model.model_fields` is a plain dict and its order is a property of the class, so two runs in one interpreter and two runs in two interpreters render identically. The troubleshooting table **is** sorted — lexicographically by code (item 5) — because a lookup table has no other natural order.
+
+**Default rendering** — pinned per case, because this is where an identity test flaps:
+
+| Case in the models | Rendered as |
+|---|---|
+| `x: int = 900` | `900` |
+| `x: str = "1g"` | `"1g"` (double-quoted, `repr`-style) |
+| `x: bool = True` / `False` | `true` / `false` (YAML spelling — the document describes YAML) |
+| `x: float = 1.0` | `1.0` |
+| `x: T \| None = None` and `x: Any = Field(default=None, …)` | `null` (YAML spelling, **not** `None`) |
+| `x: list[str] = ["*"]`, `list[int] = [7000, 7999]`, `= []` | `["*"]`, `[7000, 7999]`, `[]` |
+| `x: dict[str, Any] = {}` | `{}` |
+| `context: str` (**required — no default**) | `—` (an em dash), the "no default" marker |
+
+The required/no-default case is detected with **`field.is_required()`**, pydantic v2's own predicate, **not** by comparing against `PydanticUndefined`. Only **one** field in the whole schema is required — [`BuildConfig.context`](src/tool_swap/config/schema.py:147) — so `—` appears exactly once in the document, and a test pins that. The distinction that matters and is pinned: `—` means *"you must write this key"*; `null` means *"the default value is null"* (`cpus`, `memory`, `auth_token`, `RootConfig.version` and every `ToolConfig` override).
+
+**A nested-model field's type column** (`router: RouterConfig | None`) renders as `a RouterConfig block or null` — [`_describe_type`](src/tool_swap/config/schema.py:568)'s own output — and its description row is followed by no expansion; the block has its own section. The document is a set of per-block sections, not a tree.
+
+**4. The diagnostic code set — the complete enumeration, with citations**
+
+The generator must enumerate **every** `TSWAP-C*`/`TSWAP-S*` code the codebase can emit. There is no shipped registry that spans them, so the set is assembled from **three** sources, and the test computes it **independently** in a fourth way (item 6, test 6) so that neither the table nor the generator can be the only thing that knows.
+
+**(a) The 41 rule codes — walked from [`BUILTIN_RULES`](src/tool_swap/config/validate.py:3383).** `tuple(rule.id for rule in BUILTIN_RULES)`. Genuinely generated, and each row's **fix** is `rule.remedy`.
+
+**(b) The 14 S-codes — walked from [`compile.py`](src/tool_swap/schema/compile.py:38)'s module namespace.** `S100`–`S110`, `S120`, `S130`, `S140`, collected as the values of the module's `TSWAP_S*` `Final[str]` constants (`{v for k, v in vars(compile).items() if k.startswith("TSWAP_S")}`). Fourteen, per **A21**.
+
+**(c) The 19 non-rule C-codes — the exact enumeration.** These are module-private `_CODE_*` constants with no registry, so they are listed here **verbatim, with citations**, and the generator names them in one explicit tuple (item 5's `CODE_TABLE` supplies the rows; this list is what the test checks the table against):
+
+| Code | Constant | Module |
+|---|---|---|
+| `TSWAP-C000` | `_CODE_NOT_FOUND` | [loader.py:59](src/tool_swap/config/loader.py:59) |
+| `TSWAP-C001` | `_CODE_SYNTAX` | [loader.py:60](src/tool_swap/config/loader.py:60) |
+| `TSWAP-C001` | `_CODE_UNSUPPORTED_VERSION` — **the same code, a second emitter** | [schema.py:37](src/tool_swap/config/schema.py:37) |
+| `TSWAP-C002` | `_CODE_DUPLICATE` | [loader.py:61](src/tool_swap/config/loader.py:61) |
+| `TSWAP-C003` | `_CODE_EMPTY` | [loader.py:62](src/tool_swap/config/loader.py:62) |
+| `TSWAP-C004` | `_CODE_NON_MAPPING` | [loader.py:63](src/tool_swap/config/loader.py:63) |
+| `TSWAP-C005` | `_CODE_MISSING_TOOL_YAML` | [loader.py:64](src/tool_swap/config/loader.py:64) |
+| `TSWAP-C006` | `_CODE_PATH_IS_FILE` | [loader.py:65](src/tool_swap/config/loader.py:65) |
+| `TSWAP-C007` | `_CODE_RECURSION` | [loader.py:66](src/tool_swap/config/loader.py:66) |
+| `TSWAP-C010` | `_CODE_MISSING` | [interpolate.py:23](src/tool_swap/config/interpolate.py:23) |
+| `TSWAP-C011` | `_CODE_ENV_FILE_MISSING` | [loader.py:67](src/tool_swap/config/loader.py:67) |
+| `TSWAP-C012` | `_CODE_ENV_PARSE` | [loader.py:68](src/tool_swap/config/loader.py:68) |
+| `TSWAP-C013` | `_CODE_UNCLOSED` | [interpolate.py:24](src/tool_swap/config/interpolate.py:24) |
+| `TSWAP-C101` | `_CODE_UNKNOWN_KEY` | [schema.py:38](src/tool_swap/config/schema.py:38) |
+| `TSWAP-C104` | `_CODE_DEVICES_AS_COUNT` | [schema.py:39](src/tool_swap/config/schema.py:39) |
+| `TSWAP-C105` | `_CODE_INVALID_SHAPE` | [schema.py:40](src/tool_swap/config/schema.py:40) |
+| `TSWAP-C106` | `_CODE_UNMAPPED_KEY` | [resolver.py:25](src/tool_swap/config/resolver.py:25) |
+| `TSWAP-C201` | `_CODE_NAME_MISMATCH` | [loader.py:69](src/tool_swap/config/loader.py:69) |
+| `TSWAP-C202` | `_CODE_SHARED_PATH` | [loader.py:70](src/tool_swap/config/loader.py:70) |
+| `TSWAP-C501` | `_CODE_BAD_TTL` | [resolver.py:23](src/tool_swap/config/resolver.py:23) |
+| `TSWAP-C503` | `_CODE_DUPLICATE_MOUNT` | [resolver.py:24](src/tool_swap/config/resolver.py:24) |
+| `TSWAP-C999` | `_INTERNAL_RULE_CODE` | [validate.py:52](src/tool_swap/config/validate.py:52) |
+
+That is **22 constants** across five modules but **21 distinct codes**, because **`TSWAP-C001` is claimed twice** — the loader's YAML-syntax error and the schema's unsupported-version error share it. Pinned consequence: **the table has ONE `TSWAP-C001` row whose cause names both** (*"the file is not valid YAML, or its version: is not 1"*). A table keyed by code cannot have two rows for one code, and the honest fix is a cause covering both emitters, not a silent choice of one.
+
+**Total distinct codes: 41 + 14 + 21 = 76.** So **`CODE_TABLE` has 76 rows** — not the ~60 the intake estimated, because the C0xx/C1xx/C2xx/C5xx set is 21 rather than a handful.
+
+**5. The troubleshooting table's data design — and what *"generated from the same code table"* actually means**
+
+The ledger says the table is *"generated from the same code table"*. Taken literally, that requires a shipped code table carrying a cause and a fix per code. **There is no such object**, and only a third of the codes could supply one: `Rule` has a static `remedy` (41 codes), while [`SchemaDiagnostic`](src/tool_swap/schema/compile.py:723) builds its remedy per finding (14 codes) and the `_CODE_*` constants are bare strings (21 codes). The cause prose in particular is derivable for **no** code: a message template is not a cause.
+
+**Pinned interpretation — this is assumption A28 (item 10):**
+
+- **`CODE_TABLE` is authored data in the generator** — a `Final[tuple[CodeRow, ...]]` of 76 frozen `CodeRow(code, cause, fix)` rows, hand-written **once**, living in `scripts/gen_config_reference.py`. The **table IS the mapping**; nothing else in the repo holds cause/fix prose per code.
+- **For the 41 rule codes, `fix` is not authored twice.** The row supplies `cause` only, and the generator fills `fix` from `BUILTIN_RULES`' `rule.remedy` at render time. A test pins that every rule row's rendered fix equals its `Rule.remedy` verbatim, so a remedy edit in `validate.py` shows up as a docs diff — which is the *"cannot silently rot"* guarantee, delivered where the data actually exists.
+- **For the 14 S-codes and the 21 non-rule C-codes, both `cause` and `fix` are authored** in the row. There is no code-side source to derive them from, and inventing one (a static `REMEDIES` dict in `compile.py`) would put documentation prose into a hot path for the benefit of a docs script.
+- **"Generated" therefore means:** the document's *structure* is assembled by the script, the *code column* is validated against the emitted set from both directions (item 6, test 6), and the *fix* column for the 41 rule codes is read from code. The cause prose is authored, because it cannot honestly be anything else.
+
+**Row format**, exactly:
+
+```
+| Code | Cause | Fix |
+|---|---|---|
+| `TSWAP-C010` | An interpolated variable is unset and the reference declares no default. | Set the variable, or write ${VAR:-default} to give it one. |
+```
+
+Rows are **sorted lexicographically by code**, which for this set is also numeric order within each letter (`C000` … `C999`, then `S100` … `S140`) because every code is a fixed-width three digits.
+
+**6. The document — `docs/configuration.md`, its exact structure**
+
+One H1, then one section per block in the pinned model order, then the troubleshooting section. No timestamp, no absolute path, no version banner (a version string would make the document churn on every release for no reader benefit, and the identity test would then depend on `_CURRENT_VERSION`).
+
+```markdown
+# Configuration reference
+
+<!-- GENERATED FILE — do not edit by hand.
+     Regenerate with: python scripts/gen_config_reference.py -->
+
+Every key tool-swap understands, with its type, default and meaning.
+Generated from the Pydantic models in `src/tool_swap/config/schema.py`.
+
+## The document root
+
+The top-level keys of `tools.yaml`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `version` | an integer or null | `null` | Config schema version; this build understands version 1 only. |
+| `router` | a RouterConfig block or null | `null` | The router block: the always-on HTTP entry point's own settings. |
+…
+
+## `router:`
+
+The HTTP front door.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `host` | a string | `"0.0.0.0"` | Interface the router's HTTP server binds to; 0.0.0.0 accepts connections on every interface. |
+| `port` | an integer | `8600` | TCP port the router listens on. |
+| `log_json` | a boolean | `true` | Also write structured JSONL logs alongside the human-readable console output. |
+| `auth_token` | a string or null | `null` | When set, every request must carry an Authorization: Bearer header with this token; null disables authentication. |
+…
+
+## `build:` (inside a tool)
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `context` | a string | — | Directory used as the Docker build context, relative to the config file. |
+| `dockerfile` | a string | `"Dockerfile"` | Dockerfile to build, resolved inside the context; it must install tool-swap-runtime. |
+
+## Troubleshooting: every diagnostic code
+
+| Code | Cause | Fix |
+|---|---|---|
+| `TSWAP-C000` | The config file named on the command line does not exist. | Check the path, or run from the directory holding tools.yaml. |
+…
+```
+
+The worked sample above is the pinned format for four real fields (`version`, `host`, `log_json`, `auth_token`) plus the one required field (`context`, rendering `—`). Section headings are pinned as: `## The document root`, `## `router:``, `## `backend:``, `## `defaults:``, `## `groups.<name>:``, `## `tools.<name>:``, `## `build:` (inside a tool)`, `## `tool.yaml``, `## Troubleshooting: every diagnostic code`. The one-line blurb under each heading is the model's own docstring first line, **stripped of its `(plan/02 §3)` citation** — the reference is the document a user reads instead of the plan, so a pointer back into the plan inside every heading is noise. The generator strips a trailing parenthesised citation with a pinned regex; a test covers it.
+
+**7. The README section — the docs-manager payload (NOT B25's green)**
+
+A new `## Configuration` section in [`README.md`](README.md:1), placed **after `## CLI`** and before `## Get started` (it explains what the CLI acts on). Required content, paragraph-level:
+
+1. **Writing a `tools.yaml`** — point at [`tools.example.yaml`](tools.example.yaml) as the copy-from artifact (B24 shipped it, and CI proves it validates), plus the five-line minimal form B23 shipped, quoted or pointed at. Do **not** re-inline the whole example: it is one file away and would rot.
+2. **Validating it** — `tswap validate`, and `tswap validate --strict` for the zero-warnings gate, naming that a diagnostic carries a code, a location and a remedy.
+3. **Inspecting the resolved config** — `tswap config show`, and what it answers: *"which layer did this value come from"*.
+4. **Links** — [`docs/configuration.md`](docs/configuration.md) as the generated key-by-key reference and the troubleshooting table, and [`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md) as the design rationale. Both links, both labelled with what they are for; a bare link list teaches nothing.
+
+The existing *Repository Structure* block already lists `docs/`, so no edit there.
+
+**8. The module docstrings — the docs-manager payload (NOT B25's green)**
+
+All nine modules **already have a module docstring**, verified module by module, and all nine are well over [`test_repo_layout.py`](tests/unit/test_repo_layout.py:129)'s 20-character floor (that test covers `__init__.py` files only, so none of the nine is under it anyway). The ledger's requirement is therefore *"explaining each component's role **and its place in the pipeline**"* — and the gap is uniformly the **second half**: each docstring explains its own module well and says nothing about what hands it its input or what consumes its output.
+
+Pinned: docs-manager **adds one pipeline sentence** to each, keeping the existing text. The role statement each must carry:
+
+| Module | Current state | The role + pipeline sentence it must state |
+|---|---|---|
+| [`config/schema.py`](src/tool_swap/config/schema.py:1) | Good role, lists its codes; no pipeline placement | The Pydantic shape of the document. Runs on the dict the **loader** produced, before the **resolver** layers anything; its diagnostics are shape problems, not semantic ones. |
+| [`config/loader.py`](src/tool_swap/config/loader.py:1) | Long and good; no placement | Turns a file path into a parsed, interpolated, include-expanded dict with line numbers. **First** stage: reads bytes, calls **interpolate**, hands the dict to **schema** and the carriers to **resolver**. |
+| [`config/resolver.py`](src/tool_swap/config/resolver.py:1) | Good role and precedence; cites the plan, not the neighbours | Merges the layers into flat fields with origins. Runs **after** `schema` validated the shape, **before** `validate` judges semantics; the only producer of `ResolvedTool`, which every rule reads. |
+| [`config/validate.py`](src/tool_swap/config/validate.py:1) | Good role; says "registers nothing" | The §6 rule registry over a resolved config. **Last** config stage: every rule reads the **resolver**'s output and returns diagnostics; the CLI runs them all in one pass. |
+| [`config/errors.py`](src/tool_swap/config/errors.py:1) | Excellent; already names its consumers | The vocabulary every other stage speaks. Imported by **all** of them and importing **none** of them — the leaf of the config layer. |
+| [`config/origin.py`](src/tool_swap/config/origin.py:1) | Short, role-only | Records which layer a value came from and which it shadowed. Populated by the **resolver**, consumed by `tswap config show`. |
+| [`config/interpolate.py`](src/tool_swap/config/interpolate.py:1) | Good; lists its codes | `${VAR}` substitution over **raw text**, before YAML parsing. Called by the **loader** and by nothing else; never reads the ambient environment. |
+| [`config/defaults.py`](src/tool_swap/config/defaults.py:1) | Good; already names the resolver | The bottom layer. The only place a built-in value may come from; the **resolver** is its single consumer. |
+| [`schema/compile.py`](src/tool_swap/schema/compile.py:1) | Excellent; behaviour-numbered | Compiles authored `inputs:`/`outputs:` into JSON Schema. Runs **beside** the config pipeline, not inside it: the CLI calls it per tool after resolution, and it imports **only** `config.errors`. |
+
+**9. The test file — `tests/unit/config/test_docs_generated.py`**
+
+Constants, pinned:
+
+```python
+ROOT = Path(__file__).resolve().parents[3]
+GENERATOR = ROOT / "scripts" / "gen_config_reference.py"
+REFERENCE = ROOT / "docs" / "configuration.md"
+```
+
+**The lazy-import rule, and why it is mandatory.** A module-level `from scripts.gen_config_reference import render_reference` raises at **collection** time in the red step, and a collection error is **not a red** — it is a broken test file. Every test that needs the generator therefore imports it **inside the test body**:
+
+```python
+def test_...() -> None:
+    from scripts.gen_config_reference import render_reference   # noqa: PLC0415
+    ...
+```
+
+so the red is an `ImportError` **raised inside a test function** — a failing test with a readable message, collected alongside the rest. This is pinned as a hard requirement of the file: **no module-level import of `scripts.*`**.
+
+| # | Test | Assertion | At red |
+|---|---|---|---|
+| 1 | `test_the_generator_script_exists` | `GENERATOR.is_file()` | **FAILS** — the one-line guard that names the missing file instead of an import traceback |
+| 2 | `test_every_model_field_has_a_description` | For all 8 models, every `FieldInfo` in `Model.model_fields` has a `description` that is a non-empty, non-blank string. Failure message lists `Model.field` for every offender | **FAILS** — 72 offenders (item 2). Imports only `tool_swap.config.schema`, which is shipped, so it is an honest assertion failure, not an import error |
+| 3 | `test_the_reference_document_exists` | `REFERENCE.is_file()` | **FAILS** |
+| 4 | `test_the_committed_reference_matches_a_fresh_render` | Lazy-import `render_reference`; `render_reference() == REFERENCE.read_text(encoding="utf-8")`. The **identity test**. Failure message says *"run python scripts/gen_config_reference.py"* | **FAILS** (ImportError inside the test) |
+| 5 | `test_rendering_is_deterministic` | Two `render_reference()` calls in one process are equal. Cheap, and it is the direct form of *"generation must be deterministic"* | **FAILS** (ImportError inside the test) |
+| 6 | `test_the_troubleshooting_table_covers_every_emitted_code` | **Both directions.** The test computes the emitted set **independently of the generator**: `{r.id for r in BUILTIN_RULES}` ∪ `{v for k, v in vars(tool_swap.schema.compile).items() if k.startswith("TSWAP_S")}` ∪ a **literal frozenset of the 21 non-rule codes copied from item 4's table**. Then: every emitted code has a row, and every row's code is emitted. Set difference in both directions, each with its own message | **FAILS** (ImportError inside the test) |
+| 7 | `test_the_non_rule_code_literals_are_still_accurate` | The item-4 literal set is re-derived by reading the five modules' `_CODE_*` / `_INTERNAL_RULE_CODE` constants via `vars(module)` and filtering values matching `TSWAP-C\d{3}`, then asserted equal to the literal. **This is what stops the literal rotting**: a new `_CODE_*` constant in `loader.py` fails here by name | **FAILS** (imports the shipped modules fine, but the literal lives in the not-yet-written test's own constant — see note) |
+| 8 | `test_every_rule_row_quotes_its_remedy_verbatim` | For each of the 41 rule codes, the rendered table row's fix column equals `rule.remedy` exactly. Pins item 5's *"the fix column is read from code"* claim | **FAILS** (ImportError inside the test) |
+| 9 | `test_the_required_field_renders_an_em_dash` | The rendered `build:` section's `context` row has `—` in the default column, and no other row in the document does. Pins item 3's `is_required()` decision | **FAILS** (ImportError inside the test) |
+| 10 | `test_the_document_names_no_absolute_path_and_no_timestamp` | The rendered text contains no `/home/`, no `/workspaces/`, no four-digit year. The mechanical form of *"no timestamps, no absolute paths"* | **FAILS** (ImportError inside the test) |
+
+**Red-step accounting, stated plainly:** **all ten fail**, and **none** fails as a collection error. Tests 1 and 3 fail on a missing file; test 2 fails as a 72-item assertion failure against shipped code; test 7 fails only because its own constant is part of the red file (it is self-contained and will pass the moment the file exists — it asserts a property of shipped code, so it is the one test that turns green **without any green-step work**, exactly as B23's accounting recorded such cases); tests 4, 5, 6, 8, 9, 10 fail with an `ImportError` raised **inside the test body**. No test in this file passes at red **except** test 7, which is a property of the shipped modules and is written to document the invariant rather than to drive the green.
+
+**10. Red/green ordering, and what lands where**
+
+- **RED = `tests/unit/config/test_docs_generated.py` alone.** Ten tests, all failing, no collection error (item 9's lazy-import rule is what buys that).
+- **GREEN = one commit**, three parts:
+  1. `scripts/gen_config_reference.py` — the generator, `render_reference()` + `main()` + the 76-row `CODE_TABLE`.
+  2. `docs/configuration.md` — the generated document, produced by running the script and committed as-is.
+  3. **The 72 `Field(description=...)` additions** in [`src/tool_swap/config/schema.py`](src/tool_swap/config/schema.py:43) — the only `src/` change B25 makes, forced by test 2. The strings are item 2's, transcribed.
+  Order inside the commit does not matter, but the document must be generated **after** the descriptions land, or it renders 72 blanks and the identity test passes against a wrong file.
+- **DOCS HANDOFF (step 9, separate commit, docs-manager):** the README section (item 7) and the nine docstring pipeline sentences (item 8).
+- **No shipped test needs amending.** [`OTHER_DIRS`](tests/unit/test_repo_layout.py:66) already contains `"docs"`; `"scripts"` is deliberately not added (item 1). [`test_makefile.py`'s `ALL_TARGETS`](tests/unit/test_makefile.py:267) is untouched because **no `make` target is added** — the script is run by hand or by the failure message of test 4, and a `make docs` target would need a `help` line and an `ALL_TARGETS` entry for one command. **No CI step is added either**: test 4 already fails the build on drift, and a CI step running `--check` would assert the same thing a second way.
+- **`.importlinter` is untouched by B25.** See item 11.
+- **The `_describe_type` promotion** (item 3) is the one judgement call inside the green: if the green prefers not to touch `schema.py` beyond the descriptions, importing `_describe_type` under its private name is acceptable and the test is unaffected. Recorded so the choice is visible rather than discovered in review.
+
+**11. `.importlinter` — the answer, and why no contract is needed**
+
+[`.importlinter`](.importlinter:2) declares `root_packages = tool_swap, tool_swap_runtime`. Import-linter builds its graph from the **root packages only**, so `scripts.gen_config_reference` is not a node in it: it is neither a source nor a target of any contract, and its `from tool_swap.config.schema import RootConfig` is invisible to the tool. **The generator needs no contract and violates none today.**
+
+Nor does B26's planned contract change that. B26 adds *"`tool_swap.config` and `tool_swap.schema` must not import `cli`/`lifecycle`/`backend`/`proxy`"* — a **forbidden** contract whose `source_modules` are the config packages. It constrains what the config layer *imports*, never who imports it. A script importing `tool_swap.config.schema` is exactly the direction the contract is designed to permit.
+
+The one thing worth stating so it is not re-litigated in B26: **adding `scripts` as a third root package is declined.** It would pull one un-linted, un-type-checked file into the boundary graph for no invariant anyone wants to state, and it would then need an `__init__.py` (item 3 declines that too).
+
+**12. New assumption — A28**
+
+**A28 (new, 2026-08-21) — NOT yet confirmed by [issue #2](https://github.com/iar3-r8/tool-swap/issues/2); worth one line in the PR description.** (A27 is the highest allocated and A23 is deliberately unallocated, so **A28** is next.) Three readings of the B25 deliverable that the spec does not decide:
+
+1. **The troubleshooting table's cause/fix prose is AUTHORED, not derived — "generated from the same code table" is read as "the code column is validated against the emitted set, and the rule half's fix column is read from `Rule.remedy`".** This is the substantive one. No shipped object carries a cause per code, and only `Rule` carries a static remedy; a `SchemaDiagnostic`'s remedy is built per finding and the 21 `_CODE_*` constants are bare strings. The alternatives were: invent a static `REMEDIES` mapping inside `compile.py` and the four other modules (documentation prose in a hot path, to serve a docs script), or derive a "cause" from a message template (a template is not a cause). What the table **does** guarantee mechanically is coverage in both directions plus verbatim agreement with all 41 remedies — which is the rot-prevention the ledger is actually asking for.
+2. **The docs half of the ledger — the README section and the nine module docstrings — is docs-manager work in the step-9 handoff, not part of B25's green.** The RED/GREEN cycle covers the generator, the generated document and the 72 description additions. This splits one ledger item across two commits and two modes, and it is visible in the PR history, so it is worth confirming.
+3. **"Sorted" is read as "deterministic": fields in `model_fields` declaration order, blocks in a fixed pipeline order, and only the troubleshooting table lexicographic.** Alphabetising the field tables would scatter the timeout, batching and health groups and buy no stability that declaration order does not already have.
+
+Also recorded, as consequences rather than assumptions: **`TSWAP-C001` gets ONE row covering both its emitters** (item 4) — the only place the document is coarser than the code; **the table is 76 rows, not the ~60 estimated** at intake, because the non-rule C-code set is 21; and **72 of 85 model fields gain a description**, which makes `schema.py` roughly a third longer and is by far B25's largest diff.
+
+**13. What this behaviour must NOT do**
+
+- **No rule change, no new diagnostic code, no severity change.** B25 documents the 76 codes; it does not adjudicate them. If a code's cause is hard to write, that is a finding to record, not a licence to edit the rule.
+- **No `make` target, no CI step** (item 10 argues each).
+- **No `scripts/__init__.py`, no third import-linter root package** (items 3 and 11).
+- **No change to the 13 descriptions that already exist** — behaviour 14's reserved-key text is quoted in the shipped tests' expectations by way of the rules, and rewriting it for style would be a source change with no test behind it.
+- **No version banner, timestamp or absolute path in the generated document** — test 10 is the executable form, and a version string would make the reference churn every release.
+- **No hand edit of `docs/configuration.md`, ever.** The `GENERATED FILE` comment at the top of the document (item 6) says so in the one place a would-be editor is guaranteed to look.
+
 ### Behaviour 26 — lint, types and import boundaries stay clean
 
 - **Inputs:** the whole new codebase.
@@ -3881,6 +4309,8 @@ Two further details are pinned by committed tests rather than by the spec, and a
 | **A26** | The ledger's *"exactly this file and a matching tool directory"* — which half is a repo artifact, and what the tool declares | **Only the tool DIRECTORY is committed**; the five-line config is written to `tmp_path` by the test (a committed root `tools.yaml` would flip `tswap validate`'s no-argument behaviour repo-wide and make the golden path depend on `.env` auto-discovery in the repo root). The fixture's image source is a managed **`handler:`** — forced, since a `tool.yaml` `image:` is never lifted into a carrier and `build:` would demand a committed `Dockerfile` under `C515`'s probe — and it declares **one described `inputs:` entry**, which is the genuine choice (a one-line revert if input-less minimalism is preferred) | 23, 24 |
 
 | **A27** | B24's example: which fixtures ship, the mount path, the corrections to §3's own snippet, and the CI mechanism | **Two new fixture directories ship** — `tools/example_add/` (inline-`handler:`) and `tools/example_build/` (`build:`) — because the ledger's three `tools:` forms each need real files under the `C513`/`C514`/`C515` probes; `tools/example_echo/` is **reused**, not duplicated. The `defaults:` mount is **`${TSWAP_MODELS_DIR:-./models}:/weights/hf:ro`**, a committed repo path (`C543` probes **existence only**, and §3's `~/.cache/huggingface` does not exist on a fresh CI runner). **§3's snippet as written would not validate**: the example drops `defaults.devices: []` (it outranks the group layer — A11 — and would silently empty `gpu0`) and re-points `defaults.group` from `default` to `cpu` (with `groups:` written, no `default` group is synthesised → `C220` ERROR). The CI check is **a new step in the existing `ci` job** running the `tswap` console script — not a separate job, not a `make` target | 24 |
+
+| **A28** | B25's *"the troubleshooting table is generated from the same code table"*, the ownership of the README/docstring half, and the reading of *"sorted"* | **The table's cause/fix prose is AUTHORED, not derived.** No shipped object carries a cause per code; only `Rule` carries a static `remedy` (41 of 76 codes), while `SchemaDiagnostic` builds its remedy per finding and the 21 non-rule C-codes are bare `_CODE_*` string constants. So `CODE_TABLE` is a 76-row constant in the generator, *"generated"* means the **code column is validated against the emitted set in both directions** and the **fix column for the 41 rule rows is read from `Rule.remedy` verbatim**. **The README section and the nine module docstrings are docs-manager work in the step-9 handoff**, not B25's green (which is the generator + the generated doc + 72 `Field(description=...)` additions). **"Sorted" is read as "deterministic"**: fields in `model_fields` declaration order, blocks in a fixed pipeline order, only the code table lexicographic. Two consequences worth naming: `TSWAP-C001` gets **one** row covering both its emitters (loader syntax error and schema version error share the code), and **72 of the 85 model fields** gain a description — B25's largest diff by far | 25 |
 
 ### Scope boundaries recorded deliberately
 
