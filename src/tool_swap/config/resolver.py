@@ -5,6 +5,9 @@
 ``defaults:`` and built-in, assumption A11) — into exactly the flat
 built-in fields, recording winning and shadowed origins.  It is a pure
 function of the layer dicts: no filesystem, no environment, no clock.
+In the pipeline it runs after ``schema`` has validated the shape and
+before ``validate`` judges the semantics, and it is the only producer of
+``ResolvedTool``, which every rule reads.
 See ``plans/m1-configuration.md`` §1, behaviour 10.
 """
 

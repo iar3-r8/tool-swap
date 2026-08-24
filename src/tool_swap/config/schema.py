@@ -5,7 +5,9 @@ Every model mirrors one block of the documented config
 diagnostic rather than a silent no-op.  ``validate_root`` is the single entry
 point: it takes an already-parsed YAML dict and returns ``Diagnostic`` values
 — it raises nothing for config content and never lets Pydantic's raw
-"Input should be ..." text reach the caller.
+"Input should be ..." text reach the caller.  In the pipeline it runs on the
+dict the loader produced, before the resolver layers anything; its
+diagnostics are shape problems, not semantic ones.
 
 Codes emitted here: ``TSWAP-C001`` (unsupported config version),
 ``TSWAP-C101`` (unknown key, with a nearest-legal-alternative suggestion),

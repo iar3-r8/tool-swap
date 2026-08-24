@@ -6,6 +6,8 @@ for any input (hostile corpora included); it returns ``(schema,
 diagnostics)`` tuples so behaviour 21 can report every problem in one
 pass.  The schema half is ``None`` whenever any ERROR-severity diagnostic
 was produced — emitting an invalid schema is worse than emitting none.
+It runs beside the config pipeline rather than inside it: the CLI calls it
+per tool after resolution, and it imports no ``tool_swap`` module at all.
 
 ``json_schema:`` blocks are passed through as ``copy.deepcopy``: untouched
 content, no aliasing, nothing injected.  ``validate_against_metaschema`` is

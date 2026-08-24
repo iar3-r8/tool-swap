@@ -10,7 +10,9 @@ command.  Behaviour 12 lands the name and group rules (``TSWAP-C210`` …
 ``TSWAP-C223``) as the first entries of ``BUILTIN_RULES``; behaviours 13-19
 add the rest of the real ``§6`` rules, which M5 *moves* into preflight
 rather than reimplementing (guardrail 13).  Importing this module still
-registers nothing (behaviour 11a, Option B).
+registers nothing (behaviour 11a, Option B).  It is the last configuration
+stage: every rule reads the resolver's ``ResolvedTool`` output and returns
+diagnostics, and the CLI runs all registered rules in one pass.
 """
 
 from __future__ import annotations

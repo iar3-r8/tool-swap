@@ -5,7 +5,9 @@ loader, schema validator, and resolver all produce ``Diagnostic`` values
 (frozen, coded, ordered) which are aggregated into a ``ConfigReport`` that
 serves the three report consumers (human render, JSON, exception) from one
 shape.  A ``Diagnostic`` must carry a mandatory, non-empty ``remedy`` because
-the M1 Definition of Done is *a message a stranger can act on*.
+the M1 Definition of Done is *a message a stranger can act on*.  It sits at
+the base of the config layer: it imports no sibling module, and every stage
+that produces diagnostics imports it.
 """
 
 from __future__ import annotations

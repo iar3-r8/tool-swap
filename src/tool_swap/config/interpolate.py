@@ -7,6 +7,8 @@ never reads the ambient environment), and quotes every substituted value so
 it can never inject YAML structure (plan line 117).  All problems found in a
 single pass are returned together; when any error is present,
 ``Interpolated.text`` is the input verbatim and the caller must not use it.
+In the pipeline it is called by the ``loader`` on the raw text, and by
+nothing else.
 
 Codes emitted here: ``TSWAP-C010`` (variable unset and no default) and
 ``TSWAP-C013`` (an unclosed ``${`` reference).

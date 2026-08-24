@@ -1,8 +1,10 @@
 """Origin tracking primitives for configuration resolution.
 
 Records *which* layer a resolved value came from (the "why this value"
-answer for ``config show``) and *which* layers it shadowed — see
-``plans/m1-configuration.md`` §1, behaviour 9.
+answer for ``config show``) and *which* layers it shadowed.  In the pipeline
+it is populated by the ``resolver`` during layer merging and consumed when
+rendering ``tswap config show``.
+See ``plans/m1-configuration.md`` §1, behaviour 9.
 """
 
 from __future__ import annotations

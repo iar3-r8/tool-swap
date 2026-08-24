@@ -34,7 +34,9 @@ recursion), ``TSWAP-C201`` (``name:`` in ``tool.yaml`` differs from the
 WARNING, not fatal).  The loader does not schema-validate ``tool.yaml``
 content (that is behaviour 4's layer); it only records the tool.yaml's
 resolved path via the accessor so a validator can locate its diagnostics
-there.
+there.  It is the first stage of the configuration pipeline: the pipeline
+then hands the parsed dict to ``schema``'s ``validate_root`` and the
+included ``tool.yaml`` carriers to the ``resolver``.
 """
 
 from __future__ import annotations

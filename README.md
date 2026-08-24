@@ -24,6 +24,49 @@ pip install -e ".[dev]"
 tswap --help
 ```
 
+## Configuration
+
+Tool-swap is configured by one `tools.yaml` file plus a directory per tool.
+Requirement R4 — a working single-model config must fit in five lines — is
+the design bar, and it holds: the committed
+[`tools/example_echo`](tools/example_echo/tool.yaml) fixture is the proof,
+and
+[`test_the_minimal_config_is_at_most_five_lines`](tests/unit/config/test_minimal_config.py:226)
+asserts it mechanically.
+
+The minimum is a tool name pointing at a directory:
+
+```yaml
+tools:
+  example_echo:
+    path: ./tools/example_echo
+```
+
+The committed [`tools.example.yaml`](tools.example.yaml) shows the full
+surface, and every key has its type, default and description in the
+generated reference [`docs/configuration.md`](docs/configuration.md); the
+design rationale is in
+[`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md).
+
+**Validating.** `tswap validate` runs the whole pipeline in one pass; each
+diagnostic carries a `TSWAP-C*`/`TSWAP-S*` code, a location and a remedy.
+Exit 0 (warnings, if any, on stderr), exit 1 (errors; `--strict` also
+promotes warnings), exit 2 (the config file could not be read). `--json`
+prints the report on stdout and nothing else.
+
+**Inspecting.** `tswap config show [tool]` prints the fully-resolved config
+with each value's origin — which layer set it. `--verbose` also shows the
+shadowed values each setting overrode; `--json` emits the
+`{config, router, backend, tools}` envelope on stdout; `--show-secrets`
+prints secret values instead of `***` (local use only, no banner).
+
+**The example.** `tools.example.yaml` is validated in CI with `--strict`,
+so it is guaranteed free of errors AND warnings — copy from it freely.
+
+**Troubleshooting.** Every `TSWAP-C*`/`TSWAP-S*` code maps to a cause and a
+fix in the troubleshooting table in
+[`docs/configuration.md`](docs/configuration.md).
+
 ## Get started
 
 1. **Clone the repository**
