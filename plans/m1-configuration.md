@@ -4008,7 +4008,7 @@ Also recorded, as consequences rather than assumptions: **`TSWAP-C001` gets ONE 
 ### Behaviour 26 — lint, types and import boundaries stay clean
 
 - **Inputs:** the whole new codebase.
-- **Expected outputs:** `make lint` exits 0 (`ruff check`, `ruff format --check`, `mypy src/` strict); import-linter passes; the full suite is green with **zero** warnings; the 206-test baseline is intact.
+- **Expected outputs:** `make lint` exits 0 (`ruff check`, `ruff format --check`, `mypy src/` strict); import-linter passes; the full suite is green with **zero** warnings; the 206-test baseline is intact. *(The "206" is the intake baseline from [line 7](plans/m1-configuration.md:7) and is **stale** — the branch now runs ~1100 tests. The contract block below, item 1, replaces it with the two claims it was standing in for; no test asserts a count.)*
 - **Edge cases:**
   - `tool_swap.config` and `tool_swap.schema` must not import `tool_swap.cli`, `tool_swap.lifecycle`, `tool_swap.backend` or `tool_swap.proxy` — the config layer is a leaf that everything else depends on. **Add an import-linter contract expressing this** while there is no code to violate it, exactly the argument M0 used for its two contracts.
   - **Importing `validate.py` has no side effects** (the registration decision above). The behaviour-11 fresh-interpreter test is the executable form of this: the CLI importing `validate` pulls in no runtime dependency and mutates no global state. A module that registers rules on import would make "import boundaries are clean" mean "and also, importing does work".
@@ -4016,6 +4016,203 @@ Also recorded, as consequences rather than assumptions: **`TSWAP-C001` gets ONE 
   - mypy strict over `yaml`/`jsonschema` boundaries needs explicit narrowing rather than `Any` leaking into typed code.
 - **Error behaviour:** n/a.
 - **Files:** `.importlinter`, plus fixes wherever needed.
+
+#### Confirmed contract details (2026-08-24)
+
+Behaviour 26 is the milestone's **closing hygiene** item, and it is the one behaviour whose subject is *"everything already works"*. That makes its red step the only genuinely hard question in it, so it is settled first and everything else is pinned as a transcription. Every fact below is checked against the branch as it stands after B25 — ten config modules, four `cli/` modules, `schema/compile.py`, the `tools/` fixtures, `scripts/gen_config_reference.py` and `docs/configuration.md`.
+
+**0. What is actually new here — one config file edit and one test file**
+
+The ledger's four expectations are **not** four pieces of work. Three of them are already true and already enforced by shipped machinery; exactly one names an artefact that does not exist yet.
+
+| Ledger expectation | State on the branch today | B26's work |
+|---|---|---|
+| `make lint` exits 0 (`ruff check src/`, `ruff format --check src/`, `mypy src/` strict) | **Already true** and already asserted by [`test_makefile.py`](tests/unit/test_makefile.py:75) (`make lint` exits 0 on the clean repo) and [`test_make_typecheck_exits_zero`](tests/unit/test_makefile.py:160) | **Nothing** — it is a *verification*, run in the green, not a new test |
+| import-linter passes | **Already true** for M0's two contracts, already asserted by [`test_lint_imports_exits_zero`](tests/unit/test_imports.py:303) | **Nothing** for the existing contracts |
+| **`config`/`schema` are leaves — add the contract** ([line 4013](plans/m1-configuration.md:4013)) | **The contract does not exist.** [`.importlinter`](.importlinter:1) has exactly two contracts, both about `tool_swap` ↔ `tool_swap_runtime` | **This is the whole of B26's green** (item 3) |
+| Suite green with **zero** warnings | **Already structurally guaranteed** — [`filterwarnings = ["error"]`](pyproject.toml:73) turns any warning into a failure (item 6) | **Nothing** — a verification |
+| Importing `validate.py` has no side effects | **Already covered** by three shipped tests (item 5) | **Nothing** — a citation, not a new test |
+| mypy strict over `yaml`/`jsonschema` boundaries | **Already true**; the two narrowing points are shipped (item 7) | **Nothing unless the final run surfaces a leak** |
+
+So: **`.importlinter` gains contracts 3 and 4, and `tests/unit/test_import_boundaries.py` is created. Nothing else is planned.** If the closing battery (item 8) surfaces a lint, type or warning failure, fixing it is in scope by definition — that is what *"plus fixes wherever needed"* means — but no such failure is predicted, and the plan does not pre-authorise a refactor dressed up as a fix (item 11).
+
+**1. The stale baseline number, and the honest invariant that replaces it**
+
+The ledger says *"the 206-test baseline is intact"*. **That number is stale and must not be transcribed into a test.** It is the `main` baseline recorded at intake ([line 7](plans/m1-configuration.md:7): *206 passed, 2 skipped*); the branch has since grown twenty-five behaviours of tests and now runs on the order of **1100 tests with a single skip** — the one surviving skip being [`test_include_symlinked_tool_dir_resolves`](tests/unit/config/test_includes.py:516)'s `skipif(not hasattr(os, "symlink"))`, which does *not* skip on Linux, plus [`test_version_import.py`'s](tests/unit/test_version_import.py:174) unconditional `mark.skip`. **The green step records the exact final counts in its commit message; no test asserts a count.**
+
+The reason is not laziness, it is that a hard-coded total is an **anti-test**: it fails on every subsequent behaviour that adds a test, and the only way to keep it green is to edit it, which is precisely the weakening it purports to prevent.
+
+**"The baseline is intact" is therefore pinned as two separate claims, one mechanical and one historical:**
+
+- **Mechanical (asserted, every run):** the full suite exits 0 with **zero** warnings and **zero** errors. `filterwarnings = ["error"]` and `--strict-markers` ([pyproject.toml:72-73](pyproject.toml:72)) make both of those exit-code properties, so `pytest` returning 0 *is* the assertion.
+- **Historical (not asserted, and cannot be):** every test that existed before this branch still passes **unmodified**. No test can assert this about itself — a test file that has been weakened passes just as happily as one that has not. It is a property of the **commit history**, verifiable by `git diff main -- tests/` at review time, and the milestone's own record of it is the plan: each of the six places where a committed test *was* touched (12a, 15.0, 19b, 21b's zero-edit constraint, B20's `TEST_DIRS` line, B23's fixtures) is argued for in writing, in its own commit, before the change. **B26 asserts nothing here and claims nothing new; it points at that record.** Pinned explicitly so no one writes a `test_baseline_count.py` in good faith.
+
+**2. `.importlinter` as shipped — the syntax B26 must mirror, verbatim**
+
+```ini
+[importlinter]
+root_packages =
+    tool_swap
+    tool_swap_runtime
+
+[importlinter:contract:1]
+name = Router and runtime are strictly separate
+type = forbidden
+source_modules = tool_swap
+forbidden_modules = tool_swap_runtime
+
+[importlinter:contract:2]
+name = Router and runtime are strictly separate (reverse)
+type = forbidden
+source_modules = tool_swap_runtime
+forbidden_modules = tool_swap
+```
+
+Four properties of that file are load-bearing for what follows and are stated so the green does not rediscover them:
+
+- **INI format, `[importlinter:contract:N]` sections numbered from 1.** The new contracts are therefore `:3` and `:4`. (The TOML form exists — [`test_imports.py`](tests/unit/test_imports.py:84) has a helper for it — but it is used only by that file's temp-dir fixtures. **The repo's own config stays INI.**)
+- **`source_modules` / `forbidden_modules`, one value per line when there are several**, using the same four-space continuation indent as `root_packages`.
+- **`root_packages` is the two distributions only.** `scripts/` is outside the graph, which is why B25 item 11 concluded it needs no contract; **that conclusion stands unchanged and B26 does not revisit it** ([line 3985](plans/m1-configuration.md:3985)). No third root package.
+- **`forbidden` contracts match a module *and its descendants*.** `forbidden_modules = tool_swap.cli` therefore covers `tool_swap.cli._pipeline` and every other submodule without enumerating them, and `source_modules = tool_swap.config` covers all ten config modules. This is what keeps the new contracts to four short blocks.
+
+**3. The exact contract blocks — two contracts, appended verbatim**
+
+```ini
+[importlinter:contract:3]
+name = The config layer is a leaf
+type = forbidden
+source_modules =
+    tool_swap.config
+    tool_swap.schema
+forbidden_modules =
+    tool_swap.cli
+    tool_swap.lifecycle
+    tool_swap.backend
+    tool_swap.proxy
+
+[importlinter:contract:4]
+name = The schema compiler does not depend on the pydantic config models
+type = forbidden
+source_modules =
+    tool_swap.schema
+forbidden_modules =
+    tool_swap.config.schema
+```
+
+**Why two and not one, and why not three.** The ledger's [line 4013](plans/m1-configuration.md:4013) and [line 4015](plans/m1-configuration.md:4015) state three rules; they collapse to two contracts:
+
+1. *"`config` and `schema` must not import `cli`/`lifecycle`/`backend`/`proxy`"* → **contract 3**, one block, because `forbidden` accepts a list on both sides and the two source packages share one forbidden set. Splitting it into a config-leaf and a schema-leaf contract would duplicate the four forbidden lines for no extra coverage.
+2. *"`schema` may import `config.errors` but **not** `config.schema`"* → **contract 4**, which *must* be its own block: its source set is `schema` alone and its forbidden module is a **submodule of a package the contract deliberately does not forbid wholesale**. Folding `tool_swap.config.schema` into contract 3's forbidden list would forbid `config.schema` to `tool_swap.config` itself — i.e. `config.validate` importing `config.schema`, which it does today at [`validate.py:44`](src/tool_swap/config/validate.py:44) — and the contract would fail instantly. **The two contracts are not separable; this is the reason.**
+3. *"`cli` may import `config` and `schema`"* → **no contract at all.** It is a *permission*, and import-linter's `forbidden` type expresses prohibitions only. A permission is enforced by the **absence** of a rule; writing a `layers` contract to express it would import a whole layering model the milestone has no other use for, and would then also have to rank `lifecycle`, `backend` and `proxy` — three packages that are empty `__init__.py` stubs today. **Declined, deliberately, and recorded here so B26 does not relitigate it.** Item 4's test asserts the permission is exercised, which is the cheap half of the same guarantee.
+
+**Naming.** The two names above are the **exact strings** the test asserts on (item 5) and the exact strings `lint-imports` prints. They follow M0's convention — a sentence describing the invariant, not a rule id.
+
+**4. Proof the contracts are TRUE at green — the grep, done, not assumed**
+
+A contract added blind fails the moment it is added. Every pair was checked against the shipped tree before being written down. **The complete set of `tool_swap`-internal imports under `src/` is 17 statements; they are enumerated here:**
+
+| Module | Imports `tool_swap.…` | Verdict against contracts 3 and 4 |
+|---|---|---|
+| [`config/errors.py`](src/tool_swap/config/errors.py:11) | **nothing** — `json`, `re`, `dataclasses`, `enum` only | leaf of the leaf |
+| [`config/origin.py`](src/tool_swap/config/origin.py:1), [`config/defaults.py`](src/tool_swap/config/defaults.py:1), [`config/suggest.py`](src/tool_swap/config/suggest.py:1) | nothing internal | clean |
+| [`config/interpolate.py`](src/tool_swap/config/interpolate.py:21) | `config.errors` | intra-package, allowed |
+| [`config/schema.py`](src/tool_swap/config/schema.py:24) | `config.errors`, `config.suggest` | intra-package, allowed |
+| [`config/loader.py`](src/tool_swap/config/loader.py:50) | `config.errors`, `config.interpolate` | intra-package, allowed |
+| [`config/resolver.py`](src/tool_swap/config/resolver.py:19) | `config.defaults`, `config.errors`, `config.origin` | intra-package, allowed |
+| [`config/validate.py`](src/tool_swap/config/validate.py:28) | `tool_swap.__version__`, `config.errors`, `config.origin`, `config.resolver`, `config.schema`, `config.suggest` | intra-package plus the root `__init__`; **the root package's `__init__.py` imports nothing** ([`__init__.py`](src/tool_swap/__init__.py:1) is a docstring and `__version__ = "0.1.0"`), so this pulls in no forbidden module even indirectly |
+| **[`schema/compile.py`](src/tool_swap/schema/compile.py:17)** | **NOTHING from `tool_swap` at all** — `copy`, `keyword`, `dataclasses`, `enum`, `typing`, `jsonschema` | **Both halves of the schema rule hold trivially.** It does not import `config.schema` (contract 4 passes) and it does not currently import `config.errors` either — the permission in [line 4015](plans/m1-configuration.md:4015) is real but **unexercised**, which B25 item 0 already established when it decided the compiler defines its own `SchemaDiagnostic` ([line 2101](plans/m1-configuration.md:2101)) |
+| [`cli/_pipeline.py`](src/tool_swap/cli/_pipeline.py:24) | `config.errors`, `config.loader`, `config.resolver`, `config.schema`, `config.validate` | the permitted direction |
+| [`cli/validate.py`](src/tool_swap/cli/validate.py:28) | `cli._pipeline`, five `config.*`, **`schema.compile`** | the permitted direction; the one place `schema` is consumed |
+| [`cli/config_show.py`](src/tool_swap/cli/config_show.py:34) | `cli._pipeline`, `cli.validate`, six `config.*` | the permitted direction |
+| [`cli/main.py`](src/tool_swap/cli/main.py:15) | `cli.config_show`, `cli.validate`, `tool_swap.__version__` | intra-`cli` |
+| [`__main__.py`](src/tool_swap/__main__.py:3) | `cli.main` | root, not a source module of either contract |
+| `lifecycle/`, `backend/`, `proxy/`, `api/`, `registry/`, `scheduler/`, `observability/`, `preflight/`, `utils/` | `utils/clock.py` is self-contained; the rest are empty stubs | nothing to violate |
+
+**Conclusion, stated as the green's precondition:** **no module under `config/` or `schema/` imports `cli`, `lifecycle`, `backend` or `proxy`, directly or indirectly, and `schema/compile.py` imports no `tool_swap` module whatsoever.** Both contracts pass the moment they are written. This is the M0 argument made concrete: *the contract is added while there is no code to violate it, because that is when it is cheapest.*
+
+**One consequence worth naming:** contract 4 is, today, **vacuously satisfiable** — `tool_swap.schema` has one module and it imports nothing internal. It is still worth its four lines, because the thing it prevents is exactly the thing a future contributor would do by reflex: reach for `RootConfig`/`ToolConfig` from inside the compiler. The contract is a note to that contributor, enforced.
+
+**5. The RED — `tests/unit/test_import_boundaries.py`, five tests, all failing cleanly**
+
+This is the decision the behaviour needed. **The red is option (a): a new test file that names the expected contracts and fails because they are absent.** Option (b) — declaring B26 a green-only verification step — is **rejected**, for a reason stronger than the pipeline's red-per-behaviour rule: [`test_imports.py`](tests/unit/test_imports.py:303) runs `lint-imports` over *whatever the config contains*, so **deleting a contract from `.importlinter` keeps the whole suite green**. Without a test that names the contracts, the artefact B26 ships is unprotected the day after it lands. The test is not a formality to satisfy a process; it is the only thing that makes *"add the contract"* a durable statement.
+
+**A new file, not an addition to [`test_imports.py`](tests/unit/test_imports.py:1).** That file is behaviour 7's, owned by M0, and its docstring names its three M0 guarantees; growing it with M1 contracts blurs which milestone owns which assertion. The new file imports nothing from it and duplicates the one helper it needs (item 5's `_lint_imports_bin` note).
+
+| # | Test | Asserts | At red |
+|---|---|---|---|
+| 1 | `test_the_expected_contract_names_are_exactly_the_shipped_ones` | Parse [`.importlinter`](.importlinter:1) with `configparser`; collect every `[importlinter:contract:N]` section's `name`; assert the **set** equals the four-name literal `_EXPECTED_CONTRACTS` (M0's two + B26's two, quoted verbatim from item 3). Failure message prints missing and unexpected names separately | **FAILS** — two names missing. A set-difference assertion failure on a parsed file: no import, no subprocess, **collects cleanly** |
+| 2 | `test_the_config_layer_contract_forbids_all_four_downstream_packages` | The section named *"The config layer is a leaf"* has `source_modules` = `{tool_swap.config, tool_swap.schema}` and `forbidden_modules` = `{tool_swap.cli, tool_swap.lifecycle, tool_swap.backend, tool_swap.proxy}`, compared as **sets of stripped lines** | **FAILS** — `KeyError`/`pytest.fail` on the absent section, via an explicit lookup helper that fails with the section list rather than raising |
+| 3 | `test_the_schema_compiler_contract_forbids_the_pydantic_models` | The section named *"The schema compiler does not depend on the pydantic config models"* has `source_modules == {tool_swap.schema}` and `forbidden_modules == {tool_swap.config.schema}`. **Plus the pin that makes contract 4 non-trivial**: `tool_swap.config.errors` is **not** in any contract's forbidden set — the permission of [line 4015](plans/m1-configuration.md:4015), asserted as an absence | **FAILS** — absent section |
+| 4 | `test_lint_imports_reports_every_contract_kept` | Run `lint-imports --config .importlinter` in a subprocess with `PYTHONPATH=src`; assert exit 0 **and** that the output names **all four** contracts and reports `4 kept, 0 broken`. The count is read from the tool's own summary line, so a silently-dropped contract fails here even if the name check were relaxed | **FAILS** — the summary says `2 kept` and the two new names are absent from the output |
+| 5 | `test_the_cli_actually_imports_the_config_layer` | The permitted direction is **exercised**, not merely unforbidden: `tool_swap.cli._pipeline` is imported and asserted to have pulled `tool_swap.config.loader` and `tool_swap.config.schema` into `sys.modules`, and `tool_swap.cli.validate` likewise for `tool_swap.schema.compile` | **PASSES at red** — it is a property of shipped code (the [line 4015](plans/m1-configuration.md:4015) permission). Written anyway, and recorded here as passing, on the B25 item 9 precedent for self-contained invariant tests |
+
+**Red-step accounting, stated plainly:** **four of the five fail; none fails as a collection error; test 5 passes at red.** Tests 1–3 are assertion failures against a parsed INI file. Test 4 is a subprocess exit-code failure. There is no import of a not-yet-written module anywhere in the file, so the collection phase is clean — the property B23 and B25's red accounting both insisted on.
+
+**The `lint-imports` invocation is copied from the shipped precedent, not reinvented:** [`_lint_imports_bin()`](tests/unit/test_imports.py:28) tries `.venv/bin/lint-imports`, then `shutil.which`, then `python -c "from importlinter.cli import lint_imports_command; …"`, and the run passes `PYTHONPATH=src` with `cwd=ROOT` and `timeout=120` ([test_imports.py:288-301](tests/unit/test_imports.py:288)). **The new file copies that helper verbatim** rather than importing it across test modules. *(Noted for the green, as a pre-existing defect the coder will see: [`_lint_imports_bin`](tests/unit/test_imports.py:48) references `sys.executable` in its last branch but [`test_imports.py`](tests/unit/test_imports.py:13) never imports `sys` — the branch is dead on this machine because `.venv/bin/lint-imports` exists, but the copy in the new file must `import sys`. Fixing it in the M0 file is a one-line import addition and is **in scope** under "fixes wherever needed"; leaving it is also defensible. Flagged, not decided.)*
+
+**6. "Zero warnings" — already an exit-code property, and what the green actually checks**
+
+[`filterwarnings = ["error"]`](pyproject.toml:73) means a warning **is** a failure: a suite that exits 0 emitted no un-suppressed warning, by construction. The pytest summary line can therefore never read `N warnings` for a passing run — and this is itself already tested, twice, by [`TestFilterWarningsAsError`](tests/unit/test_pytest_config.py:242) (the setting is present; a fixture emitting `DeprecationWarning` under the repo's own config fails).
+
+Two things the green must nonetheless **look at**, because "zero warnings" has one loophole and one non-warning cousin:
+
+- **Locally-suppressed warnings are invisible to the exit code.** The suite has exactly one place that suppresses deliberately: [`test_metaschema.py`](tests/unit/schema/test_metaschema.py:206) wraps `warnings.catch_warnings()` + `simplefilter("error")` around a `jsonschema.validator_for` probe, to *prove* the shipped path avoids the deprecated call. That is a warning being **asserted**, not hidden, and it is correct. **No other `catch_warnings`, `simplefilter`, `pytest.warns` or per-test `filterwarnings` mark exists anywhere in `tests/`** — checked. Nothing is being swept under a rug.
+- **The summary's non-warning notes.** A green run's last line is `N passed, M skipped` — the skips being [`test_include_symlinked_tool_dir_resolves`](tests/unit/config/test_includes.py:516) (conditional, does not skip on Linux) and [`test_version_import.py`](tests/unit/test_version_import.py:174)'s unconditional `mark.skip`. **Skips are not warnings** and the ledger's "zero warnings" does not touch them. The green records the counts; it does not chase them to zero.
+
+**If the closing run does show a warning count**, the loophole above is where to look first, and the fix is the warning's own fix — never a `filterwarnings` entry added to `pyproject.toml` to silence it (item 11).
+
+**7. The other two ledger bullets — where they are already discharged**
+
+- **"Importing `validate.py` has no side effects"** ([line 4014](plans/m1-configuration.md:4014)) is covered **three times over** and **B26 adds no test for it**:
+  1. [`test_fresh_interpreter_starts_with_an_empty_registry`](tests/unit/config/test_validate_registry.py:685) — the behaviour-11 fresh-interpreter test the ledger names. Spawns `sys.executable -c "import tool_swap.config.validate; assert registered_rule_ids() == []"`, asserts exit 0. **This is the executable form of the ledger's claim** and it is shipped and green.
+  2. [`test_importing_validate_leaves_the_registry_unchanged`](tests/unit/config/test_validate_registry.py:668) — in-process `importlib.import_module`, registry still empty, `RULES == ()`.
+  3. [`test_ordinary_re_import_leaves_the_registry_unchanged`](tests/unit/config/test_validate_registry_builtins.py:275) — the same after `register_builtin_rules()` has run, i.e. re-import does not double-register.
+  The ledger's phrasing is broader than test 1 strictly asserts (*"pulls in no runtime dependency and mutates no global state"* vs *"the registry is empty"*). **The gap is deliberate and is not closed by B26.** The "no runtime dependency" half is contract 3's job as of this behaviour — an import of `tool_swap_runtime` is already M0 contract 1's job, and an import of `cli`/`lifecycle`/`backend`/`proxy` becomes a contract violation the moment the new block lands. The "no global state" half beyond the registry is unbounded as stated and untestable as written; the registry is the only module-level mutable state `validate.py` has. Recorded so the citation is honest rather than generous.
+- **mypy strict over the `yaml`/`jsonschema` boundaries** ([line 4016](plans/m1-configuration.md:4016)) is **already satisfied** and needs no code. The two boundary points are shipped and visible: `jsonschema` is imported with an explicit `# type: ignore[import-untyped]` carrying a reason — *"jsonschema 4.26 ships no py.typed"* ([`compile.py:25`](src/tool_swap/schema/compile.py:25)) — and `yaml` is typed via `types-PyYAML` in the dev extra ([pyproject.toml:44](pyproject.toml:44)), with `safe_load`'s `Any` narrowed in the loader as [behaviour 1](plans/m1-configuration.md:62) required. `make lint` runs `mypy src/` under `strict = true` ([pyproject.toml:59-61](pyproject.toml:61)) and exits 0. **The test form of this bullet is mypy itself**; B26 writes nothing new for it. *(The one `type: ignore` is narrow, module-scoped and reasoned — the plan's standing objection is to blanket ignores, not to a single annotated one at an untyped third-party boundary.)*
+
+**8. The GREEN — one commit, and the closing verification battery**
+
+**GREEN = `.importlinter` gains contracts 3 and 4 (item 3, transcribed).** That is the entire source-side diff, ten lines of INI.
+
+The green then runs the **closing battery**, which is B26's real deliverable as a milestone-completion gate. Each command, and what its result must be:
+
+| # | Command | Required result |
+|---|---|---|
+| 1 | `make lint` | exit 0 — `ruff check src/`, `ruff format --check src/`, `mypy src/` strict, all clean ([Makefile:14-17](Makefile:14)) |
+| 2 | `.venv/bin/lint-imports` | exit 0, **`4 kept, 0 broken`**, all four contract names printed |
+| 3 | `.venv/bin/python -m pytest` | exit 0, **zero warnings** (item 6), zero errors; the pass/skip counts recorded verbatim in the commit message |
+| 4 | `.venv/bin/python -m pytest tests/unit/test_import_boundaries.py -v` | the five tests of item 5, all passing |
+| 5 | `.venv/bin/python -m pytest tests/unit/config/test_validate_registry.py::test_fresh_interpreter_starts_with_an_empty_registry -v` | passing — the item-7 citation, run explicitly so the ledger's bullet has a named green result rather than an implicit one |
+| 6 | `git diff main --stat -- tests/` | reviewed by eye, not asserted: the item-1 historical claim. The only committed-test edits are the six the plan argued for |
+
+**No CI change.** The workflow already runs *Run lint* and *Run import-linter* as separate steps ([line 3491](plans/m1-configuration.md:3491)), and B24 added the `tswap validate` step. The new contracts are picked up by the existing import-linter step with no edit, and test 4 is picked up by `make test`. **Nothing in `.github/workflows/ci.yml` is touched by B26** — worth stating, since a behaviour named "everything stays clean" invites a defensive CI addition.
+
+**9. Does the contract "bite"? — the M0 precedent, and what B26 pins**
+
+M0 **did** prove its contracts non-vacuous, and the mechanism is worth reading before copying: [`TestImportLinterViolationFixture`](tests/unit/test_imports.py:329) builds **synthetic packages in a `TemporaryDirectory`** (`test_source` importing `test_forbidden`), writes a **generated `.importlinter`** naming them as root packages, runs `lint-imports` with `PYTHONPATH` pointed at the temp tree, and asserts non-zero exit plus both module names in the output — with a clean-tree counterpart asserting exit 0 and a reverse-direction case. Five tests, and the class docstring states the motive exactly: *"Without it, an empty config passes trivially and the contract has no enforceable behaviour."*
+
+**What that precedent does and does not establish.** It proves **the tool bites** — that `forbidden` contracts detect violations and name them. It does **not** prove *these* contracts bite, because the fixture never touches `tool_swap`. A genuine biting probe for contract 3 would require writing a real violating import into `src/tool_swap/config/` (a root package of the repo's own config), running the linter, and reverting — a test that mutates the source tree, and that fails destructively if it crashes mid-way. **Declined.**
+
+**B26 pins the middle position, and it is stronger than M0's:**
+
+- **Not re-proved:** that `forbidden` contracts detect violations in general. M0's five fixture tests cover it and they run in every suite; duplicating them for M1 would assert import-linter's behaviour a second time.
+- **Proved, and this is new:** that the four contracts are **present by name and enforced** (tests 1–4), and that the **permitted** direction is genuinely exercised by shipped code (test 5) — so the leaf rule is a live constraint on a real dependency edge, not a rule about an edge nobody draws. Test 4's `4 kept` count is the specific guard against the vacuity M0's docstring warns about: a contract deleted, renamed or typo'd into inertness fails it.
+- **Explicitly not claimed:** that a violation of contract 3 or 4 has been *observed* to fail. If a future behaviour wants that, the honest way is a synthetic fixture on M0's model with a two-package temp tree mirroring the `config`/`cli` shape — cheap to add, and **not** added now, because it would test the tool rather than the codebase.
+
+**10. Assumptions — none, and why**
+
+**B26 introduces no new assumption and needs nothing from [issue #2](https://github.com/iar3-r8/tool-swap/issues/2).** Every decision above is mechanical: the contract syntax is read off the shipped file, the contract *content* is dictated word-for-word by ledger lines 4013 and 4015, its truth at green is established by the item-4 enumeration, the zero-warnings claim is a shipped `pyproject.toml` setting, and the side-effect and mypy bullets cite shipped tests and shipped code. The only genuine judgement calls are **two contracts rather than one** (item 3, forced — folding them breaks `config.validate`'s own import), the **stale 206 baseline reinterpreted rather than transcribed** (item 1), and **no biting probe for the new contracts** (item 9) — all three argued in place, none of them changing the config format, a diagnostic code, the CLI surface or a DoD item. Three small items are flagged for the coder's judgement rather than pinned: the dead `sys.executable` branch in M0's helper (item 5), whether `schema/compile.py`'s unexercised `config.errors` permission is worth a comment in the contract file (it is not — a contract file should not document imports that do not exist), and the exact final test counts, which only the green can know.
+
+**11. What this behaviour must NOT do**
+
+- **No refactor.** B26 is a gate, not a cleanup. If `make lint` passes, nothing in `src/` is touched — a *"while I was in there"* change at the end of a milestone is invisible in review and has no test behind it.
+- **No `filterwarnings` entry added to `pyproject.toml`.** If a warning surfaces, the warning is fixed. Adding an ignore is the one change that would make the ledger's "zero warnings" false while turning the suite green.
+- **No hard-coded test count anywhere** (item 1).
+- **No third root package in `.importlinter`, no `scripts/__init__.py`** — B25 item 11 settled both ([line 3987](plans/m1-configuration.md:3987)) and B26 is where they would be reopened.
+- **No `layers` contract.** The permitted direction is expressed by the absence of a prohibition (item 3, point 3).
+- **No amendment to [`test_imports.py`](tests/unit/test_imports.py:1)** beyond, at most, the one-line `import sys` fix. M0's file keeps M0's guarantees.
+- **No CI step, no `make` target** (item 8).
+- **No weakening of any committed test to make the battery green.** If a shipped test fails at the gate, that is a finding to report, not an assertion to soften — the whole value of the item-1 historical claim rests on this last line.
 
 ---
 
@@ -4102,7 +4299,8 @@ scripts/
 |---|---|---|
 | `pyproject.toml` | add pydantic, pyyaml, python-dotenv, jsonschema, types-PyYAML | 1 |
 | `src/tool_swap/__main__.py` | reduced to `from tool_swap.cli.main import app, main` re-exports, preserving the `tswap` entry point and `from tool_swap.__main__ import app` in the existing tests | 21 |
-| `.importlinter` | new contract: `config`/`schema` are leaves | 26 |
+| `.importlinter` | **two** new `forbidden` contracts — *"The config layer is a leaf"* (contract 3) and *"The schema compiler does not depend on the pydantic config models"* (contract 4); verbatim in B26's contract block, item 3 | 26 |
+| `tests/unit/test_import_boundaries.py` | new — the four expected contract names, their exact source/forbidden sets, `lint-imports` reporting `4 kept`, and the exercised `cli` → `config`/`schema` direction (B26's red, item 5) | 26 |
 | `.github/workflows/ci.yml` | assert `tools.example.yaml` validates under `--strict` | 24 |
 | `README.md` | configuration section | 25 |
 
