@@ -19,8 +19,9 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 del _ROOT, _p
 
 import asyncio
+import re
 import time
-from typing import runtime_checkable, TYPE_CHECKING
+from typing import TYPE_CHECKING, runtime_checkable
 
 import pytest
 
@@ -38,6 +39,48 @@ if TYPE_CHECKING:
     from typing import Protocol
 else:
     Protocol = object  # fallback — not used at runtime by this stub
+
+
+# Raw string: ``\x1b`` is interpreted by the REGEX engine (the ESC
+# character), not by the Python string parser, so no invalid-escape
+# warnings (the suite runs with ``filterwarnings = ["error"]``).
+#
+# The CSI final byte must be the full ``[@-~]`` (0x40-0x7E) range, NOT
+# just ``[A-Z]``: the SGR terminators are lowercase (``m``), so an
+# uppercase-only class silently leaves ``ESC[1m``/``ESC[0m`` in place.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[@-~]"  # CSI sequences, e.g. ESC[1m, ESC[0m, ESC[2J
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL / OSC ... ST
+    r"|\x1b[()][0-9A-B]"  # character-set selection
+    r"|\x1b[>=]"  # keypad modes
+    r"|\x1b[78]"  # save/restore cursor position
+)
+
+
+def normalize_help_output(text: str) -> str:
+    """Strip ANSI escapes and collapse all whitespace runs to single spaces.
+
+    Shared by the CLI ``--help`` smoke tests (imported via
+    ``from conftest import normalize_help_output`` — see those modules).
+    On GitHub Actions
+    (``GITHUB_ACTIONS=true``) typer's ``rich_utils`` freezes
+    ``FORCE_TERMINAL=True`` at module-import time, so Rich styles the help
+    text — ``CliRunner(env=...)`` cannot stop it because the env is applied
+    at ``invoke()`` time, long after import. Two independent things then
+    break substring/line-anchor assertions, so BOTH must be normalised:
+
+    1. ANSI escapes are injected mid-token (``\\x1b[1m--config\\x1b[0m``), so
+       ``"--config" in stdout`` is literally ``False``;
+    2. line wrapping moves a flag's description onto a continuation line, so
+       ``(?m)^.*--config\\b.{10,}$``-style anchors fail even after the
+       escapes are stripped.
+
+    The result is a single whitespace-collapsed, escape-free line on which
+    whole-token membership checks (``"flag" in normalized``) are stable for
+    any terminal width or colour state.
+    """
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    return " ".join(stripped.split())
 
 
 class ManualClock:

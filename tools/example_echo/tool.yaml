@@ -1,0 +1,12 @@
+name: example_echo
+version: "0.1.0"
+description: Echo the text you send it back, unchanged.
+handler: handler.py:EchoHandler
+
+runtime:
+  requirements: requirements.txt
+
+inputs:
+  - name: text
+    type: string
+    description: The text to echo back, unchanged.

@@ -1,0 +1,128 @@
+# ============================================================================
+# tools.example.yaml — a complete, validated tool-swap configuration.
+#
+# Every key below is documented in docs/configuration.md (the generated
+# reference).  This file is validated in CI with
+# `tswap validate --config tools.example.yaml --strict`, so it is guaranteed
+# to be free of errors AND warnings: copy from it freely.
+#
+# Every ${VAR:-} carries a default, so the file validates with an empty
+# environment.  Every path it names exists in this repository.
+# ============================================================================
+
+version: 1                          # config schema version; only 1 is understood
+
+# ---------------------------------------------------------------------------
+# Router: the always-on HTTP entry point
+# ---------------------------------------------------------------------------
+router:
+  host: 0.0.0.0
+  port: 8600
+  log_level: INFO                   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_dir: ./logs
+  log_json: true
+  cors_origins: ["*"]
+  auth_token: ${TSWAP_TOKEN:-}      # if set, require Authorization: Bearer <token>
+  status_page: true
+
+# ---------------------------------------------------------------------------
+# Container backend
+# ---------------------------------------------------------------------------
+backend:
+  type: docker
+  network: tool-swap-net
+  container_prefix: ms-
+  label_namespace: com.tool-swap
+  gpu_runtime: nvidia
+  orphans: stop                     # stop | adopt | ignore
+  port_range: [7000, 7999]
+  registry_prefix: tool-swap
+
+# ---------------------------------------------------------------------------
+# Defaults inherited by every tool. Any key here can be overridden per tool.
+# NOTE: devices: is deliberately NOT set here — a defaults-level devices:
+# outranks a group's devices:, which would silently empty every group's
+# GPU assignment below.
+# ---------------------------------------------------------------------------
+defaults:
+  # --- lifecycle / TTL ---
+  ttl: 900                          # idle seconds -> stop container (ADR-0004)
+  keep_warm: false
+  autostart: true
+
+  # --- resources ---
+  group: cpu                        # tools that do not name a group land here
+  cpus: null
+  memory: null
+  shm_size: "1g"
+
+  # --- batching ---
+  max_batch_size: 8
+  max_wait_ms: 20
+  workers: 1
+  runtime_server: bentoml           # bentoml (v1) | native (not implemented)
+
+  # --- timeouts (seconds) ---
+  start_timeout: 120
+  ready_timeout: 600
+  queue_timeout: 300
+  request_timeout: 300
+  drain_timeout: 30
+  stop_timeout: 30
+  max_queue_depth: 64
+
+  # --- health probing ---
+  health_path: /health
+  ready_path: /ready
+  probe_interval: 1.0
+
+  # --- environment and storage applied to EVERY tool ---
+  env:
+    HF_HOME: /weights/hf
+    HF_TOKEN: ${HF_TOKEN:-}
+  mounts:
+    # A repo-relative default keeps this example valid on a clean checkout;
+    # point TSWAP_MODELS_DIR at your real weights cache to use it for real.
+    - ${TSWAP_MODELS_DIR:-./models}:/weights/hf:ro
+
+# ---------------------------------------------------------------------------
+# Scheduling groups. A group caps how many of its members may run at once.
+# Every group defined here is referenced by a tool below (TSWAP-C223).
+# ---------------------------------------------------------------------------
+groups:
+  cpu:
+    max_resident: 2                 # matches the two CPU tools below
+    eviction: lru                   # lru | lifo | none
+  gpu0:
+    max_resident: 1                 # one tool on this GPU at a time -> swapping
+    devices: [0]
+    eviction: lru
+
+# ---------------------------------------------------------------------------
+# Tools — one of each of the three documented forms
+# (docs/configuration-guide.md, "Three ways to define a tool")
+# ---------------------------------------------------------------------------
+tools:
+
+  # --- (a) defined in its own directory (the simple path, and the usual one) ---
+  # Its description, handler and requirements come from the directory's
+  # tool.yaml, so this entry needs none of them.
+  example_echo:
+    path: ./tools/example_echo
+    ttl: 600                        # inline overrides beat defaults:
+
+  # --- (b) defined fully inline (no separate tool.yaml) ---
+  example_add:
+    handler: ./tools/example_add/handler.py:AddHandler
+    requirements: ./tools/example_add/requirements.txt
+    description: Add two numbers and return their sum.
+    max_batch_size: 32
+    max_wait_ms: 50
+
+  # --- (c) our runtime, but the author supplies the Dockerfile ---
+  example_build:
+    build:
+      context: ./tools/example_build
+      dockerfile: Dockerfile        # must install tool-swap-runtime
+    description: A tool whose image is built from its own Dockerfile.
+    group: gpu0

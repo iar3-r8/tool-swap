@@ -1,0 +1,1 @@
+# No third-party dependencies: the echo tool uses only the standard library.

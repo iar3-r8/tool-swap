@@ -14,3 +14,23 @@ name = Router and runtime are strictly separate (reverse)
 type = forbidden
 source_modules = tool_swap_runtime
 forbidden_modules = tool_swap
+
+[importlinter:contract:3]
+name = The config layer is a leaf
+type = forbidden
+source_modules =
+    tool_swap.config
+    tool_swap.schema
+forbidden_modules =
+    tool_swap.cli
+    tool_swap.lifecycle
+    tool_swap.backend
+    tool_swap.proxy
+
+[importlinter:contract:4]
+name = The schema compiler does not depend on the pydantic config models
+type = forbidden
+source_modules =
+    tool_swap.schema
+forbidden_modules =
+    tool_swap.config.schema

@@ -1,0 +1,3550 @@
+"""Validator skeleton: a rule registry that reports every finding at once.
+
+M1 behaviour 11 (``plans/m1-configuration.md`` §1): validation is a set of
+rules over the resolved config, and ``validate_config`` runs **every**
+registered rule, aggregates **all** diagnostics into ONE ``ConfigReport``
+(never stopping at the first error), and serves them in the behaviour-2
+``(file, line or 0, code)`` order.  A rule whose ``check`` raises is caught
+and reported as a single internal diagnostic instead of crashing the whole
+command.  Behaviour 12 lands the name and group rules (``TSWAP-C210`` …
+``TSWAP-C223``) as the first entries of ``BUILTIN_RULES``; behaviours 13-19
+add the rest of the real ``§6`` rules, which M5 *moves* into preflight
+rather than reimplementing (guardrail 13).  Importing this module still
+registers nothing (behaviour 11a, Option B).  It is the last configuration
+stage: every rule reads the resolver's ``ResolvedTool`` output and returns
+diagnostics, and the CLI runs all registered rules in one pass.
+"""
+
+from __future__ import annotations
+
+import copy
+import keyword
+import os
+import re
+import string
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Final, TypeGuard
+
+from tool_swap import __version__
+from tool_swap.config.errors import (
+    ConfigReport,
+    Diagnostic,
+    Location,
+    Severity,
+)
+
+# ``RESERVED_KEYS`` is defined in the resolver (behaviour 14, block 2) and
+# re-exported here as part of this module's pinned public API (the
+# behaviour-14 test file imports it from ``validate``).
+from tool_swap.config.origin import OriginLevel
+from tool_swap.config.resolver import (  # noqa: F401  (re-export)
+    RESERVED_KEYS,
+    ResolvedTool,
+)
+from tool_swap.config.schema import BackendConfig, GroupConfig
+from tool_swap.config.suggest import nearest_alternative
+
+#: Diagnostic code format; a rule id IS the code its diagnostics carry
+#: (mirrors :class:`~tool_swap.config.errors.Diagnostic`).
+_CODE_PATTERN: Final[re.Pattern[str]] = re.compile(r"TSWAP-[CS]\d{3}")
+
+#: Internal diagnostic emitted when a rule's ``check`` raises (behaviour 11).
+_INTERNAL_RULE_CODE: Final[str] = "TSWAP-C999"
+
+#: Location of the internal diagnostic: the config file as a whole.
+_INTERNAL_REMEDY: Final[str] = (
+    "Re-run tool-swap after fixing the validator rule, or file a bug naming "
+    "the failing rule id; the config itself may still be valid."
+)
+
+
+class _RuleRegistry:
+    """The live module-level rule registry (``RULES``).
+
+    A single mutable object, mutated in place by :func:`register` and
+    :func:`unregister_all`, so every reference to the module-global
+    ``RULES`` — including names captured earlier by ``from ... import
+    RULES`` — always observes the current contents.  Compares equal to a
+    tuple exactly when its contents equal that tuple (in both comparison
+    directions).
+    """
+
+    def __init__(self) -> None:
+        """Start with no rules registered."""
+        self._rules: list[Rule] = []
+
+    def __eq__(self, other: object) -> bool:
+        """Compare against a tuple of rules by contents, in order.
+
+        Args:
+            other: the object to compare against.
+
+        Returns:
+            True when ``other`` is a sequence of the same rules in the
+            same order; NotImplemented otherwise.
+        """
+        if not isinstance(other, Sequence) or isinstance(other, (str, bytes)):
+            return NotImplemented
+        return tuple(self._rules) == tuple(other)
+
+    def __iter__(self) -> Iterator[Rule]:
+        """Yield the registered rules in registration order."""
+        return iter(self._rules)
+
+    def __len__(self) -> int:
+        """Return the number of registered rules."""
+        return len(self._rules)
+
+    def __bool__(self) -> bool:
+        """True iff at least one rule is registered."""
+        return bool(self._rules)
+
+    def __repr__(self) -> str:
+        """Render as the tuple of the registered rules."""
+        return f"({', '.join(repr(rule) for rule in self._rules)})"
+
+
+@dataclass(frozen=True)
+class Rule:
+    """One validation rule over a :class:`ValidatedConfig`.
+
+    A rule is a registered object with an ``id`` (which IS its diagnostic
+    code), a mandatory non-empty ``remedy``, a default ``severity``, and a
+    ``check`` method.  This is deliberately the shape M5's preflight
+    ``Check`` protocol uses, so M5 *moves* these rules instead of
+    reimplementing them (guardrail 13).  Field order is pinned so
+    subclasses may add trailing defaulted fields.
+
+    Attributes:
+        id: Diagnostic code matching ``TSWAP-[CS]\\d{3}``.
+        remedy: The rule's default remedy text; mandatory, non-empty.
+        severity: The rule's default severity (``Severity.ERROR``).
+    """
+
+    id: str
+    remedy: str
+    severity: Severity = Severity.ERROR
+
+    def __post_init__(self) -> None:
+        """Validate the ``id`` code format and mandatory ``remedy``.
+
+        Raises:
+            ValueError: if ``id`` does not match ``TSWAP-[CS]\\d{3}`` or
+                ``remedy`` is empty or whitespace-only.
+        """
+        if _CODE_PATTERN.fullmatch(self.id) is None:
+            raise ValueError(
+                "Rule id must match pattern 'TSWAP-[CS]\\d{3}' "
+                f"(a code starting with 'TSWAP-'); got {self.id!r}"
+            )
+        if not self.remedy.strip():
+            raise ValueError("Rule 'remedy' must be a non-empty string.")
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Run the rule; the base implementation finds nothing.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            The diagnostics this rule found (``[]`` by default).
+        """
+        del config
+        return []
+
+
+def _no_line(_path: str) -> int | None:
+    """Default ``line_for``: no line information is available."""
+    return None
+
+
+def _real_is_file(path: Path) -> bool:
+    """Real-filesystem ``is_file`` predicate (``OSError`` swallowed).
+
+    A permission denial, an overlong path or a broken symlink loop answers
+    ``False`` rather than escaping a rule as a ``TSWAP-C999`` crash: the
+    honest answer is "I could not see that file", which the rules'
+    "does not exist" messages already convey.
+
+    Args:
+        path: the path to test.
+
+    Returns:
+        True when ``path`` is an existing regular file.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _real_is_dir(path: Path) -> bool:
+    """Real-filesystem ``is_dir`` predicate (``OSError`` swallowed).
+
+    Args:
+        path: the path to test.
+
+    Returns:
+        True when ``path`` is an existing directory.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+@dataclass(frozen=True)
+class FileProbe:
+    """The ONLY filesystem contact the config layer has (behaviour 15).
+
+    Every rule that needs disk knowledge goes through this object,
+    carried on :class:`ValidatedConfig`, so ``validate_config`` stays a
+    pure function of its input and tests inject dict-backed fakes.
+
+    Attributes:
+        is_file: reports an existing regular file (default:
+            ``Path.is_file``, ``OSError`` swallowed to ``False``).
+        is_dir: reports an existing directory (default:
+            ``Path.is_dir``, ``OSError`` swallowed to ``False``).
+    """
+
+    is_file: Callable[[Path], bool] = _real_is_file
+    is_dir: Callable[[Path], bool] = _real_is_dir
+
+
+#: The real-filesystem probe: a no-arg :class:`FileProbe` IS the real
+#: filesystem, and it is the default every :class:`ValidatedConfig`
+#: carries (behaviour 15, item 1).
+REAL_FILESYSTEM: Final[FileProbe] = FileProbe()
+
+
+@dataclass(frozen=True)
+class ValidatedConfig:
+    """The resolved configuration a rule's ``check`` is run against.
+
+    Frozen and constructible directly (no loader, no filesystem), so tests
+    can build fakes.  ``validate_config`` must not mutate it or its nested
+    data.
+
+    Attributes:
+        tools: name -> :class:`~tool_swap.config.resolver.ResolvedTool`.
+        raw: the raw root YAML mapping.
+        line_for: maps a dotted YAML path to a 1-based source line or
+            ``None``.
+        path: the config file path.
+        probe: the filesystem predicates the rules may consult (default:
+            :data:`REAL_FILESYSTEM`); behaviour 15's trailing,
+            keyword-only, defaulted field.
+        gpu_count: the GPUs visible on this host, or ``None`` when
+            unknown (default); behaviour 16's trailing, keyword-only,
+            defaulted field.  Nothing in M1 populates it, so ``TSWAP-C521``
+            is skipped silently in production.
+        home: the home directory ``~`` expansion uses, or ``None`` for the
+            REAL home (default); behaviour 17's trailing, keyword-only,
+            defaulted field.  ``None`` lets ``parse_mount`` read the real
+            ``$HOME`` via :meth:`Path.expanduser`; an injected ``Path``
+            replaces a leading ``~`` literally, keeping the rules pure.
+    """
+
+    tools: dict[str, ResolvedTool]
+    raw: dict[str, object]
+    line_for: Callable[[str], int | None] = field(default=_no_line, kw_only=True)
+    path: Path = field(default=Path("tools.yaml"), kw_only=True)
+    probe: FileProbe = field(default=REAL_FILESYSTEM, kw_only=True)
+    gpu_count: int | None = field(default=None, kw_only=True)
+    home: Path | None = field(default=None, kw_only=True)
+
+
+#: The module-level registry of rules.  A single live object (not a
+#: rebindable tuple): ``register`` / :func:`unregister_all` mutate it in
+#: place, so ``from tool_swap.config.validate import RULES`` always
+#: reflects the current contents; it compares equal to a tuple of the
+#: registered rules.
+RULES: Final[_RuleRegistry] = _RuleRegistry()
+
+
+def register(rule: Rule) -> None:
+    """Register a rule; a duplicate id is rejected.
+
+    Args:
+        rule: the rule to append to the registry.
+
+    Raises:
+        ValueError: if ``rule.id`` is already registered; the registry is
+            left unchanged.
+    """
+    if rule.id in (r.id for r in RULES):
+        raise ValueError(
+            f"Rule with id {rule.id!r} is already registered; "
+            "each rule id may be registered only once."
+        )
+    RULES._rules.append(rule)
+
+
+def registered_rule_ids() -> list[str]:
+    """Return the registered rule ids in registration order.
+
+    Returns:
+        A fresh list of the rule ids; mutating the result does not mutate
+        the registry.
+    """
+    return [rule.id for rule in RULES]
+
+
+def unregister_all() -> None:
+    """Clear the registry in place (deterministic test isolation)."""
+    RULES._rules.clear()
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 12 — names, duplicates and group references (§6 rules 2, 3)
+# ---------------------------------------------------------------------------
+
+#: The pinned C210 reason phrase (plan, behaviour 12).
+_URLS_REASON: Final[str] = "used in URLs, container names and log directory names"
+
+#: A valid tool name: a lowercase letter or digit first, then a run of
+#: lowercase letters, digits, ``_`` and ``-`` (TSWAP-C210).
+_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+#: Every character a tool name may contain.
+_ALLOWED_NAME_CHARS: Final[frozenset[str]] = frozenset(
+    string.ascii_lowercase + string.digits + "_-"
+)
+
+#: The group a tool resolves to when its ``group`` entry is absent.
+_DEFAULT_GROUP: Final[str] = "default"
+
+#: The synthesized ``default`` group used when ``groups:`` is absent; the
+#: values are read from :class:`~tool_swap.config.schema.GroupConfig`'s
+#: field defaults so the synthesis cannot drift from the schema.
+_SYNTHESISED_DEFAULT_GROUP: Final[dict[str, int | str]] = {
+    "max_resident": int(GroupConfig.model_fields["max_resident"].default),
+    "eviction": str(GroupConfig.model_fields["eviction"].default),
+}
+
+#: The legal ``groups.*.eviction`` values (TSWAP-C222).
+_VALID_EVICTIONS: Final[tuple[str, ...]] = ("lru", "lifo", "none")
+
+
+def effective_groups(raw: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The groups block a rule should check against (behaviour 12).
+
+    Pure helper: no mutation of ``raw``.  When ``raw`` has no
+    ``"groups"`` key at all it returns the synthesized
+    ``{"default": {"max_resident": 4, "eviction": "lru"}}`` (the
+    five-line config works, and the values match
+    :class:`~tool_swap.config.schema.GroupConfig`'s field defaults);
+    when ``"groups"`` IS present it returns that block deep-copied and
+    otherwise unchanged — never inserting a ``default`` entry into a
+    hand-written block, since silently synthesising there would hide a
+    typo.
+
+    Args:
+        raw: the raw root YAML mapping.
+
+    Returns:
+        The effective ``groups`` mapping (a fresh copy, safe to mutate).
+    """
+    if "groups" not in raw:
+        return {_DEFAULT_GROUP: dict(_SYNTHESISED_DEFAULT_GROUP)}
+    block = raw["groups"]
+    if not isinstance(block, dict):
+        return {}
+    return copy.deepcopy(block)
+
+
+def effective_port_range(raw: dict[str, object]) -> object:
+    """The backend port range a rule should check against (behaviour 16).
+
+    The behaviour-12 :func:`effective_groups` precedent applied to
+    ``backend.port_range``: the ``backend:`` block is a root block no
+    resolver layer carries, so the rules read it through the raw mapping,
+    never through ``values["port_range"]`` (that key is one of the 47
+    built-ins and is always a lie).  The value is returned **as
+    authored** — deliberately not narrowed to ``list[int]`` — because
+    judging its shape is ``TSWAP-C532``'s job.  When the ``backend:``
+    block or its ``port_range`` key is absent, a fresh copy of the
+    schema's own field default is returned, never an alias of it.
+
+    Args:
+        raw: the raw root YAML mapping (never mutated).
+
+    Returns:
+        The authored ``port_range`` value, or a fresh copy of the
+        ``BackendConfig.port_range`` default.
+    """
+    backend = raw.get("backend")
+    if not isinstance(backend, dict) or "port_range" not in backend:
+        return list(BackendConfig.model_fields["port_range"].default)
+    return backend["port_range"]
+
+
+def _effective_group(tool: ResolvedTool) -> str | None:
+    """The group a tool references, or ``None`` for a non-string value.
+
+    A tool with no ``group`` entry resolves to the implicit
+    ``default`` group; a non-string value is a schema-level problem and
+    is left to other rules.
+
+    Args:
+        tool: the resolved tool whose ``group`` entry is read.
+
+    Returns:
+        The referenced group name, or ``None`` when the value is not a
+        string.
+    """
+    group = tool.values.get("group", _DEFAULT_GROUP)
+    return group if isinstance(group, str) else None
+
+
+class _C210Rule(Rule):
+    """``TSWAP-C210``: a tool name outside ``^[a-z0-9][a-z0-9_-]*$``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool whose effective name breaks the charset.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One diagnostic per offending name, naming the tool, every
+            offending character and the pinned reason phrase.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            name = tool.name
+            if _NAME_PATTERN.fullmatch(name) is not None:
+                continue
+            if name:
+                offending = sorted(
+                    {
+                        char
+                        for index, char in enumerate(name)
+                        if (
+                            char not in _ALLOWED_NAME_CHARS
+                            or (index == 0 and char in "_-")
+                        )
+                    }
+                )
+                chars = ", ".join(repr(char) for char in offending)
+                message = (
+                    f"Tool {name!r} is not a valid tool name (it must "
+                    f"match ^[a-z0-9][a-z0-9_-]*$); offending "
+                    f"character(s): {chars}. Tool names are "
+                    f"{_URLS_REASON}."
+                )
+            else:
+                message = (
+                    "A tool with an empty name is invalid: a name must "
+                    f"match ^[a-z0-9][a-z0-9_-]*$. Tool names are "
+                    f"{_URLS_REASON}."
+                )
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C211Rule(Rule):
+    """``TSWAP-C211``: two or more tools resolve to the same name."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every effective name claimed by more than one entry.
+
+        This is the behaviour-12 duplicate: a duplicate arising across
+        layers or after ``tool.yaml`` name resolution (distinct from the
+        behaviour-6 duplicate-YAML-key loader error).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One diagnostic per duplicated name, naming every entry that
+            resolves to it.
+        """
+        by_name: dict[str, list[str]] = {}
+        for key, tool in config.tools.items():
+            by_name.setdefault(tool.name, []).append(key)
+        findings: list[Diagnostic] = []
+        for effective_name, keys in by_name.items():
+            if len(keys) < 2:
+                continue
+            entries = ", ".join(repr(key) for key in keys)
+            message = (
+                f"Tool {effective_name!r} is defined more than once: "
+                f"entries {entries} all resolve to the same name."
+            )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path="tools",
+                        line=config.line_for("tools"),
+                    ),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C220Rule(Rule):
+    """``TSWAP-C220``: a tool references a group absent from ``groups:``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool whose group is not defined.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One diagnostic per dangling reference, naming the group, the
+            tool, the nearest existing group (via
+            :func:`~tool_swap.config.suggest.nearest_alternative`) and
+            the full list of defined groups.
+        """
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            group = _effective_group(tool)
+            if group is None or group in groups:
+                continue
+            defined = ", ".join(repr(name) for name in sorted(groups))
+            message = (
+                f"Tool {key!r} references group {group!r}, which is not "
+                f"defined in 'groups:' (defined groups: {defined})"
+            )
+            nearest = nearest_alternative(group, sorted(groups))
+            if nearest is not None:
+                message += f"; did you mean {nearest!r}?"
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C221Rule(Rule):
+    """``TSWAP-C221``: ``groups.*.max_resident`` below 1."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every group whose ``max_resident`` is below 1.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One diagnostic per offending group, naming the group and the
+            value.
+        """
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, block in groups.items():
+            if not isinstance(block, dict):
+                continue
+            value = block.get("max_resident")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            if value >= 1:
+                continue
+            message = (
+                f"Group {group_name!r} has max_resident {value}, which "
+                "must be at least 1."
+            )
+            yaml_path = f"groups.{group_name}.max_resident"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C222Rule(Rule):
+    """``TSWAP-C222``: ``groups.*.eviction`` outside the valid set."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every group whose ``eviction`` is not a valid value.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One diagnostic per offending group, naming the value and
+            listing the valid values.
+        """
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, block in groups.items():
+            if not isinstance(block, dict):
+                continue
+            value = block.get("eviction")
+            if not isinstance(value, str) or value in _VALID_EVICTIONS:
+                continue
+            valid = ", ".join(_VALID_EVICTIONS)
+            message = (
+                f"Group {group_name!r} has eviction {value!r}, which is "
+                f"not one of: {valid}."
+            )
+            yaml_path = f"groups.{group_name}.eviction"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C223Rule(Rule):
+    """``TSWAP-C223``: a group defined but referenced by no tool."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn about defined groups no tool references (probably a rename).
+
+        A tool "references" a group when its resolved ``group`` equals
+        the group name, or when it has no ``group`` entry at all (meaning
+        ``default``).  The warning is a single diagnostic naming every
+        orphan; it is suppressed when NO defined group is referenced at
+        all (a hand-written block omitting ``default`` is a C220 typo
+        scenario, not a rename signal).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING diagnostic naming the orphan groups.
+        """
+        groups = effective_groups(config.raw)
+        referenced: set[str] = set()
+        for tool in config.tools.values():
+            group = _effective_group(tool)
+            if group is not None:
+                referenced.add(group)
+        if not referenced.intersection(groups):
+            return []
+        orphans = sorted(group for group in groups if group not in referenced)
+        if not orphans:
+            return []
+        names = ", ".join(repr(group) for group in orphans)
+        message = (
+            f"Group(s) defined but referenced by no tool: {names}; probably a rename."
+        )
+        return [
+            Diagnostic(
+                code=self.id,
+                severity=self.severity,
+                message=message,
+                location=Location(
+                    file=str(config.path),
+                    yaml_path="groups",
+                    line=config.line_for("groups"),
+                ),
+                remedy=self.remedy,
+            )
+        ]
+
+
+#: ``TSWAP-C210`` — tool name outside the allowed charset (§6 rule 2).
+TSWAP_C210_RULE: Final[Rule] = _C210Rule(
+    id="TSWAP-C210",
+    remedy=(
+        "Rename the tool to match ^[a-z0-9][a-z0-9_-]*$: start with a "
+        "lowercase letter or digit, then lowercase letters, digits, '_' "
+        "and '-' only."
+    ),
+)
+
+#: ``TSWAP-C211`` — duplicate tool names (§6 rule 2).
+TSWAP_C211_RULE: Final[Rule] = _C211Rule(
+    id="TSWAP-C211",
+    remedy=(
+        "Give each tool a unique name: a name may resolve to at most one "
+        "tool, across every config layer."
+    ),
+)
+
+#: ``TSWAP-C220`` — a tool references a group absent from ``groups:``.
+TSWAP_C220_RULE: Final[Rule] = _C220Rule(
+    id="TSWAP-C220",
+    remedy=(
+        "Either define the group under 'groups:' or point the tool's "
+        "'group' field at an existing one (or drop it to use 'default')."
+    ),
+)
+
+#: ``TSWAP-C221`` — ``groups.*.max_resident`` below 1.
+TSWAP_C221_RULE: Final[Rule] = _C221Rule(
+    id="TSWAP-C221",
+    remedy=(
+        "Set the group's max_resident to 1 or higher; a group must be "
+        "able to hold at least one tool."
+    ),
+)
+
+#: ``TSWAP-C222`` — ``groups.*.eviction`` outside the valid set.
+TSWAP_C222_RULE: Final[Rule] = _C222Rule(
+    id="TSWAP-C222",
+    remedy="Set the group's eviction to one of: lru, lifo or none.",
+)
+
+#: ``TSWAP-C223`` — a group defined but referenced by no tool (WARNING).
+TSWAP_C223_RULE: Final[Rule] = _C223Rule(
+    id="TSWAP-C223",
+    severity=Severity.WARNING,
+    remedy=(
+        "If the group is still needed, point at least one tool's "
+        "'group' field at it; otherwise remove it from 'groups:'."
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Behaviour 13 — D19 mandatory descriptions (§6 rule 6b)
+# ---------------------------------------------------------------------------
+
+#: The pinned C300 WHY phrase (plan, behaviour 13).
+_C300_WHY: Final[str] = (
+    "the description is what an LLM agent reads to decide whether to call this tool"
+)
+
+#: The self-sufficient remedy direction shared by the C3xx rules (the
+#: ``ValidatedConfig`` carries no per-tool ``tool.yaml`` path, so the
+#: remedy must not pretend to know which file was authored).
+_C3XX_REMEDY_TARGET: Final[str] = (
+    "add it to the tool's 'tool.yaml', or its inline 'tools.<name>' entry"
+)
+
+
+def _is_blank(value: object) -> bool:
+    """Whether a description value counts as missing (plan, behaviour 13).
+
+    Missing is ``None`` or a ``str`` whose ``strip()`` is empty; any
+    non-string value (e.g. ``description: 123``) counts as PRESENT and is
+    left to the schema layer's ``TSWAP-C105``, so one mistake yields one
+    diagnostic rather than two.
+
+    Args:
+        value: the description value from a carrier field or entry.
+
+    Returns:
+        True when the value is missing (``None`` or blank string).
+    """
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _entry_label(entry: Mapping[str, object], block: str, index: int) -> str:
+    """The name an entry carries in a C301/C302/C303 message.
+
+    The entry's ``name`` is used when it is a non-empty string; otherwise
+    the entry is named positionally (``inputs[<i>]`` and friends) so the
+    message stays actionable.
+
+    Args:
+        entry: the mapping entry being checked.
+        block: the block name (``inputs`` / ``outputs`` / ``params``).
+        index: the 0-based position of the entry in the block.
+
+    Returns:
+        The entry's name, or its positional label.
+    """
+    name = entry.get("name")
+    if isinstance(name, str) and name.strip():
+        return name
+    return f"{block}[{index}]"
+
+
+def _tool_location(config: ValidatedConfig, yaml_path: str) -> Location:
+    """The behaviour-12 location form for a tool-level diagnostic.
+
+    Args:
+        config: the validated configuration.
+        yaml_path: the dotted YAML path; the same string is handed to
+            ``config.line_for`` (``line=None`` is a legal outcome).
+
+    Returns:
+        The :class:`~tool_swap.config.errors.Location` at that path.
+    """
+    return Location(
+        file=str(config.path),
+        yaml_path=yaml_path,
+        line=config.line_for(yaml_path),
+    )
+
+
+def _check_entry_descriptions(
+    rule: Rule,
+    config: ValidatedConfig,
+    tool_key: str,
+    block: str,
+    block_value: object,
+) -> list[Diagnostic]:
+    """One missing/blank ``description`` diagnostic per block entry.
+
+    Shared by C301/C302/C303.  A block whose value is not a list is
+    skipped silently, and a non-mapping entry is skipped silently:
+    malformed shapes belong to behaviour 20's ``TSWAP-S1xx``.
+
+    Args:
+        rule: the emitting rule (its ``id`` and ``severity`` are used).
+        config: the validated configuration.
+        tool_key: the ``tools:`` map key of the tool.
+        block: the block name (``inputs`` / ``outputs`` / ``params``),
+            used in the positional entry label.
+        block_value: the block's carrier value (``None`` or a list).
+
+    Returns:
+        The diagnostics, one per missing or blank entry description.
+    """
+    if not isinstance(block_value, list):
+        return []
+    findings: list[Diagnostic] = []
+    for index, entry in enumerate(block_value):
+        if not isinstance(entry, Mapping):
+            continue
+        if not _is_blank(entry.get("description")):
+            continue
+        label = _entry_label(entry, block, index)
+        yaml_path = f"tools.{tool_key}.{block}.{index}.description"
+        findings.append(
+            Diagnostic(
+                code=rule.id,
+                severity=rule.severity,
+                message=(
+                    f"Entry {label!r} in the tool's '{block}' block is "
+                    "missing a description."
+                ),
+                location=_tool_location(config, yaml_path),
+                remedy=rule.remedy,
+            )
+        )
+    return findings
+
+
+class _C300Rule(Rule):
+    """``TSWAP-C300``: a tool whose own description is missing or blank."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool whose ``description`` carrier is missing/blank.
+
+        Applies to **every** tool — there is no escape — and reads only
+        the carrier field (no filesystem, no loader, no ``raw`` parsing).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed tool, stating the pinned
+            WHY phrase and naming the key to add in the remedy.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if not _is_blank(tool.description):
+                continue
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(f"Tool {key!r} is missing a description: {_C300_WHY}."),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C301Rule(Rule):
+    """``TSWAP-C301``: an ``inputs:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``inputs`` entry whose description is missing/blank.
+
+        Absent (``None``) or empty (``[]``) blocks yield nothing; entries
+        that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed input entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "inputs", tool.inputs)
+            )
+        return findings
+
+
+class _C302Rule(Rule):
+    """``TSWAP-C302``: an ``outputs:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``outputs`` entry whose description is missing/blank.
+
+        Absent (``None``) or empty (``[]``) blocks yield nothing; entries
+        that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING diagnostic per undescribed output entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "outputs", tool.outputs)
+            )
+        return findings
+
+
+class _C303Rule(Rule):
+    """``TSWAP-C303``: a ``params:`` entry missing its description."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``params`` entry whose description is missing/blank.
+
+        §5.5.1 requires ``name``, ``type`` and ``description`` on every
+        param.  Absent (``None``) or empty (``[]``) blocks yield nothing;
+        entries that are not mappings are skipped silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per undescribed param entry.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_entry_descriptions(self, config, key, "params", tool.params)
+            )
+        return findings
+
+
+#: ``TSWAP-C300`` — a tool's own description is missing or blank (§6 rule 6b).
+TSWAP_C300_RULE: Final[Rule] = _C300Rule(
+    id="TSWAP-C300",
+    remedy=(
+        "Add a non-blank 'description' field for the tool — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C301`` — an ``inputs:`` entry is missing its description.
+TSWAP_C301_RULE: Final[Rule] = _C301Rule(
+    id="TSWAP-C301",
+    remedy=(
+        "Add a non-blank 'description' to the input entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C302`` — an ``outputs:`` entry is missing its description
+#: (WARNING; outputs are advisory, unlike inputs and params).
+TSWAP_C302_RULE: Final[Rule] = _C302Rule(
+    id="TSWAP-C302",
+    severity=Severity.WARNING,
+    remedy=(
+        "Add a non-blank 'description' to the output entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+#: ``TSWAP-C303`` — a ``params:`` entry is missing its description.
+TSWAP_C303_RULE: Final[Rule] = _C303Rule(
+    id="TSWAP-C303",
+    remedy=(
+        "Add a non-blank 'description' to the param entry — "
+        + _C3XX_REMEDY_TARGET
+        + "."
+    ),
+)
+
+
+#: The codes ``--allow-missing-descriptions`` downgrades (plan block 6):
+#: the three ERROR description codes.  ``TSWAP-C302`` is deliberately
+#: excluded — it is already a warning, and appending "downgraded by" to a
+#: diagnostic the flag did not change would be a lie.
+MISSING_DESCRIPTION_CODES: Final[frozenset[str]] = frozenset(
+    {"TSWAP-C300", "TSWAP-C301", "TSWAP-C303"}
+)
+
+#: The pinned downgrade banner, appended to each downgraded diagnostic's
+#: ``message`` (which is what makes it survive ``--json``).
+ALLOW_MISSING_DESCRIPTIONS_BANNER: Final[str] = (
+    "downgraded by --allow-missing-descriptions; this flag is for local "
+    "prototyping and is never permitted in CI"
+)
+
+# ---------------------------------------------------------------------------
+# Behaviour 14 — withdrawn and reserved keys (§6 rules 4, 1c)
+# ---------------------------------------------------------------------------
+
+#: The pinned ADR-0004 citation — path AND title, verbatim (plan block 7),
+#: verified against the ADR file's own ``# `` heading.
+_ADR_0004_CITATION: Final[str] = (
+    "plan/adr/0004-hard-stop-only-in-v1.md (ADR-0004 — v1 reclaims "
+    "resources by stopping containers; soft unload is deferred)"
+)
+
+#: The pinned ADR-0005 citation — path AND title, verbatim (plan block 7),
+#: verified against the ADR file's own ``# `` heading.  Both C403 and C404
+#: cite this same string so the two consumers cannot drift.
+_ADR_0005_CITATION: Final[str] = (
+    "plan/adr/0005-one-uniform-batched-calling-convention.md "
+    "(ADR-0005 — One uniform calling convention: every handler takes "
+    "and returns a list)"
+)
+
+#: The valid ``runtime.server`` values (TSWAP-C402 lists them).
+_VALID_RUNTIME_SERVERS: Final[tuple[str, ...]] = ("bentoml", "native")
+
+#: The only implemented ``runtime.server`` backend (TSWAP-C401).
+_IMPLEMENTED_RUNTIME_SERVER: Final[str] = "bentoml"
+
+
+def _reserved_key_path(tool_key: str, key: str, layer: str) -> str:
+    """The ``yaml_path`` a reserved-key finding carries (plan block 6).
+
+    The ``defaults:`` layer resolves to ``defaults.<key>``; the inline
+    and ``tool.yaml`` layers both resolve to ``tools.<key>.<key>`` (the
+    line map belongs to the root config, so a ``tool.yaml``-authored key
+    has no line here, and the message names its layer in words).
+
+    Args:
+        tool_key: the ``tools:`` map key of the tool.
+        key: the reserved key (``soft_ttl`` / ``scalar_inputs`` /
+            ``max_batch_bytes``).
+        layer: the layer label from the carrier pair.
+
+    Returns:
+        The dotted YAML path for the finding's location.
+    """
+    if layer == "defaults":
+        return f"defaults.{key}"
+    return f"tools.{tool_key}.{key}"
+
+
+def _reserved_key_layer_phrase(layer: str) -> str:
+    """How a reserved-key message names the layer the key was written in.
+
+    A ``tool.yaml``-authored key has no line in the root config's map,
+    so the message must name the layer in words (the same
+    self-sufficiency requirement as behaviour 13's C301–C303).
+
+    Args:
+        layer: the layer label from the carrier pair.
+
+    Returns:
+        A phrase naming the layer for the message.
+    """
+    if layer == "tool.yaml":
+        return "written in the tool's tool.yaml"
+    if layer == "defaults":
+        return "written in the defaults: block"
+    return "written inline"
+
+
+def _check_reserved_key(
+    rule: Rule,
+    config: ValidatedConfig,
+    tool_key: str,
+    tool: ResolvedTool,
+    key: str,
+    message: str,
+) -> list[Diagnostic]:
+    """One diagnostic per carrier pair carrying the reserved ``key``.
+
+    Shared by C400/C403/C405 (same mechanism, plan block 2): the
+    ``layer`` element of the pair is load-bearing for the message, not
+    for the path (plan block 6).
+
+    Args:
+        rule: the emitting rule (its ``id``, ``severity`` and ``remedy``
+            are used).
+        config: the validated configuration.
+        tool_key: the ``tools:`` map key of the tool.
+        tool: the resolved tool whose ``reserved_keys`` is read.
+        key: the reserved key this rule owns.
+        message: the per-key message (layer phrase appended by the
+            caller is NOT included here; each key's message already
+            names its own content).
+
+    Returns:
+        One diagnostic per offending ``(key, layer)`` pair.
+    """
+    findings: list[Diagnostic] = []
+    for found_key, layer in tool.reserved_keys:
+        if found_key != key:
+            continue
+        yaml_path = _reserved_key_path(tool_key, key, layer)
+        findings.append(
+            Diagnostic(
+                code=rule.id,
+                severity=rule.severity,
+                message=f"{message} ({_reserved_key_layer_phrase(layer)}.)",
+                location=_tool_location(config, yaml_path),
+                remedy=rule.remedy,
+            )
+        )
+    return findings
+
+
+class _C400Rule(Rule):
+    """``TSWAP-C400``: a reserved ``soft_ttl`` present at any level."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``soft_ttl`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(soft_ttl, layer)`` carrier pair,
+            citing ADR-0004 and stating that ``ttl`` is the only idle
+            timer in v1.
+        """
+        message = (
+            f"'soft_ttl' is a reserved key and is rejected: {_ADR_0004_CITATION}; "
+            "ttl: is the only idle timer in v1"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "soft_ttl", message)
+            )
+        return findings
+
+
+class _C401Rule(Rule):
+    """``TSWAP-C401``: ``runtime.server: native`` (not implemented)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool resolving ``runtime_server`` to ``"native"``.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool, naming the current
+            version and that ``bentoml`` is the only implemented
+            backend.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("runtime_server")
+            if value != "native":
+                continue
+            message = (
+                "runtime.server: 'native' is not implemented in this "
+                f"version (tool-swap {__version__}); {_IMPLEMENTED_RUNTIME_SERVER!r} "
+                "is the only implemented backend"
+            )
+            yaml_path = f"tools.{key}.runtime_server"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C402Rule(Rule):
+    """``TSWAP-C402``: ``runtime.server`` outside {bentoml, native}."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``runtime_server`` value outside the valid set.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool, naming the
+            offending value and listing the valid values.
+        """
+        valid = ", ".join(_VALID_RUNTIME_SERVERS)
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("runtime_server")
+            if not isinstance(value, str) or value in _VALID_RUNTIME_SERVERS:
+                continue
+            message = (
+                f"runtime.server {value!r} is not a valid value; valid "
+                f"values are: {valid}"
+            )
+            yaml_path = f"tools.{key}.runtime_server"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C403Rule(Rule):
+    """``TSWAP-C403``: a reserved ``scalar_inputs`` present."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``scalar_inputs`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(scalar_inputs, layer)`` carrier
+            pair, citing ADR-0005 and stating the uniform calling
+            convention.
+        """
+        message = (
+            f"'scalar_inputs' is a reserved key and is rejected: {_ADR_0005_CITATION}; "
+            "every handler takes and returns a list"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "scalar_inputs", message)
+            )
+        return findings
+
+
+class _C404Rule(Rule):
+    """``TSWAP-C404``: a per-input ``batchable:`` key (inputs ONLY)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``inputs`` entry carrying a ``batchable`` key.
+
+        Presence-not-value: ``batchable: false`` is as withdrawn as
+        ``batchable: true``.  ``outputs:`` and ``params:`` are not
+        scanned; a non-list block or a non-mapping entry is skipped
+        silently (malformed shapes are behaviour 20's ``TSWAP-S1xx``).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending input entry, named by
+            behaviour 13's entry-label convention and citing ADR-0005.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if not isinstance(tool.inputs, list):
+                continue
+            for index, entry in enumerate(tool.inputs):
+                if not isinstance(entry, Mapping) or "batchable" not in entry:
+                    continue
+                label = _entry_label(entry, "inputs", index)
+                message = (
+                    f"Input {label!r} carries a 'batchable' key, which "
+                    f"is withdrawn: batching is a property of the tool, "
+                    f"not of an input. {_ADR_0005_CITATION}"
+                )
+                yaml_path = f"tools.{key}.inputs.{index}.batchable"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C405Rule(Rule):
+    """``TSWAP-C405``: a reserved ``max_batch_bytes`` present."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every reserved-layer ``max_batch_bytes`` (presence, not value).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per ``(max_batch_bytes, layer)`` carrier
+            pair, stating the key does not exist and naming the
+            mitigation.
+        """
+        message = (
+            "'max_batch_bytes' does not exist as a config key; set "
+            "max_batch_size low for large payloads"
+        )
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            findings.extend(
+                _check_reserved_key(self, config, key, tool, "max_batch_bytes", message)
+            )
+        return findings
+
+
+#: ``TSWAP-C400`` — a reserved ``soft_ttl`` present at any level (§6 rule 4).
+TSWAP_C400_RULE: Final[Rule] = _C400Rule(
+    id="TSWAP-C400",
+    remedy="remove soft_ttl; use ttl: — it is the only idle timer in v1",
+)
+
+#: ``TSWAP-C401`` — ``runtime.server: native`` is not implemented (§6 rule 1c).
+TSWAP_C401_RULE: Final[Rule] = _C401Rule(
+    id="TSWAP-C401",
+    remedy="set runtime.server: bentoml (or remove the key)",
+)
+
+#: ``TSWAP-C402`` — ``runtime.server`` outside {bentoml, native} (§6 rule 1c).
+TSWAP_C402_RULE: Final[Rule] = _C402Rule(
+    id="TSWAP-C402",
+    remedy="set runtime.server to one of: bentoml, native",
+)
+
+#: ``TSWAP-C403`` — a reserved ``scalar_inputs`` present (§6 rule 4).
+TSWAP_C403_RULE: Final[Rule] = _C403Rule(
+    id="TSWAP-C403",
+    remedy="remove scalar_inputs; the handler already takes a list",
+)
+
+#: ``TSWAP-C404`` — a per-input ``batchable:`` key (§6 rule 4).
+TSWAP_C404_RULE: Final[Rule] = _C404Rule(
+    id="TSWAP-C404",
+    remedy="remove 'batchable' from the input entry; batching is a tool-level property",
+)
+
+#: ``TSWAP-C405`` — a reserved ``max_batch_bytes`` present (§6 rule 4).
+TSWAP_C405_RULE: Final[Rule] = _C405Rule(
+    id="TSWAP-C405",
+    remedy="remove max_batch_bytes and set max_batch_size low for large payloads",
+)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 15 — image source, handler and file existence (§6 rules 5, 6)
+# ---------------------------------------------------------------------------
+
+#: The pinned expected handler form the C512 message shows (plan block 4).
+_EXPECTED_HANDLER_FORM: Final[str] = "file.py:ClassName"
+
+
+def _parse_handler(handler: str) -> tuple[str, str] | None:
+    """Parse a ``handler`` value as ``file.py:ClassName`` (plan block 4).
+
+    Split on the FIRST colon.  Both halves must be non-empty after
+    stripping surrounding whitespace; the file part must end in ``.py``;
+    the name part must be a Python identifier that is not a keyword
+    (``str.isidentifier`` is the language's own definition; a keyword
+    such as ``class`` can never name a class, and a dotted name is not
+    part of the documented form).
+
+    Shared by C512 (which reports a ``None`` result), C513 (which checks
+    the file part) and C516 (which checks the escape), so the three
+    rules cannot disagree about parseability.
+
+    Args:
+        handler: the ``handler`` carrier value.
+
+    Returns:
+        The ``(file part, name part)`` pair when the value is well
+        formed, else ``None``.
+    """
+    if ":" not in handler:
+        return None
+    file_part, name_part = handler.split(":", 1)
+    file_part = file_part.strip()
+    name_part = name_part.strip()
+    if not file_part or not file_part.endswith(".py"):
+        return None
+    if not name_part or not name_part.isidentifier() or keyword.iskeyword(name_part):
+        return None
+    return file_part, name_part
+
+
+def _resolved(base: Path, value: str) -> Path:
+    """Resolve ``value`` against ``base``, LEXICALLY (plan block 2(a)).
+
+    ``base / Path(value)`` with a purely lexical normalisation
+    (``os.path.normpath`` semantics): collapse ``.`` and cancel ``..``
+    against the preceding segment textually.  Never
+    :meth:`Path.resolve` (disk contact, CWD-dependent), never
+    ``Path.cwd()``, never ``~`` expansion — the loader expands ``~`` for
+    ``path:`` only, and a ``~`` left unexpanded is a portability mistake
+    whose verbatim path is more informative in the message.  An absolute
+    ``value`` is honoured as-is (normalised).
+
+    Args:
+        base: the resolution root (the tool directory or the config
+            directory).
+        value: the as-authored path value.
+
+    Returns:
+        The normalised path.
+    """
+    return Path(os.path.normpath(base / Path(value)))
+
+
+def _tool_base(config: ValidatedConfig, tool: ResolvedTool) -> Path:
+    """The resolution root for one tool (plan block 2(a)).
+
+    Args:
+        config: the validated configuration (its ``path`` supplies the
+            fallback).
+        tool: the resolved tool (its ``base_dir`` wins when set).
+
+    Returns:
+        ``tool.base_dir`` when set, else ``config.path.parent``.
+    """
+    return tool.base_dir if tool.base_dir is not None else config.path.parent
+
+
+def _image_sources(tool: ResolvedTool) -> list[str]:
+    """The image sources PRESENT on a tool, in ``image``, ``build``,
+    ``handler`` order (plan block 3(b)).
+
+    Presence, never value: a ``build: {}`` still counts (its shape is
+    the schema layer's one diagnostic), and ``requirements`` never
+    counts — it is an attribute of the managed source, optional.
+
+    Args:
+        tool: the resolved tool.
+
+    Returns:
+        The source names present (zero, one or two or three entries).
+    """
+    sources: list[str] = []
+    if tool.image is not None:
+        sources.append("image")
+    if tool.build is not None:
+        sources.append("build")
+    if tool.handler is not None:
+        sources.append("handler")
+    return sources
+
+
+class _C510Rule(Rule):
+    """``TSWAP-C510``: more than one image source."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool carrying two or more image sources.
+
+        One diagnostic per tool (not one per pair), naming every source
+        found and requiring exactly one.  ``path:`` is not a source — it
+        is a layer supplier — so it is not special-cased: the resolver
+        has already merged a ``tool.yaml``'s ``handler`` into the
+        carrier, and the rule sees the post-merge picture.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending tool at ``tools.<key>``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            sources = _image_sources(tool)
+            if len(sources) < 2:
+                continue
+            found = ", ".join(f"'{source}'" for source in sources)
+            message = (
+                f"Tool {key!r} defines {len(sources)} image sources "
+                f"({found}); exactly one of image:, build: or a managed "
+                "handler: may be present"
+            )
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C511Rule(Rule):
+    """``TSWAP-C511``: no image source at all."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool with none of ``image`` / ``build`` / ``handler``.
+
+        Reads the carriers, never ``config.raw`` (the inline layer only;
+        a ``tool.yaml``-supplied ``handler`` is absent from ``raw`` and
+        reading it would resurrect a false positive on every ``path:``
+        tool).  A ``path:`` tool whose ``tool.yaml`` supplies a
+        ``handler`` arrives with the carrier set, so it is legal.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per source-less tool at ``tools.<key>``,
+            listing the three ways to define a tool.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if _image_sources(tool):
+                continue
+            message = (
+                f"Tool {key!r} has no image source: define exactly one "
+                "of an image: (a pre-built image), a build: block (we "
+                "build it), or a managed handler: (+ optional "
+                "requirements:)"
+            )
+            yaml_path = f"tools.{key}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C512Rule(Rule):
+    """``TSWAP-C512``: a ``handler`` outside the ``file.py:ClassName`` form."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every unparseable ``handler`` (plan block 4).
+
+        A malformed handler suppresses C513 and C516 for the same tool:
+        they re-run the shared :func:`_parse_handler` and skip on
+        failure, so the three rules cannot disagree.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per malformed handler at
+            ``tools.<key>.handler``, showing the expected form and the
+            value found.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.handler is None or _parse_handler(tool.handler) is not None:
+                continue
+            message = (
+                f"handler {tool.handler!r} is not in the expected form "
+                f"{_EXPECTED_HANDLER_FORM}"
+            )
+            yaml_path = f"tools.{key}.handler"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C513Rule(Rule):
+    """``TSWAP-C513``: the handler file does not exist (or is a directory)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every parseable handler whose file part is not a file.
+
+        Static-only: the file is probed, never imported.  Suppressed
+        when the handler fails C512's parse (one mistake, one
+        diagnostic).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per missing handler file at
+            ``tools.<key>.handler`` carrying ``str(resolved)`` in the
+            message; the message adds "is a directory, not a file" when
+            the probe reports the path as a directory.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.handler is None:
+                continue
+            parsed = _parse_handler(tool.handler)
+            if parsed is None:
+                continue  # C512 owns the malformed string
+            resolved = _resolved(_tool_base(config, tool), parsed[0])
+            if probe.is_file(resolved):
+                continue
+            if probe.is_dir(resolved):
+                message = f"Handler file {str(resolved)} is a directory, not a file"
+            else:
+                message = f"Handler file does not exist: {str(resolved)}"
+            yaml_path = f"tools.{key}.handler"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C514Rule(Rule):
+    """``TSWAP-C514``: a named ``requirements`` file that does not exist."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every named requirements file the probe cannot find.
+
+        ``None`` yields nothing and queries no disk (C514 only fires
+        when the file is named).  Suppressed by nothing: a tool can
+        carry both C513 and C514 in one report.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per missing file at
+            ``tools.<key>.requirements`` carrying ``str(resolved)`` in
+            the message.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.requirements is None:
+                continue
+            resolved = _resolved(_tool_base(config, tool), tool.requirements)
+            if probe.is_file(resolved):
+                continue
+            message = f"Requirements file does not exist: {str(resolved)}"
+            yaml_path = f"tools.{key}.requirements"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C515Rule(Rule):
+    """``TSWAP-C515``: ``build.context`` or ``build.dockerfile`` missing."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag a build context that is not a directory, and a
+        dockerfile that is not a file within it.
+
+        ``build=None`` yields nothing and queries no disk; a present
+        ``build`` that is not a dict is skipped silently (the schema
+        layer owns the ``build`` shape — one mistake, one diagnostic,
+        never a C999).  The dockerfile resolves WITHIN the context
+        directory unless it is absolute, in which case it is used
+        as-is.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per problem: the context at
+            ``tools.<key>.build.context`` (mirrored message "is a file,
+            not a directory" when the probe reports a file), the
+            dockerfile at ``tools.<key>.build.dockerfile``; each message
+            carries ``str(resolved)``.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            build = tool.build
+            if not isinstance(build, dict):
+                continue
+            base = _tool_base(config, tool)
+            context = build.get("context")
+            dockerfile = build.get("dockerfile", "Dockerfile")
+            context_path = f"tools.{key}.build.context"
+            dockerfile_path = f"tools.{key}.build.dockerfile"
+            context_is_dir = False
+            if isinstance(context, str):
+                context_resolved = _resolved(base, context)
+                if probe.is_dir(context_resolved):
+                    context_is_dir = True
+                else:
+                    if probe.is_file(context_resolved):
+                        message = (
+                            f"Build context {str(context_resolved)} is a "
+                            "file, not a directory"
+                        )
+                    else:
+                        message = (
+                            f"Build context does not exist: {str(context_resolved)}"
+                        )
+                    findings.append(
+                        Diagnostic(
+                            code=self.id,
+                            severity=self.severity,
+                            message=message,
+                            location=_tool_location(config, context_path),
+                            remedy=self.remedy,
+                        )
+                    )
+            # The dockerfile resolves WITHIN the context directory, so it
+            # is only checked when that directory exists.
+            if context_is_dir and isinstance(dockerfile, str):
+                dockerfile_resolved = _resolved(context_resolved, dockerfile)
+                if not probe.is_file(dockerfile_resolved):
+                    findings.append(
+                        Diagnostic(
+                            code=self.id,
+                            severity=self.severity,
+                            message=(
+                                f"Dockerfile does not exist: {str(dockerfile_resolved)}"
+                            ),
+                            location=_tool_location(config, dockerfile_path),
+                            remedy=self.remedy,
+                        )
+                    )
+        return findings
+
+
+class _C516Rule(Rule):
+    """``TSWAP-C516``: a path escaping the tool directory (WARNING)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on every lexical escape past the resolution root.
+
+        The comparison is on the NORMALISED path (``is_relative_to``
+        semantics, pure lexical, no I/O): ``sub/../handler.py`` cancels
+        out inside the base and warns nothing, while ``../shared/...``
+        and an absolute path elsewhere both warn.  The escape is
+        ALLOWED (a WARNING, not an error) and does not suppress
+        C513/C514/C515 — an escaping path that also does not exist
+        yields both, since they are different problems.  Evaluated only
+        for a parseable handler (shared :func:`_parse_handler`).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per offending path, at the path's own
+            key (``tools.<key>.handler`` / ``.requirements`` /
+            ``.build.context`` / ``.build.dockerfile``), naming the
+            resolved path and the portability problem.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            base = _tool_base(config, tool)
+            candidates: list[tuple[str, Path]] = []
+            if tool.handler is not None:
+                parsed = _parse_handler(tool.handler)
+                if parsed is not None:
+                    candidates.append(
+                        (f"tools.{key}.handler", _resolved(base, parsed[0]))
+                    )
+            if tool.requirements is not None:
+                candidates.append(
+                    (f"tools.{key}.requirements", _resolved(base, tool.requirements))
+                )
+            build = tool.build
+            if isinstance(build, dict):
+                context = build.get("context")
+                if isinstance(context, str):
+                    candidates.append(
+                        (f"tools.{key}.build.context", _resolved(base, context))
+                    )
+                dockerfile = build.get("dockerfile", "Dockerfile")
+                if isinstance(dockerfile, str):
+                    root = (
+                        _resolved(base, context) if isinstance(context, str) else base
+                    )
+                    candidates.append(
+                        (f"tools.{key}.build.dockerfile", _resolved(root, dockerfile))
+                    )
+            for yaml_path, resolved in candidates:
+                if resolved.is_relative_to(base):
+                    continue
+                message = (
+                    f"{str(resolved)} escapes the tool directory "
+                    f"{str(base)}: it breaks the portability that "
+                    "path: exists to provide"
+                )
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+#: ``TSWAP-C510`` — more than one image source (§6 rule 5).
+TSWAP_C510_RULE: Final[Rule] = _C510Rule(
+    id="TSWAP-C510",
+    remedy=(
+        "Keep exactly one image source: an image: (pre-built), a build: "
+        "block (we build it), or a managed handler: — remove the others "
+        "from the tool's inline 'tools.<name>' entry"
+    ),
+)
+
+#: ``TSWAP-C511`` — no image source (§6 rule 5).
+TSWAP_C511_RULE: Final[Rule] = _C511Rule(
+    id="TSWAP-C511",
+    remedy=(
+        "Give the tool exactly one image source: an image: (pre-built), "
+        "a build: block, or a managed handler: in its inline "
+        "'tools.<name>' entry, or a tool.yaml (via path:) that supplies "
+        "a handler:"
+    ),
+)
+
+#: ``TSWAP-C512`` — a handler outside the file.py:ClassName form (§6 rule 6).
+TSWAP_C512_RULE: Final[Rule] = _C512Rule(
+    id="TSWAP-C512",
+    remedy=(
+        "Write the handler as file.py:ClassName — a .py file relative to "
+        "the tool directory, a ':' and a Python class name that is not "
+        "a keyword"
+    ),
+)
+
+#: ``TSWAP-C513`` — the handler file does not exist (§6 rule 6).
+TSWAP_C513_RULE: Final[Rule] = _C513Rule(
+    id="TSWAP-C513",
+    remedy=(
+        "Create the handler file at the path shown, or fix the path: it "
+        "is relative to the tool's directory (its path: directory, or "
+        "the root config's directory for an inline tool)"
+    ),
+)
+
+#: ``TSWAP-C514`` — a named requirements file does not exist (§6 rule 6).
+TSWAP_C514_RULE: Final[Rule] = _C514Rule(
+    id="TSWAP-C514",
+    remedy=(
+        "Create the requirements file at the path shown, or fix the "
+        "path: it is relative to the tool's directory"
+    ),
+)
+
+#: ``TSWAP-C515`` — a build context or dockerfile is missing (§6 rule 6).
+TSWAP_C515_RULE: Final[Rule] = _C515Rule(
+    id="TSWAP-C515",
+    remedy=(
+        "Create the context directory (or the Dockerfile within it) at "
+        "the paths shown, or fix build.context / build.dockerfile: they "
+        "are relative to the tool's directory, and the dockerfile "
+        "resolves within the context"
+    ),
+)
+
+#: ``TSWAP-C516`` — a path escapes the tool directory (§6 rule 6, WARNING:
+#: the escape is allowed).
+TSWAP_C516_RULE: Final[Rule] = _C516Rule(
+    id="TSWAP-C516",
+    severity=Severity.WARNING,
+    remedy=(
+        "Keep the path inside the tool's directory (no ../ walking out, "
+        "no absolute path elsewhere): escaping it breaks the "
+        "portability that path: exists to provide"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 16 — devices, workers, host ports (§6 rules 4c, 7, 8)
+# ---------------------------------------------------------------------------
+
+
+def _is_device_index(value: object) -> TypeGuard[int]:
+    """True for a value usable as a device index (an ``int``, not a bool).
+
+    ``bool`` is tested before ``int`` because ``True`` is an ``int`` in
+    Python and ``devices: [true]`` is a mistake, not GPU 1 (plan item 4).
+
+    Args:
+        value: an as-authored ``devices`` entry.
+
+    Returns:
+        True when ``value`` is an ``int`` that is not a ``bool`` (narrows
+        the argument to ``int`` for the caller).
+    """
+    return not isinstance(value, bool) and isinstance(value, int)
+
+
+def _range_endpoints(raw: dict[str, object]) -> tuple[int, int] | None:
+    """The effective ``backend.port_range`` as judged endpoints, or ``None``.
+
+    The shape judgement ``TSWAP-C531`` needs before it may compare a port
+    against the range: a list of exactly two ints, each within
+    ``1..65535``, with ``low <= high``.  Any malformed shape answers
+    ``None`` and C531's range comparison is suppressed for the run (a
+    malformed range cannot judge any port — the C512-suppresses-C513
+    pattern); the port-0 clause is not arithmetic and is unaffected.
+
+    Args:
+        raw: the raw root YAML mapping (never mutated).
+
+    Returns:
+        The ``(low, high)`` endpoints when the range is well-formed, else
+        ``None``.
+    """
+    value = effective_port_range(raw)
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    low, high = value[0], value[1]
+    for endpoint in (low, high):
+        if not _is_device_index(endpoint):
+            return None
+        if not 1 <= endpoint <= 65535:
+            return None
+    if low > high:
+        return None
+    return (low, high)
+
+
+class _C520Rule(Rule):
+    """``TSWAP-C520``: a negative or non-integer device index."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every ``devices`` entry that is not a non-negative int.
+
+        The rules never see Pydantic's output — ``values["devices"]``
+        holds the entries as authored (a ``"0"`` stays the string
+        ``"0"`` even though the schema's lax mode coerced it) — so the
+        entry is judged itself, with ``bool`` excluded before the ``int``
+        test.  A ``devices`` value that is not a list is skipped
+        silently: ``TSWAP-C104`` owns it with a bespoke message.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.devices.<i>`` (0-based, dotted-numeric), naming
+            the tool, the entry (via ``repr``) and its position.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            for i, value in enumerate(devices):
+                if _is_device_index(value) and value >= 0:
+                    continue
+                message = (
+                    f"Tool {key!r} has an invalid device index {value!r} "
+                    f"at position {i} in devices:"
+                )
+                yaml_path = f"tools.{key}.devices.{i}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C521Rule(Rule):
+    """``TSWAP-C521``: a device index exceeding the visible GPUs."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn for every index at or above the injected GPU count.
+
+        Skipped entirely and silently when ``config.gpu_count`` is
+        ``None`` (unknown — the M1 production default, which nothing
+        populates); ``gpu_count == 0`` is a legitimate "no GPUs on this
+        host" value and warns for every index.  Negatives and non-int
+        entries belong to ``TSWAP-C520`` (one mistake, one diagnostic).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING per offending index at
+            ``tools.<key>.devices.<i>``, naming the index, the count
+            seen, and that the config may target another machine.
+        """
+        count = config.gpu_count
+        if count is None:
+            return []
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            for i, value in enumerate(devices):
+                if not _is_device_index(value) or value < 0:
+                    continue
+                if value < count:
+                    continue
+                message = (
+                    f"Tool {key!r} uses device index {value}, but only "
+                    f"{count} GPU(s) are visible on this host; the config "
+                    "may target another machine"
+                )
+                yaml_path = f"tools.{key}.devices.{i}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+class _C522Rule(Rule):
+    """``TSWAP-C522``: a duplicate index within one tool's ``devices``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn once per tool whose ``devices`` lists an index twice.
+
+        Compares only ``int`` non-``bool`` entries (a duplicated
+        ``"0"`` is ``TSWAP-C520``'s problem twice over).  One diagnostic
+        per tool, at the LIST rather than at an entry — the duplication
+        is a property of the list, and picking "the second occurrence"
+        would be arbitrary.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.devices``,
+            naming every duplicated index.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list):
+                continue
+            counts: dict[int, int] = {}
+            for value in devices:
+                if _is_device_index(value):
+                    counts[value] = counts.get(value, 0) + 1
+            duplicates = sorted(index for index, n in counts.items() if n > 1)
+            if not duplicates:
+                continue
+            message = (
+                f"Tool {key!r} lists duplicate device index(es) "
+                f"{', '.join(str(index) for index in duplicates)} in "
+                "devices:"
+            )
+            yaml_path = f"tools.{key}.devices"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C523Rule(Rule):
+    """``TSWAP-C523``: ``workers > 1`` AND a non-empty ``devices`` list."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when multiple workers multiply GPU VRAM.
+
+        Fires when ``workers`` is an ``int`` (not a ``bool``) ``> 1``
+        AND ``devices`` is a non-empty list.  ``devices: []`` (or absent)
+        with ``workers: 4`` yields nothing: that is the CPU case, where
+        multiple workers are the intended way to use more cores.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.workers``
+            stating that VRAM multiplies by the worker count, invisibly
+            to the scheduler.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            workers = tool.values.get("workers")
+            if not _is_device_index(workers) or workers <= 1:
+                continue
+            devices = tool.values.get("devices")
+            if not isinstance(devices, list) or not devices:
+                continue
+            message = (
+                f"Tool {key!r} runs {workers} workers with a non-empty "
+                "devices: list, so the workers multiply its VRAM, "
+                "invisibly to the scheduler"
+            )
+            yaml_path = f"tools.{key}.workers"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C530Rule(Rule):
+    """``TSWAP-C530``: two tools sharing an explicit host port."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every host port claimed by two or more tools.
+
+        The operand set is every tool whose ``expose_host_port`` is an
+        ``int`` and not a ``bool`` (``bool``-before-``int``: ``true``
+        auto-allocates and participates in neither check; port 0 IS in
+        the set — no 0-exemption).  One diagnostic per colliding port,
+        at ``tools`` — the collision belongs to no single tool (the
+        ``_C211Rule`` duplicate-name precedent).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per colliding port at ``tools``, naming the port
+            and every tool claiming it.
+        """
+        claimants: dict[int, list[str]] = {}
+        for key, tool in config.tools.items():
+            value = tool.values.get("expose_host_port")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            claimants.setdefault(value, []).append(key)
+        findings: list[Diagnostic] = []
+        for port, keys in claimants.items():
+            if len(keys) < 2:
+                continue
+            message = (
+                f"Host port {port} is claimed by multiple tools: "
+                f"{', '.join(repr(key) for key in keys)}"
+            )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, "tools"),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C531Rule(Rule):
+    """``TSWAP-C531``: an explicit host port outside ``backend.port_range``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every explicit port the effective range cannot host.
+
+        Fires for every tool whose ``expose_host_port`` is an ``int``
+        and not a ``bool`` (``true`` auto-allocates and participates in
+        neither check — nothing is allocated at validate time).  Port
+        ``0`` is an error UNCONDITIONALLY, with its dedicated clause:
+        the objection is not arithmetic, so it fires even against a
+        range that contains 0.  Any other port outside the effective
+        range (endpoints inclusive, via
+        :func:`effective_port_range` — never
+        ``values["port_range"]``) is an error naming the port and both
+        endpoints; a malformed range suppresses that comparison for the
+        run (``TSWAP-C532`` owns it — the C512-suppresses-C513 pattern).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per offending tool at
+            ``tools.<key>.expose_host_port``.
+        """
+        endpoints = _range_endpoints(config.raw)
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("expose_host_port")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            yaml_path = f"tools.{key}.expose_host_port"
+            if value == 0:
+                message = (
+                    f"Tool {key!r} sets expose_host_port 0; 0 tells "
+                    "Docker to pick any free port, and tool-swap does "
+                    "not support that spelling — write true to "
+                    "auto-allocate from backend.port_range, or an "
+                    "explicit port"
+                )
+            elif endpoints is None:
+                continue  # TSWAP-C532 owns the malformed range
+            else:
+                low, high = endpoints
+                if low <= value <= high:
+                    continue
+                message = (
+                    f"Tool {key!r} exposes host port {value}, outside "
+                    f"backend.port_range [{low}, {high}]"
+                )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C532Rule(Rule):
+    """``TSWAP-C532``: an inverted or malformed ``backend.port_range``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Judge the authored range shape; one diagnostic per problem.
+
+        The schema's ``list[int]`` catches non-int entries but not the
+        length, the bounds or the order, so this rule owns: a length
+        other than 2 (naming the length found), a non-``int`` (or
+        ``bool``) entry, an endpoint outside ``1..65535``, and
+        ``low > high`` (naming both values).  ``low == high`` is a
+        tight but legitimate one-port range.  A non-LIST value is
+        skipped silently — the schema's ``TSWAP-C105`` owns it.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per problem at ``backend.port_range`` (the first
+            ``yaml_path`` in M1 rooted at ``backend``).
+        """
+        value = effective_port_range(config.raw)
+        if not isinstance(value, list):
+            return []
+        yaml_path = "backend.port_range"
+        if len(value) != 2:
+            message = (
+                f"backend.port_range has {len(value)} entries; exactly "
+                "two are required, [low, high]"
+            )
+            return [
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            ]
+        findings: list[Diagnostic] = []
+        for i, endpoint in enumerate(value):
+            if _is_device_index(endpoint):
+                continue
+            message = f"backend.port_range entry {i} is {endpoint!r}, not an int"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        low, high = value[0], value[1]
+        if _is_device_index(low) and not 1 <= low <= 65535:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range low endpoint {low} is not a "
+                        "port number (outside 1..65535)"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        if _is_device_index(high) and not 1 <= high <= 65535:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range high endpoint {high} is not a "
+                        "port number (outside 1..65535)"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        if _is_device_index(low) and _is_device_index(high) and low > high:
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=(
+                        f"backend.port_range is inverted: low {low} is "
+                        f"greater than high {high}"
+                    ),
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C520`` — a negative or non-integer device index (§6 rule 7).
+TSWAP_C520_RULE: Final[Rule] = _C520Rule(
+    id="TSWAP-C520",
+    remedy=(
+        "Replace every device index with a non-negative integer GPU "
+        "index, wherever the list was set — the tool's devices: entry, "
+        "the defaults: block, or the tool's group"
+    ),
+)
+
+#: ``TSWAP-C521`` — a device index exceeding the visible GPUs (§6 rule 7,
+#: WARNING: the config may target another machine).
+TSWAP_C521_RULE: Final[Rule] = _C521Rule(
+    id="TSWAP-C521",
+    severity=Severity.WARNING,
+    remedy=(
+        "Use device indices below the visible GPU count on the target "
+        "host, or deploy on a host with enough GPUs: this config may "
+        "target another machine"
+    ),
+)
+
+#: ``TSWAP-C522`` — a duplicate index within one tool's devices (§6 rule 7,
+#: WARNING).
+TSWAP_C522_RULE: Final[Rule] = _C522Rule(
+    id="TSWAP-C522",
+    severity=Severity.WARNING,
+    remedy=(
+        "Remove the duplicate device index from the tool's devices: "
+        "list, or from the defaults: block or group that supplies it"
+    ),
+)
+
+#: ``TSWAP-C523`` — workers > 1 with a non-empty devices list (§6 rule 4c,
+#: WARNING: VRAM multiplies invisibly to the scheduler).
+TSWAP_C523_RULE: Final[Rule] = _C523Rule(
+    id="TSWAP-C523",
+    severity=Severity.WARNING,
+    remedy=(
+        "Reduce workers: to 1, or keep workers: and size the group's "
+        "max_resident: so the multiplied VRAM still fits"
+    ),
+)
+
+#: ``TSWAP-C530`` — two tools sharing an explicit host port (§6 rule 8).
+TSWAP_C530_RULE: Final[Rule] = _C530Rule(
+    id="TSWAP-C530",
+    remedy=(
+        "Give each tool a distinct expose_host_port int, or set true to "
+        "auto-allocate from backend.port_range"
+    ),
+)
+
+#: ``TSWAP-C531`` — an explicit host port outside backend.port_range
+#: (§6 rule 8; port 0 unconditionally).
+TSWAP_C531_RULE: Final[Rule] = _C531Rule(
+    id="TSWAP-C531",
+    remedy=(
+        "Pick an expose_host_port inside backend.port_range (both "
+        "endpoints inclusive), or true for auto-allocation; 0 is not a "
+        "supported spelling"
+    ),
+)
+
+#: ``TSWAP-C532`` — an inverted or malformed backend.port_range (§6 rule 8).
+TSWAP_C532_RULE: Final[Rule] = _C532Rule(
+    id="TSWAP-C532",
+    remedy=(
+        "Write backend.port_range as a two-int list [low, high] with "
+        "1 <= low <= high <= 65535 (low == high is a legal one-port "
+        "range)"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 17 — mounts (§6 rule 9, §5.6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParsedMount:
+    """One parsed ``host:container[:ro|rw]`` entry.
+
+    The parsed view the four ``C54x`` rules and behaviour 22 (``config
+    show``) share: it is a pure function of the authored string, the
+    config directory and the injected home, and it is never written back
+    into ``values`` (which keeps holding the authored strings).
+
+    Attributes:
+        host: the host part as authored, after leading-``~`` expansion;
+            may still be relative.
+        container: the container part as authored.
+        mode: the mode as authored, or ``"ro"`` when the entry omitted
+            the third part (a ``"RO"`` survives verbatim — ``C541`` is
+            the rule that rejects it).
+        mode_defaulted: ``True`` iff the authored entry had no third
+            part.
+        resolved_host: the host resolved against the config file's
+            directory, LEXICALLY (normpath; no disk, no CWD).
+    """
+
+    host: str
+    container: str
+    mode: str
+    mode_defaulted: bool
+    resolved_host: Path
+
+
+def _expand_host(host: str, home: Path | None) -> str:
+    """Expand a LEADING ``~`` in a host part (plan item 3).
+
+    Only a leading ``~`` expands, exactly :meth:`Path.expanduser`
+    semantics: ``"a~/b"`` is a literal directory name.  When ``home`` is
+    provided the expansion is a literal substitution and ``os.environ``
+    is never read; ``None`` means the real home.
+
+    Args:
+        host: the host part as authored.
+        home: the injected home, or ``None`` for the real ``$HOME``.
+
+    Returns:
+        The host with its leading ``~`` replaced (or unchanged).
+    """
+    if home is None:
+        return str(Path(host).expanduser())
+    if host == "~":
+        return str(home)
+    if host.startswith("~/"):
+        return str(home / host[2:])
+    return host
+
+
+def parse_mount(
+    entry: str, *, config_dir: Path, home: Path | None = None
+) -> ParsedMount | None:
+    """Parse one mount entry; ``None`` means unparseable (``TSWAP-C540``).
+
+    PURE: no disk access, no environment read when ``home`` is given.
+    The entry is split on ``":"`` BEFORE any expansion (expansion cannot
+    introduce or remove a colon): it parses iff there are exactly 2 or
+    3 parts and every part is non-empty.  A 2-part entry gets
+    ``mode="ro"`` with ``mode_defaulted=True``; a 3-part entry keeps the
+    mode AS AUTHORED (``C541`` judges it, not the parser).  The host
+    resolves against ``config_dir`` lexically (shared :func:`_resolved`).
+
+    Args:
+        entry: the authored mount string.
+        config_dir: the config file's directory — the resolution base
+            for relative hosts (never a tool's ``base_dir``).
+        home: the home for leading-``~`` expansion, or ``None`` for the
+            real home.
+
+    Returns:
+        The parsed view, or ``None`` for exactly the ``C540`` shapes.
+    """
+    parts = entry.split(":")
+    if len(parts) not in (2, 3) or not all(parts):
+        return None
+    host = _expand_host(parts[0], home)
+    if len(parts) == 3:
+        mode = parts[2]
+        mode_defaulted = False
+    else:
+        mode = "ro"
+        mode_defaulted = True
+    return ParsedMount(
+        host=host,
+        container=parts[1],
+        mode=mode,
+        mode_defaulted=mode_defaulted,
+        resolved_host=_resolved(config_dir, host),
+    )
+
+
+def _string_mount_entries(config: ValidatedConfig) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(tool key, index, entry)`` for every string ``mounts`` entry.
+
+    Non-list ``mounts`` values and non-string entries are skipped
+    silently: ``TSWAP-C105`` owns both at the schema layer, and
+    re-reporting either per rule would bury the schema's message.  One
+    shared iteration keeps the four rules on identical entry sets.
+
+    Args:
+        config: the validated configuration to scan.
+
+    Yields:
+        ``(key, i, entry)`` for every string entry, in tool order and
+        list order (``i`` is 0-based into the resolved list).
+    """
+    for key, tool in config.tools.items():
+        mounts = tool.values.get("mounts")
+        if not isinstance(mounts, list):
+            continue
+        for i, entry in enumerate(mounts):
+            if isinstance(entry, str):
+                yield key, i, entry
+
+
+class _C540Rule(Rule):
+    """``TSWAP-C540``: an unparseable mount entry."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every entry that :func:`parse_mount` cannot parse.
+
+        Suppression is per ENTRY, never per tool: an entry that fails
+        parsing is ``None`` for :func:`parse_mount`, so C541/C542/C543
+        (which all re-run it and skip on ``None``) cannot fire on the
+        same entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per unparseable entry at
+            ``tools.<key>.mounts.<i>`` naming the value and both
+            expected forms verbatim.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            if parse_mount(entry, config_dir=config.path.parent, home=config.home):
+                continue
+            message = (
+                f"Mount entry {entry!r} is unparseable: expected "
+                "host:container or host:container:ro|rw"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C541Rule(Rule):
+    """``TSWAP-C541``: a mount mode outside ``{ro, rw}``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every 3-part entry whose mode is not literally ``ro``/``rw``.
+
+        Matched EXACTLY and case-sensitively (assumption A18): ``:RO``
+        is a C541, not a synonym.  A defaulted mode (2-part entry)
+        never fires — the parser's ``"ro"`` is already legal.
+        Independent of C542: both may fire on one entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.mounts.<i>`` naming the mode via ``repr`` and
+            listing both legal values.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None or parsed.mode_defaulted:
+                continue  # C540 owns the unparseable; the default is legal
+            if parsed.mode in ("ro", "rw"):
+                continue
+            message = (
+                f"Mount entry {entry!r} has mode {parsed.mode!r}; the "
+                "only legal modes are ro and rw"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C542Rule(Rule):
+    """``TSWAP-C542``: a non-absolute container path."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every parsed entry whose container part is not absolute.
+
+        Docker requires an absolute destination; Windows-style container
+        paths are unsupported and the message says so.  Independent of
+        C541: both may fire on one entry.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR diagnostic per offending entry at
+            ``tools.<key>.mounts.<i>`` naming the container part.
+        """
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None or parsed.container.startswith("/"):
+                continue
+            message = (
+                f"Mount entry {entry!r} has a non-absolute container "
+                f"path {parsed.container!r}: Docker requires an "
+                "absolute destination, and Windows-style container "
+                "paths are unsupported"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C543Rule(Rule):
+    """``TSWAP-C543``: the host path does not exist (WARNING)."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on every parsed entry whose host is neither file nor dir.
+
+        Either predicate satisfies existence — a bind source is
+        legitimately a directory (weights caches) or a file (a socket, a
+        single model file).  Never an error: the path may be created
+        before the container starts.  Not suppressed by C541/C542, which
+        say nothing about the host side.
+
+        Args:
+            config: the validated configuration to check (disk
+                knowledge arrives only through ``config.probe``).
+
+        Returns:
+            One WARNING per missing host at ``tools.<key>.mounts.<i>``,
+            naming the absolute expanded ``str(resolved_host)``.
+        """
+        probe = config.probe
+        findings: list[Diagnostic] = []
+        for key, i, entry in _string_mount_entries(config):
+            parsed = parse_mount(entry, config_dir=config.path.parent, home=config.home)
+            if parsed is None:
+                continue
+            if probe.is_file(parsed.resolved_host) or probe.is_dir(
+                parsed.resolved_host
+            ):
+                continue
+            message = (
+                f"Mount host path does not exist: {str(parsed.resolved_host)} "
+                "(it may be created before the container starts)"
+            )
+            yaml_path = f"tools.{key}.mounts.{i}"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C540`` — an unparseable mount entry (§6 rule 9).
+TSWAP_C540_RULE: Final[Rule] = _C540Rule(
+    id="TSWAP-C540",
+    remedy=(
+        "Rewrite the entry as host:container or host:container:ro|rw; "
+        "a host path containing ':' (a Windows drive letter, for "
+        "example) is not supported — mount entries are split on ':'"
+    ),
+)
+
+#: ``TSWAP-C541`` — a mount mode outside {ro, rw} (§6 rule 9).
+TSWAP_C541_RULE: Final[Rule] = _C541Rule(
+    id="TSWAP-C541",
+    remedy=(
+        "Use ro or rw as the third part, exactly lowercase; a host "
+        "path containing ':' (a Windows drive letter, for example) is "
+        "not supported — mount entries are split on ':'"
+    ),
+)
+
+#: ``TSWAP-C542`` — a non-absolute container path (§6 rule 9).
+TSWAP_C542_RULE: Final[Rule] = _C542Rule(
+    id="TSWAP-C542",
+    remedy="Make the container path absolute (start it with '/')",
+)
+
+#: ``TSWAP-C543`` — the host path does not exist (§6 rule 9, WARNING).
+TSWAP_C543_RULE: Final[Rule] = _C543Rule(
+    id="TSWAP-C543",
+    severity=Severity.WARNING,
+    remedy=(
+        "Confirm the path exists on the host running the daemon — mount "
+        "entries are host paths interpreted by the Docker daemon, not "
+        "paths inside the router container — wherever the entry was "
+        "set: the tool's mounts:, the defaults: block, or its "
+        "tool.yaml; the path may also be created before the container "
+        "starts"
+    ),
+)
+
+
+def _origin_phrase(tool: ResolvedTool, field: str) -> str:
+    """The phrase a C60x message uses to name the layer that set ``field``.
+
+    A TOTAL helper (never raises): ``OriginMap.winning`` raises
+    ``KeyError`` for an unrecorded path, and this translates that into
+    the pinned ``origin unrecorded`` phrase rather than letting it
+    surface as a ``TSWAP-C999`` from inside a rule.  ``Origin.render()``
+    is deliberately not used: it is ``config show``'s renderer, and with
+    the resolver's fixed source strings it doubles the layer word
+    (``"inline (inline)"``), which reads as a bug inside a sentence.
+
+    The phrases are pinned by behaviour 18, item 2(b): ``INLINE`` →
+    ``set inline``; ``TOOL_YAML`` → ``set in the tool's tool.yaml``;
+    ``DEFAULTS`` with a ``groups.<name>.<field>`` source →
+    ``set in group '<name>'``; any other ``DEFAULTS`` source →
+    ``set in the defaults: block``; ``BUILT_IN`` → ``the built-in
+    default``.
+
+    Args:
+        tool: the resolved tool whose origin map is read.
+        field: the flat field name, as the resolver records it.
+
+    Returns:
+        The pinned phrase naming the layer that set ``field``.
+    """
+    try:
+        origin = tool.origins.winning(field)
+    except KeyError:
+        return "origin unrecorded"
+    if origin.level is OriginLevel.INLINE:
+        return "set inline"
+    if origin.level is OriginLevel.TOOL_YAML:
+        return "set in the tool's tool.yaml"
+    if origin.level is OriginLevel.DEFAULTS:
+        if origin.source.startswith("groups."):
+            group_name = origin.source.split(".", 2)[1]
+            return f"set in group {group_name!r}"
+        return "set in the defaults: block"
+    return "the built-in default"
+
+
+class _C600Rule(Rule):
+    """``TSWAP-C600``: ``keep_warm: true`` AND ``autostart: false``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every tool that can never start as configured.
+
+        Fires when ``keep_warm is True`` AND ``autostart is False`` —
+        identity against the bool singletons, not truthiness: a non-bool
+        on either key is skipped silently (the schema's ``TSWAP-C105``
+        owns it).  Layer-blind on purpose: a ``defaults:``-level
+        ``autostart: false`` plus one ``keep_warm: true`` tool is an
+        error for that tool, and the message cites the origin of EACH
+        half, since the two halves frequently come from different
+        layers.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one ERROR per tool at ``tools.<key>.keep_warm``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.values.get("keep_warm") is not True:
+                continue
+            if tool.values.get("autostart") is not False:
+                continue
+            message = (
+                f"Tool {key!r} sets keep_warm: true "
+                f"({_origin_phrase(tool, 'keep_warm')}) with "
+                f"autostart: false ({_origin_phrase(tool, 'autostart')}); "
+                "keep_warm starts the tool at boot and exempts it from "
+                "TTL, while autostart: false forbids starting it "
+                "automatically at all"
+            )
+            yaml_path = f"tools.{key}.keep_warm"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C601Rule(Rule):
+    """``TSWAP-C601``: ``keep_warm: true`` AND an EXPLICIT ``ttl > 0``."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when a keep-warm tool carries a dead ``ttl`` it authored.
+
+        Fires when all three hold: ``keep_warm is True``; ``ttl`` is an
+        ``int``/``float`` (not a ``bool``) ``> 0``; and the ttl's
+        winning origin is ``INLINE`` or ``TOOL_YAML`` — authored on this
+        tool, not inherited from ``defaults:`` or the built-in (the
+        rejected wider reading: a ``defaults.ttl`` written once for a
+        dozen tools expresses no expectation about the keep-warm one).
+        A non-numeric ``ttl`` or an unrecorded ttl origin is skipped
+        silently.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per tool at ``tools.<key>.keep_warm``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            if tool.values.get("keep_warm") is not True:
+                continue
+            ttl = tool.values.get("ttl")
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                continue
+            if ttl <= 0:
+                continue
+            try:
+                ttl_level = tool.origins.winning("ttl").level
+            except KeyError:
+                continue
+            if ttl_level not in (OriginLevel.INLINE, OriginLevel.TOOL_YAML):
+                continue
+            message = (
+                f"Tool {key!r} sets keep_warm: true "
+                f"({_origin_phrase(tool, 'keep_warm')}) with ttl {ttl} "
+                f"({_origin_phrase(tool, 'ttl')}); keep_warm exempts the "
+                "tool from TTL, so the ttl value has no effect"
+            )
+            yaml_path = f"tools.{key}.keep_warm"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+class _C602Rule(Rule):
+    """``TSWAP-C602``: ``max_concurrent`` at or below zero."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag a concurrency cap that rejects every request.
+
+        Fires when ``max_concurrent`` is an ``int`` (not a ``bool``)
+        ``<= 0`` — widened from ``== 0``: a negative cap is the same
+        mistake with the same consequence, and the message names the
+        actual value found.  ``None`` is the documented "uncapped"
+        built-in and is skipped silently, as is a non-int.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one ERROR per tool at
+            ``tools.<key>.max_concurrent``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            value = tool.values.get("max_concurrent")
+            if value is None or isinstance(value, bool):
+                continue
+            if not isinstance(value, int) or value > 0:
+                continue
+            message = (
+                f"Tool {key!r} sets max_concurrent {value} "
+                f"({_origin_phrase(tool, 'max_concurrent')}); a cap "
+                "below 1 rejects every request with 429, so the tool "
+                "can never serve"
+            )
+            yaml_path = f"tools.{key}.max_concurrent"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=_tool_location(config, yaml_path),
+                    remedy=self.remedy,
+                )
+            )
+        return findings
+
+
+#: The C603 range table, in plan table order (item 6(a)):
+#: ``(field, range phrase the message states, is-out-of-range)``.
+#: ``max_wait_ms: 0`` is legal (flush immediately); ``1`` is the floor
+#: for ``max_batch_size`` / ``workers`` / the six timeouts.
+_C603_RANGES: Final[tuple[tuple[str, str, Callable[[float], bool]], ...]] = (
+    ("max_batch_size", ">= 1", lambda value: value < 1),
+    ("max_wait_ms", ">= 0", lambda value: value < 0),
+    ("workers", ">= 1", lambda value: value < 1),
+    ("start_timeout", "> 0", lambda value: value <= 0),
+    ("ready_timeout", "> 0", lambda value: value <= 0),
+    ("queue_timeout", "> 0", lambda value: value <= 0),
+    ("request_timeout", "> 0", lambda value: value <= 0),
+    ("drain_timeout", "> 0", lambda value: value <= 0),
+    ("stop_timeout", "> 0", lambda value: value <= 0),
+)
+
+
+class _C603Rule(Rule):
+    """``TSWAP-C603``: an out-of-range batching or timeout number."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Flag every out-of-range value, one diagnostic per key.
+
+        One table-driven rule over the nine fields of
+        :data:`_C603_RANGES`, iterated per tool in table order
+        (deterministic, values-independent).  Each check is
+        ``bool``-before-``numeric`` and a non-numeric value is skipped
+        silently (the schema's ``TSWAP-C105`` owns it).  Each
+        diagnostic names its own field, its own value, its own range
+        and its own origin — each is a separate edit.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One ERROR per offending key at ``tools.<key>.<field>``.
+        """
+        findings: list[Diagnostic] = []
+        for key, tool in config.tools.items():
+            for range_field, range_phrase, out_of_range in _C603_RANGES:
+                value = tool.values.get(range_field)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if not out_of_range(value):
+                    continue
+                message = (
+                    f"Tool {key!r} sets {range_field} {value} "
+                    f"({_origin_phrase(tool, range_field)}); {range_field} "
+                    f"must be {range_phrase}"
+                )
+                yaml_path = f"tools.{key}.{range_field}"
+                findings.append(
+                    Diagnostic(
+                        code=self.id,
+                        severity=self.severity,
+                        message=message,
+                        location=_tool_location(config, yaml_path),
+                        remedy=self.remedy,
+                    )
+                )
+        return findings
+
+
+#: ``TSWAP-C600`` — keep_warm: true plus autostart: false (§6 rule 11).
+TSWAP_C600_RULE: Final[Rule] = _C600Rule(
+    id="TSWAP-C600",
+    remedy=(
+        "Resolve the contradiction, one of two: set keep_warm: false — "
+        "the tool then starts on demand and idle-stops after ttl — or "
+        "set autostart: true — the tool then starts at boot and stays "
+        "resident, exempt from TTL. Either key may live in the tool's "
+        "entry or the defaults: block"
+    ),
+)
+
+#: ``TSWAP-C601`` — keep_warm: true plus an explicit ttl > 0 (§6 rule 11,
+#: WARNING).
+TSWAP_C601_RULE: Final[Rule] = _C601Rule(
+    id="TSWAP-C601",
+    severity=Severity.WARNING,
+    remedy=(
+        "Remove the ttl from this tool if keep_warm is what you want, "
+        "or set keep_warm: false if the idle timeout is what you want"
+    ),
+)
+
+#: ``TSWAP-C602`` — max_concurrent at or below zero (§6 rule 11).
+TSWAP_C602_RULE: Final[Rule] = _C602Rule(
+    id="TSWAP-C602",
+    remedy=(
+        "Set max_concurrent to a positive integer, or drop the key to "
+        "leave the tool uncapped; use autostart: false to disable a "
+        "tool"
+    ),
+)
+
+#: ``TSWAP-C603`` — out-of-range batching or timeout numbers (§6 rule 11).
+TSWAP_C603_RULE: Final[Rule] = _C603Rule(
+    id="TSWAP-C603",
+    remedy=(
+        "Set the named field to a value in its range: max_batch_size "
+        ">= 1, max_wait_ms >= 0, workers >= 1, and each of "
+        "start_timeout, ready_timeout, queue_timeout, request_timeout, "
+        "drain_timeout and stop_timeout > 0"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 19 — D9 group starvation, and group capacity (§6 rules 12, 13)
+# ---------------------------------------------------------------------------
+
+#: The pinned C610 mechanism sentence (plan, behaviour 19, item 4).
+_C610_MECHANISM: Final[str] = (
+    "keep_warm exempts a tool from TTL but not from eviction, so "
+    "this group can never satisfy all its members"
+)
+
+
+def group_members(config: ValidatedConfig) -> dict[str, list[ResolvedTool]]:
+    """Every effective group mapped to its member tools (behaviour 19).
+
+    Pure helper: no mutation of ``config`` or anything reachable from
+    it (``effective_groups`` already deep-copies).  A tool whose
+    ``group`` value is not a string, and a tool naming a group absent
+    from the effective block, are a member of NOTHING — neither
+    inflates nor deflates another group's count.  A memberless group
+    still appears, mapped to a fresh empty list.
+
+    Args:
+        config: the validated configuration whose raw ``groups:`` block
+            and resolved ``tools`` are cross-referenced.
+
+    Returns:
+        Effective group name (in :func:`effective_groups` iteration
+        order) -> its member tools (in ``config.tools`` order); every
+        member list is fresh per call, holding the original tool
+        objects.
+    """
+    groups = effective_groups(config.raw)
+    members: dict[str, list[ResolvedTool]] = {name: [] for name in groups}
+    for tool in config.tools.values():
+        group = _effective_group(tool)
+        if group is not None and group in members:
+            members[group].append(tool)
+    return members
+
+
+def _group_max_resident(block: object) -> int | None:
+    """A group's effective ``max_resident``, or ``None`` to skip it.
+
+    An absent key means the schema default, read from
+    :class:`~tool_swap.config.schema.GroupConfig`'s field default (never
+    a literal, so the two cannot drift) — NOT a skip: Pydantic
+    genuinely applies it at runtime, so the starvation is real.
+    ``None`` answers a non-dict block, a ``bool`` (``bool``-before-
+    ``int``), a non-``int`` and any value below 1 (the last is
+    ``TSWAP-C221``'s error, already reported).  With every skipped case
+    removed, every value returned is an ``int >= 1``.
+
+    Args:
+        block: one raw ``groups:`` entry, as authored.
+
+    Returns:
+        The group's effective capacity, or ``None`` when a B19 rule
+        must skip the group silently.
+    """
+    if not isinstance(block, dict):
+        return None
+    if "max_resident" not in block:
+        return int(GroupConfig.model_fields["max_resident"].default)
+    value = block["max_resident"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+class _C610Rule(Rule):
+    """``TSWAP-C610``: every member keep_warm while ``max_resident`` < count."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on a group whose keep-warm members can never all fit.
+
+        Fires when the group's effective ``max_resident`` is an int, the
+        group has at least one member (``all()`` over an empty list is
+        vacuously true; a memberless group is ``TSWAP-C223``'s), EVERY
+        member resolves ``keep_warm`` to ``True`` (identity against the
+        singleton, the ``_C600Rule`` pattern, never truthiness), and
+        ``max_resident < len(members)``.  Layer-blind: a
+        ``defaults:``-level ``keep_warm`` starves exactly like an inline
+        one, and no origin is consulted.  The synthesised ``default``
+        group IS judged.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per starving group, located at
+            ``groups.<name>.max_resident`` (``line`` is ``None`` when the
+            key was never written).
+        """
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, members in group_members(config).items():
+            capacity = _group_max_resident(groups[group_name])
+            if capacity is None or not members:
+                continue
+            if not all(tool.values.get("keep_warm") is True for tool in members):
+                continue
+            if capacity >= len(members):
+                continue
+            message = (
+                f"Group {group_name!r} has {len(members)} members and "
+                "every one of them sets keep_warm: true, but "
+                f"max_resident is {capacity}; {_C610_MECHANISM}"
+            )
+            yaml_path = f"groups.{group_name}.max_resident"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=(
+                        f"Raise the group's max_resident to {len(members)} "
+                        "so every keep-warm member fits, or set "
+                        "eviction: none on the group if pinning these "
+                        "tools was the intent."
+                    ),
+                )
+            )
+        return findings
+
+
+class _C612Rule(Rule):
+    """``TSWAP-C612``: two or more groups sharing a device index."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn when groups sharing a device index would exceed it together.
+
+        A group participates when its effective ``max_resident`` is an
+        int and its RAW block declares ``devices`` as a list of usable
+        indices (``_is_device_index``; a malformed entry is
+        ``TSWAP-C520``'s and simply does not participate).  ``devices``
+        is read from the raw block, NEVER from member
+        ``values["devices"]``: group devices flow into member values
+        through the resolver, and reading them would fire on tools and
+        double-report against ``TSWAP-C523``/``TSWAP-C530``.  This rule
+        is a statement about the ``groups:`` block alone.
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            One WARNING per shared device index (ordered by ascending
+            index, then group name), located at the bare ``groups``
+            block, naming every participating group, its combined
+            capacity and the larger group's.
+        """
+        groups = effective_groups(config.raw)
+        shared: dict[int, list[str]] = {}
+        capacities: dict[str, int] = {}
+        for group_name, block in groups.items():
+            capacity = _group_max_resident(block)
+            if capacity is None:
+                continue
+            devices = block.get("devices")
+            if not isinstance(devices, list):
+                continue
+            indices: set[int] = {i for i in devices if _is_device_index(i)}
+            if not indices:
+                continue
+            capacities[group_name] = capacity
+            for index in indices:
+                shared.setdefault(index, []).append(group_name)
+        findings: list[Diagnostic] = []
+        for index in sorted(shared):
+            names = sorted(shared[index])
+            if len(names) < 2:
+                continue
+            total = sum(capacities[name] for name in names)
+            largest = max(capacities[name] for name in names)
+            # Every capacity is >= 1, so this inequality always holds
+            # for any two-group overlap; it is kept as the plan's
+            # stated comparison, not collapsed, so it survives a future
+            # legal 0.
+            if total <= largest:
+                continue
+            if len(names) == 2:
+                declared = (
+                    f"Groups {names[0]!r} and {names[1]!r} both declare device {index}"
+                )
+            else:
+                listed = (
+                    ", ".join(repr(name) for name in names[:-1]) + f" and {names[-1]!r}"
+                )
+                declared = f"Groups {listed} all declare device {index}"
+            message = (
+                f"{declared}, and their combined max_resident is {total} "
+                f"against the larger group's {largest}; tool-swap does "
+                "not model VRAM in v1, so this is not checked further"
+            )
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path="groups",
+                        line=config.line_for("groups"),
+                    ),
+                    remedy=(
+                        "Give each group its own device, or lower the "
+                        "groups' max_resident so their combined total "
+                        f"fits what device {index} can actually hold; "
+                        "tool-swap cannot verify VRAM capacity in v1."
+                    ),
+                )
+            )
+        return findings
+
+
+class _C613Rule(Rule):
+    """``TSWAP-C613``: ``max_resident`` above the member count."""
+
+    def check(self, config: ValidatedConfig) -> list[Diagnostic]:
+        """Warn on a group with unused capacity (usually a stale config).
+
+        Fires when ``raw`` HAS a ``groups:`` key — the synthesised
+        ``default`` group is exempt, because warning that OUR default
+        exceeds the author's one tool would warn about nothing and break
+        behaviour 23's zero-warnings golden path — and the group's
+        effective ``max_resident`` exceeds its member count.  A
+        memberless group does not fire: it is ``TSWAP-C223``'s finding.
+        Mutually exclusive with ``_C610Rule`` by construction (``>`` vs
+        ``<``; ``==`` fires neither).
+
+        Args:
+            config: the validated configuration to check.
+
+        Returns:
+            At most one WARNING per stale group, located at
+            ``groups.<name>.max_resident``.
+        """
+        if "groups" not in config.raw:
+            return []
+        groups = effective_groups(config.raw)
+        findings: list[Diagnostic] = []
+        for group_name, members in group_members(config).items():
+            capacity = _group_max_resident(groups[group_name])
+            if capacity is None or not members:
+                continue
+            if capacity <= len(members):
+                continue
+            message = (
+                f"Group {group_name!r} has max_resident {capacity} but "
+                f"only {len(members)} members, so "
+                f"{capacity - len(members)} slots can never be used; "
+                "this is harmless, but usually means the group lost "
+                "members and max_resident was not updated"
+            )
+            yaml_path = f"groups.{group_name}.max_resident"
+            findings.append(
+                Diagnostic(
+                    code=self.id,
+                    severity=self.severity,
+                    message=message,
+                    location=Location(
+                        file=str(config.path),
+                        yaml_path=yaml_path,
+                        line=config.line_for(yaml_path),
+                    ),
+                    remedy=(
+                        f"Lower the group's max_resident to {len(members)} "
+                        "to match its members, or add the missing tools "
+                        "to the group if members were removed by "
+                        "mistake; nothing breaks either way."
+                    ),
+                )
+            )
+        return findings
+
+
+#: ``TSWAP-C610`` — every member keep_warm while max_resident is below
+#: the member count (§6 rule 13, WARNING; TSWAP-C611 was withdrawn,
+#: item 0 / A20).
+TSWAP_C610_RULE: Final[Rule] = _C610Rule(
+    id="TSWAP-C610",
+    severity=Severity.WARNING,
+    remedy=(
+        "Raise the group's max_resident to its keep-warm member count, "
+        "or set eviction: none on the group if pinning these tools was "
+        "the intent"
+    ),
+)
+
+#: ``TSWAP-C612`` — two or more groups sharing a device index (§6 rule
+#: 12, WARNING; VRAM is not modelled in v1).
+TSWAP_C612_RULE: Final[Rule] = _C612Rule(
+    id="TSWAP-C612",
+    severity=Severity.WARNING,
+    remedy=(
+        "Give each group its own device, or lower the groups' "
+        "max_resident so their combined total fits the device; "
+        "tool-swap cannot verify VRAM capacity in v1"
+    ),
+)
+
+#: ``TSWAP-C613`` — max_resident above the member count (§6 rule 13,
+#: WARNING; harmless, usually a stale config).
+TSWAP_C613_RULE: Final[Rule] = _C613Rule(
+    id="TSWAP-C613",
+    severity=Severity.WARNING,
+    remedy=(
+        "Lower the group's max_resident to its member count, or add the "
+        "missing tools to the group; nothing breaks either way"
+    ),
+)
+
+
+#: Every rule M1 ships, in code order (behaviour 11a): the single list
+#: M5 moves into preflight.  Behaviours 13-19 append their rules here,
+#: in code order, as they land.
+BUILTIN_RULES: Final[tuple[Rule, ...]] = (
+    TSWAP_C210_RULE,
+    TSWAP_C211_RULE,
+    TSWAP_C220_RULE,
+    TSWAP_C221_RULE,
+    TSWAP_C222_RULE,
+    TSWAP_C223_RULE,
+    TSWAP_C300_RULE,
+    TSWAP_C301_RULE,
+    TSWAP_C302_RULE,
+    TSWAP_C303_RULE,
+    TSWAP_C400_RULE,
+    TSWAP_C401_RULE,
+    TSWAP_C402_RULE,
+    TSWAP_C403_RULE,
+    TSWAP_C404_RULE,
+    TSWAP_C405_RULE,
+    TSWAP_C510_RULE,
+    TSWAP_C511_RULE,
+    TSWAP_C512_RULE,
+    TSWAP_C513_RULE,
+    TSWAP_C514_RULE,
+    TSWAP_C515_RULE,
+    TSWAP_C516_RULE,
+    TSWAP_C520_RULE,
+    TSWAP_C521_RULE,
+    TSWAP_C522_RULE,
+    TSWAP_C523_RULE,
+    TSWAP_C530_RULE,
+    TSWAP_C531_RULE,
+    TSWAP_C532_RULE,
+    TSWAP_C540_RULE,
+    TSWAP_C541_RULE,
+    TSWAP_C542_RULE,
+    TSWAP_C543_RULE,
+    TSWAP_C600_RULE,
+    TSWAP_C601_RULE,
+    TSWAP_C602_RULE,
+    TSWAP_C603_RULE,
+    TSWAP_C610_RULE,
+    TSWAP_C612_RULE,
+    TSWAP_C613_RULE,
+)
+
+
+def register_builtin_rules() -> None:
+    """Register every rule in :data:`BUILTIN_RULES` (idempotent).
+
+    A rule already registered *as the same object* is skipped, so a
+    second call is a silent no-op and never duplicates ids; a rule id
+    registered by a *different* object still raises ``ValueError``
+    through :func:`register`, so the duplicate-id guard is preserved
+    rather than weakened.  This is the one call site the CLI (behaviour
+    21) and the test suite reach; importing this module still registers
+    nothing.
+
+    Raises:
+        ValueError: if a rule id is claimed by a different object.
+    """
+    registered_by_id: dict[str, Rule] = {rule.id: rule for rule in RULES}
+    for rule in BUILTIN_RULES:
+        if registered_by_id.get(rule.id) is rule:
+            continue
+        register(rule)
+
+
+def _internal_diagnostic(
+    rule: Rule, exception: Exception, config: ValidatedConfig
+) -> Diagnostic:
+    """Build the one internal diagnostic for a rule whose ``check`` raised.
+
+    Args:
+        rule: the failing rule (its id is named in the message).
+        exception: the exception the rule raised (its text is named).
+        config: the config being validated (its path is the location).
+
+    Returns:
+        A ``TSWAP-C999`` ERROR diagnostic with a non-empty remedy.
+    """
+    return Diagnostic(
+        code=_INTERNAL_RULE_CODE,
+        severity=Severity.ERROR,
+        message=(
+            f"Validator rule {rule.id} raised {type(exception).__name__}: "
+            f"{exception}; its findings may be incomplete."
+        ),
+        location=Location(file=str(config.path)),
+        remedy=_INTERNAL_REMEDY,
+    )
+
+
+def validate_config(config: ValidatedConfig) -> ConfigReport:
+    """Run every registered rule and aggregate all findings in one report.
+
+    Pure with respect to its input: no filesystem, no clock, no
+    environment reads, and no mutation of ``config`` or its nested data.
+    Runs **every** rule (never stopping at the first error); a rule whose
+    ``check`` raises an unexpected exception is caught and reported as one
+    internal ``TSWAP-C999`` diagnostic, while the other rules' diagnostics
+    are still present.  Registration order does not affect the outcome:
+    the report's diagnostics are passed pre-sorted in the behaviour-2
+    ``(file, line or 0, code)`` order.
+
+    Args:
+        config: the validated configuration to run the rules against.
+
+    Returns:
+        One :class:`~tool_swap.config.errors.ConfigReport` holding every
+        diagnostic; an empty (ok, exit code 0) report when no rules are
+        registered or none find anything.
+    """
+    diagnostics: list[Diagnostic] = []
+    for rule in RULES:
+        try:
+            diagnostics.extend(rule.check(config))
+        except Exception as exception:
+            diagnostics.append(_internal_diagnostic(rule, exception, config))
+    return ConfigReport(diagnostics=tuple(sorted(diagnostics)))
+
+
+def downgrade_missing_descriptions(report: ConfigReport) -> ConfigReport:
+    """Downgrade the missing-description diagnostics of a report.
+
+    The ``--allow-missing-descriptions`` post-processor (plan block 6,
+    mechanism (a)): the rules always emit their documented severities and
+    this pure function rewrites the report, so it is unit-testable before
+    the CLI (behaviour 21) exists.
+
+    Every diagnostic whose code is in :data:`MISSING_DESCRIPTION_CODES`
+    (``C300``, ``C301``, ``C303`` — but never ``C302``, which is already a
+    warning) is returned with severity :attr:`Severity.WARNING` and the
+    pinned banner appended to its ``message`` as
+    ``f"{original} — {ALLOW_MISSING_DESCRIPTIONS_BANNER}"``, so the banner
+    is part of the diagnostic and survives ``--json``.  Every other
+    diagnostic passes through untouched and the input report is not
+    mutated.
+
+    Idempotent: a diagnostic already carrying the banner is returned
+    unchanged, so a double call (e.g. a CLI refactor calling this twice)
+    yields the same report.  ``--strict`` + ``--allow-missing-descriptions``
+    is contradictory and ``--strict`` wins: the downgrade runs first, then
+    ``--strict`` promotes warnings back to errors.
+
+    Args:
+        report: the report to downgrade (never mutated).
+
+    Returns:
+        A NEW :class:`~tool_swap.config.errors.ConfigReport` with the
+        rewritten diagnostics in the original order.
+    """
+    new_diagnostics: list[Diagnostic] = []
+    for diagnostic in report.diagnostics:
+        if diagnostic.code not in MISSING_DESCRIPTION_CODES:
+            new_diagnostics.append(diagnostic)
+            continue
+        if ALLOW_MISSING_DESCRIPTIONS_BANNER in diagnostic.message:
+            new_diagnostics.append(replace(diagnostic, severity=Severity.WARNING))
+            continue
+        new_diagnostics.append(
+            replace(
+                diagnostic,
+                severity=Severity.WARNING,
+                message=(f"{diagnostic.message} — {ALLOW_MISSING_DESCRIPTIONS_BANNER}"),
+            )
+        )
+    return ConfigReport(diagnostics=tuple(new_diagnostics))
