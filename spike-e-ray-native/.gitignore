@@ -3,3 +3,4 @@ results/metrics/
 .env
 *.log
 __pycache__/
+vendor/
