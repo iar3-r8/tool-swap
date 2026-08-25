@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -38,10 +39,17 @@ def run() -> None:
     print("=== Part A: Decorator/ray_actor_options form ===")
 
     try:
-        import subprocess
         result = subprocess.run(
-            ["serve", "deploy", "apps/step1_two_deployments.py", "step1_app"],
-            capture_output=True, text=True, timeout=120,
+            [
+                "serve",
+                "deploy",
+                "step1_two_deployments:application",
+                "--name",
+                "step1_app",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         recorder.write(block("serve deploy output", result.stdout + result.stderr))
         print(f"Deploy exit code: {result.returncode}")

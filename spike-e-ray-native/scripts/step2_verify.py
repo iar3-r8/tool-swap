@@ -23,8 +23,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from recorder import Recorder, record, block
 from serve_api import serve_status, get_application, post_introspect, apply_config
 
-TORCH_URL = os.environ.get("SPIKE_SERVE_URL_TORCH", "http://localhost:8000")
-TF_URL = os.environ.get("SPIKE_SERVE_URL_TF", "http://localhost:8001")
+# One HTTP proxy serves the whole cluster on :8000; the two apps are
+# separated by route_prefix (see apps/step2_config.yaml), not by port.
+TORCH_URL = os.environ.get("SPIKE_SERVE_URL_TORCH", "http://localhost:8000/torch")
+TF_URL = os.environ.get("SPIKE_SERVE_URL_TF", "http://localhost:8000/tf")
 
 
 def run() -> None:
