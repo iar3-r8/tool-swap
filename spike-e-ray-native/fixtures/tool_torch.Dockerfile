@@ -14,13 +14,16 @@ RUN pip install --no-cache-dir \
     requests
 
 # === Baked assets (must run before COPY toolkit, so assets are cached) ===
+# ASSET_SEED must differ from tool_tf's — step 2 needs distinct weight bytes.
 COPY fixtures/make_assets.py /tmp/make_assets.py
 ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
+ARG ASSET_SEED=1001
 RUN python /tmp/make_assets.py \
       --weights /opt/spike/weights/ckpt.bin --weights-mb ${WEIGHTS_MB} \
       --payload /opt/spike/data/payload.bin --payload-mb ${PAYLOAD_MB} \
-   && rm /tmp/make_assets.py
+      --seed ${ASSET_SEED} \
+    && rm /tmp/make_assets.py
 ENV SPIKE_WEIGHTS_PATH=/opt/spike/weights/ckpt.bin
 ENV SPIKE_PAYLOAD_PATH=/opt/spike/data/payload.bin
 

@@ -13,7 +13,8 @@ content would make any future read measurement optimistic.
 Usage (normally invoked via RUN inside the Dockerfile):
     python make_assets.py \
         --weights /opt/spike/weights/ckpt.bin --weights-mb 8 \
-        --payload /opt/spike/data/payload.bin --payload-mb 64
+        --payload /opt/spike/data/payload.bin --payload-mb 64 \
+        --seed 1001
 """
 from __future__ import annotations
 
@@ -74,6 +75,8 @@ def main() -> None:
     ap.add_argument("--weights-mb", type=int, default=8, help="Checkpoint size in MB")
     ap.add_argument("--payload", required=True, help="Path to payload file")
     ap.add_argument("--payload-mb", type=int, default=64, help="Payload size in MB")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="PRNG seed base; payload uses seed+1")
     args = ap.parse_args()
 
     weights_bytes = args.weights_mb * 1024 * 1024
@@ -82,10 +85,10 @@ def main() -> None:
     print(f"Baking assets: weights={args.weights} ({args.weights_mb} MB), "
           f"payload={args.payload} ({args.payload_mb} MB)")
 
-    w_meta = _generate_file(args.weights, weights_bytes, seed=42)
+    w_meta = _generate_file(args.weights, weights_bytes, seed=args.seed)
     print(f"  weights: {w_meta['size_bytes']} bytes, sha256={w_meta['sha256']}")
 
-    p_meta = _generate_file(args.payload, payload_bytes, seed=137)
+    p_meta = _generate_file(args.payload, payload_bytes, seed=args.seed + 1)
     print(f"  payload: {p_meta['size_bytes']} bytes, sha256={p_meta['sha256']}")
 
     # Write sidecar .meta.json alongside each asset

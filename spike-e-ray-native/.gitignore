@@ -2,3 +2,4 @@ results/raw/
 results/metrics/
 .env
 *.log
+__pycache__/

@@ -5,10 +5,10 @@
 # Each application has a unique route_prefix so the ServeDeploySchema
 # uniqueness validator does not reject the pair.
 #
-# NOTE: image_uri is omitted because podman is broken in this dev container
-# (cannot clone: Operation not permitted). This config tests the builder
-# pattern only — not image isolation. Image isolation must be tested on
-# a host where podman works (e.g. DGX).
+# NOTE: image_uri is set here, so this config tests the builder pattern
+# AND per-image isolation. The podman restriction that applied in the
+# dev container (cannot clone: Operation not permitted) no longer holds
+# on the host, where podman works and image_uri containers can start.
 
 applications:
   - name: step2_torch
@@ -18,7 +18,7 @@ applications:
       weights_path: /opt/spike/weights/ckpt.bin
       framework: torch
       vram_mb: 4096
-      image_uri: ""
+      image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
 
   - name: step2_tf
     import_path: step2_builder:build
@@ -27,4 +27,4 @@ applications:
       weights_path: /opt/spike/weights/ckpt.bin
       framework: tensorflow
       vram_mb: 4096
-      image_uri: ""
+      image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"
