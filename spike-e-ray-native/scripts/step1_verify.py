@@ -17,7 +17,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from recorder import Recorder, record, block
-from serve_api import serve_status, post_introspect
+from serve_api import serve_status, post_introspect, apply_config
 
 TOOL_URL_TORCH = os.environ.get(
     "SPIKE_SERVE_URL_TORCH", "http://localhost:8000/torch"
@@ -114,10 +114,9 @@ def run() -> None:
     print("")
     print("=== Part B: YAML config form ===")
     try:
-        result = subprocess.run(
-            ["serve", "deploy", "apps/step1_config.yaml"],
-            capture_output=True, text=True, timeout=120,
-        )
+        # Render ${VAR:default} placeholders before deploy — Ray does
+        # yaml.safe_load with no substitution (diagnosis §2.2).
+        result = apply_config("apps/step1_config.yaml")
         recorder.write(block("serve deploy (YAML) output", result.stdout + result.stderr))
         print(f"YAML deploy exit code: {result.returncode}")
         if result.returncode == 0:
