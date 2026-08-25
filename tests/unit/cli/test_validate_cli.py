@@ -68,6 +68,16 @@ import re
 from pathlib import Path
 
 import pytest
+import typer.main
+
+# ``conftest`` is importable here because pytest's default prepend
+# importmode puts the ``tests/`` directory on ``sys.path`` when it loads
+# ``tests/conftest.py`` (no ``__init__.py`` at that level, so it is imported
+# as a top-level module). This is the one cross-directory sharing point the
+# repo allows: leaf test dirs have no ``__init__.py`` and import sibling test
+# modules by relative path, but the shared conftest is loadable by name.
+from conftest import normalize_help_output
+from typer.core import TyperArgument, TyperOption
 from typer.testing import CliRunner
 
 from tool_swap.__main__ import app
@@ -99,19 +109,21 @@ _FLAG_BANNER = (
     "and is never permitted in CI"
 )
 
-# Each flag must appear on its own help line followed by a non-trivial
-# description (plan item 12: at least 10 characters after the flag).
-_FLAG_HELP_RES = {
-    "--config": re.compile(r"(?m)^.*--config\b.{10,}$"),
-    "--env-file": re.compile(r"(?m)^.*--env-file\b.{10,}$"),
-    "--all": re.compile(r"(?m)^.*\s--all\b.{10,}$"),
-    "--strict": re.compile(r"(?m)^.*--strict\b.{10,}$"),
-    "--json": re.compile(r"(?m)^.*\s--json\b.{10,}$"),
-    "--allow-missing-descriptions": re.compile(
-        r"(?m)^.*--allow-missing-descriptions\b.{10,}$"
-    ),
-}
-_TOOL_ARG_RE = re.compile(r"(?m)^.*\bTOOL\b.{10,}$")
+# The EXACT documented flag surface of ``tswap validate`` (plan item 12).
+# The metadata test asserts set-equality, so adding or dropping a flag
+# without updating this list fails the suite (and vice versa).
+_VALIDATE_FLAGS = (
+    "--config",
+    "--env-file",
+    "--all",
+    "--strict",
+    "--json",
+    "--allow-missing-descriptions",
+)
+#: A declared help string shorter than this is "trivial" (plan item 12).
+_MIN_HELP_LEN = 10
+#: The metavar of validate's single positional argument.
+_TOOL_METAVAR = "TOOL"
 
 # ---------------------------------------------------------------------------
 # Runner / env (verbatim copy of tests/unit/test_cli.py's shipped pattern —
@@ -351,17 +363,109 @@ def _invoke(runner: CliRunner, config_path: Path, *args: str) -> object:
 # ---------------------------------------------------------------------------
 
 
+def _validate_click_command() -> object:
+    """Return the Click command object for ``tswap validate``.
+
+    ``typer.main.get_command`` is the documented bridge from a Typer app to
+    its Click representation; the returned command's ``.params`` and
+    ``.commands`` are then walked directly, never re-rendered.
+    """
+    root = typer.main.get_command(app)
+    return root.commands["validate"]
+
+
+def _flag_opts(command: object) -> set[str]:
+    """Return the long-option strings (``--foo``) declared on *command*."""
+    opts: set[str] = set()
+    for param in command.params:  # type: ignore[attr-defined]
+        if isinstance(param, TyperOption):
+            opts.update(param.opts)
+            opts.update(param.secondary_opts)
+    return opts
+
+
+def _tool_argument(command: object) -> object:
+    """Return the single ``TyperArgument`` on *command*, or None."""
+    args = [
+        p
+        for p in command.params  # type: ignore[attr-defined]
+        if isinstance(p, TyperArgument)
+    ]
+    assert len(args) == 1, (
+        f"Expected exactly one positional argument on the command, got {len(args)}"
+    )
+    return args[0]
+
+
 class TestHelp:
-    """``tswap validate --help`` lists every flag with a description."""
+    """``tswap validate --help`` lists every flag with a description.
 
-    def test_validate_help_exits_zero_and_lists_every_flag(
-        self, runner: CliRunner
-    ) -> None:
-        """Exit 0; each of the six flags and the TOOL argument appear.
+    The documented CLI surface is pinned in two layers, chosen because the
+    rendered ``--help`` text is UNRELIABLE on GitHub Actions:
 
-        Plan item 12: every surface name must be present with a
-        non-trivial one-line description (>= 10 characters after the flag),
-        so asserting presence alone cannot pass against empty help strings.
+    - ``typer/rich_utils.py`` evaluates ``FORCE_TERMINAL`` from the real
+      process environment at module-import time, so
+      ``CliRunner(env={"NO_COLOR": "1"})`` — applied only at ``invoke()``
+      time — cannot stop Rich from styling the help;
+    - with ``force_terminal=True`` Rich injects ANSI escapes mid-token
+      (``\\x1b[1m--config\\x1b[0m`` makes ``"--config" in stdout`` False)
+      AND wraps long lines, pushing a flag's description onto a
+      continuation line.
+
+    Layer 1 therefore asserts the DECLARED command metadata (zero rendering
+    involved) and Layer 2 a normalised (escape-stripped, whitespace-
+    collapsed) smoke check that the text actually reaches ``--help`` output.
+    """
+
+    def test_validate_help_exits_zero_and_lists_every_flag(self) -> None:
+        """Every declared flag and the TOOL argument carries a real help string.
+
+        Plan item 12, asserted against the command metadata rather than the
+        rendered help: each option in ``_VALIDATE_FLAGS`` must be declared
+        on the Click command with a help string of at least
+        ``_MIN_HELP_LEN`` characters, the positional TOOL argument must do
+        the same, and the declared option set must equal ``_VALIDATE_FLAGS``
+        exactly — so both dropping and sneaking in a flag fail the suite.
+        This has zero dependence on terminal width or ANSI rendering.
+        """
+        command = _validate_click_command()
+
+        opts = _flag_opts(command)
+        assert opts == set(_VALIDATE_FLAGS), (
+            f"The declared validate flags must be exactly "
+            f"{sorted(_VALIDATE_FLAGS)}, got {sorted(opts)}"
+        )
+        for flag in _VALIDATE_FLAGS:
+            param = next(
+                p
+                for p in command.params  # type: ignore[attr-defined]
+                if isinstance(p, TyperOption) and flag in p.opts
+            )
+            assert isinstance(param.help, str) and len(param.help) >= _MIN_HELP_LEN, (
+                f"Flag {flag} must declare a help string of at least "
+                f"{_MIN_HELP_LEN} characters, got {param.help!r}"
+            )
+        tool = _tool_argument(command)
+        assert tool.metavar == _TOOL_METAVAR, (
+            f"Expected the positional argument to render as {_TOOL_METAVAR}, "
+            f"got {tool.metavar!r}"
+        )
+        assert isinstance(tool.help, str) and len(tool.help) >= _MIN_HELP_LEN, (
+            f"The TOOL argument must declare a help string of at least "
+            f"{_MIN_HELP_LEN} characters, got {tool.help!r}"
+        )
+
+    def test_validate_help_smoke_renders_every_flag(self, runner: CliRunner) -> None:
+        """``validate --help`` exits 0 and shows every flag name in its text.
+
+        Layer 2 (rendering smoke): proves the metadata above actually
+        reaches ``--help`` output. The output is normalised through
+        ``normalize_help_output`` (shared conftest helper) — ANSI escapes
+        stripped AND whitespace collapsed — because on GitHub Actions Rich
+        both injects escapes mid-token and wraps lines, so raw substring
+        or line-anchor assertions are unreliable. Whole-token membership
+        on the collapsed line is the weakest check that still survives
+        both failure modes.
         """
         result = runner.invoke(app, ["validate", "--help"])
 
@@ -369,25 +473,52 @@ class TestHelp:
             f"Expected exit 0, got {result.exit_code}. "
             f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
         )
-        for flag, pattern in _FLAG_HELP_RES.items():
-            assert pattern.search(result.stdout), (
-                f"Expected '{flag}' with a one-line description in "
-                f"validate --help. Got:\n{result.stdout}"
+        normalized = normalize_help_output(result.stdout)
+        for token in (*_VALIDATE_FLAGS, _TOOL_METAVAR):
+            assert token in normalized, (
+                f"Expected {token!r} in the normalised validate --help "
+                f"output. Normalised:\n{normalized}"
             )
-        assert _TOOL_ARG_RE.search(result.stdout), (
-            "Expected the TOOL positional argument with a description in "
-            f"validate --help. Got:\n{result.stdout}"
+
+    def test_root_help_lists_validate_subcommand(self) -> None:
+        """The root command declares ``validate`` with a description.
+
+        Metadata form: the root Click group's ``.commands`` dict must map
+        ``"validate"`` to a command whose ``.help`` is non-trivial. The
+        previous rendered-text assertion (``\\bvalidate\\b`` on a help
+        line) was doubly broken on GitHub Actions — Rich's bold SGR reset
+        sits immediately before the name so ``\\b`` finds no boundary, and
+        the same pattern passed for ``config`` only via a FALSE POSITIVE
+        (the word "config" inside validate's description).
+        """
+        root = typer.main.get_command(app)
+
+        assert "validate" in root.commands, (
+            f"Expected a 'validate' subcommand on the root, got {sorted(root.commands)}"
+        )
+        help_ = root.commands["validate"].help
+        assert isinstance(help_, str) and len(help_) >= 3, (
+            f"The validate subcommand must declare a non-trivial help "
+            f"string, got {help_!r}"
         )
 
-    def test_root_help_lists_validate_subcommand(self, runner: CliRunner) -> None:
-        """The root ``tswap --help`` names the new validate command."""
+    def test_root_help_smoke_lists_validate_and_config(self, runner: CliRunner) -> None:
+        """``tswap --help`` exits 0 and shows both subcommand names.
+
+        Rendering smoke (layer 2) for the root: the normalised output must
+        contain the whole tokens ``validate`` and ``config`` — the latter
+        asserted here as a token because on a raw line it only ever appears
+        as a false positive inside validate's description.
+        """
         result = runner.invoke(app, ["--help"])
 
         assert result.exit_code == 0
-        assert re.search(r"(?m)^.*\bvalidate\b.{3,}$", result.stdout), (
-            "Expected 'validate' with a description in the root help. "
-            f"Got:\n{result.stdout}"
-        )
+        normalized = normalize_help_output(result.stdout)
+        for token in ("validate", "config"):
+            assert token in normalized, (
+                f"Expected {token!r} in the normalised root --help output. "
+                f"Normalised:\n{normalized}"
+            )
 
 
 # ---------------------------------------------------------------------------
