@@ -12,7 +12,11 @@
 # application level.
 
 applications:
+  # Explicit route_prefixes: two applications both defaulting to "/" are
+  # rejected by ServeDeploySchema ("duplicate applications for route
+  # prefix '/'"). step3_gate.py polls /tool_torch and /tool_tf.
   - name: tool_torch
+    route_prefix: /tool_torch
     import_path: step3_gpu_swap:application_torch
     deployments:
       - name: ToolTorch
@@ -27,6 +31,7 @@ applications:
           look_back_period_s: 15
 
   - name: tool_tf
+    route_prefix: /tool_tf
     import_path: step3_gpu_swap:application_tf
     deployments:
       - name: ToolTf

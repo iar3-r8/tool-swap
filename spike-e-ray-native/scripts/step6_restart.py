@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from recorder import Recorder, record, block
-from serve_api import serve_status, get_application
+from serve_api import serve_status
 from nvidia import snapshot_vram
 from podman import podman_ps_all, podman_ps_count
 
@@ -145,6 +145,19 @@ def phase_a(recorder: Recorder) -> None:
 
 
 # ── Phase B: Replica actor kill ──────────────────────────────────
+# Data source: GET /api/serve/applications/ (serve_head.py:81) — the
+# only application route; there is no per-application GET, so
+# get_application() would 404. Payload shape per ServeInstanceDetails
+# (schema.py:1723): applications[name].deployments[dep].replicas, and
+# each replica exposes `pid` (ReplicaDetails, schema.py:1285, populated
+# from the actor's PID in deployment_state.py:1792).
+def _tool_torch_dep(status: dict) -> dict:
+    """Return the ToolTorch deployment details from a serve status dict."""
+    app = status.get("applications", {}).get("tool_torch", {})
+    # Deployment name as declared in apps/step6_config.yaml.
+    return app.get("deployments", {}).get("ToolTorch", {})
+
+
 def phase_b(recorder: Recorder) -> None:
     """Kill a replica actor, observe unattended recovery."""
     print("")
@@ -155,12 +168,20 @@ def phase_b(recorder: Recorder) -> None:
     # Find the serving application and its replica PID
     print("\n=== Finding replica ===")
     try:
-        apps = get_application("tool_torch")
-        print(f"tool_torch app: {json.dumps(apps, indent=2)}")
-        recorder.write(block("tool_torch app state", json.dumps(apps, indent=2)))
+        apps = serve_status()
+        app = apps.get("applications", {}).get("tool_torch")
+        print(f"tool_torch app: {json.dumps(app, indent=2)}")
+        recorder.write(block("tool_torch app state", json.dumps(app, indent=2)))
+
+        if app is None:
+            print("tool_torch application not found in serve status")
+            recorder.write(block("Phase B", "tool_torch application not found"))
+            return
+
+        dep = _tool_torch_dep(apps)
 
         # Look for replicas
-        for replica in apps.get("replicas", []):
+        for replica in dep.get("replicas", []):
             pid = replica.get("pid")
             if pid:
                 print(f"Found replica PID: {pid}")
@@ -175,9 +196,14 @@ def phase_b(recorder: Recorder) -> None:
                 print("\n=== Watching for unattended recovery ===")
                 for _ in range(30):
                     time.sleep(2)
-                    apps_after = get_application("tool_torch")
-                    status = apps_after.get("status", "unknown")
-                    replicas = apps_after.get("replicas", [])
+                    apps_after = serve_status()
+                    dep_after = _tool_torch_dep(apps_after)
+                    # Deployment-level status; the app-level enum is
+                    # ApplicationStatus (RUNNING when healthy, never
+                    # "HEALTHY" — schema.py:1171), so the healthy
+                    # check applies to DeploymentStatus (schema.py).
+                    status = dep_after.get("status", "unknown")
+                    replicas = dep_after.get("replicas", [])
                     print(f"  Status: {status}, Replicas: {len(replicas)}")
                     for r in replicas:
                         print(f"    PID: {r.get('pid')}, state: {r.get('state')}")

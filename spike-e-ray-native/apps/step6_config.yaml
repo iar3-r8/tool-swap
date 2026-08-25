@@ -6,7 +6,11 @@
 # inside the deployments list.
 
 applications:
+  # Explicit route_prefixes: two applications both defaulting to "/" are
+  # rejected by ServeDeploySchema ("duplicate applications for route
+  # prefix '/'").
   - name: tool_torch
+    route_prefix: /tool_torch
     import_path: step3_gpu_swap:application_torch
     deployments:
       - name: ToolTorch
@@ -18,6 +22,7 @@ applications:
           downscale_to_zero_delay_s: 60
 
   - name: tool_tf
+    route_prefix: /tool_tf
     import_path: step3_gpu_swap:application_tf
     deployments:
       - name: ToolTf
