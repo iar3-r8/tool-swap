@@ -1,9 +1,10 @@
 # ============================================================================
 # tools.example.yaml — a complete, validated tool-swap configuration.
 #
-# Every key below is documented in plan/02_CONFIGURATION.md §3.  This file is
-# validated in CI with `tswap validate --config tools.example.yaml --strict`,
-# so it is guaranteed to be free of errors AND warnings: copy from it freely.
+# Every key below is documented in docs/configuration.md (the generated
+# reference).  This file is validated in CI with
+# `tswap validate --config tools.example.yaml --strict`, so it is guaranteed
+# to be free of errors AND warnings: copy from it freely.
 #
 # Every ${VAR:-} carries a default, so the file validates with an empty
 # environment.  Every path it names exists in this repository.
@@ -40,8 +41,8 @@ backend:
 # ---------------------------------------------------------------------------
 # Defaults inherited by every tool. Any key here can be overridden per tool.
 # NOTE: devices: is deliberately NOT set here — a defaults-level devices:
-# outranks a group's devices: (plan/02 §4.1, assumption A11), which would
-# silently empty every group's GPU assignment below.
+# outranks a group's devices:, which would silently empty every group's
+# GPU assignment below.
 # ---------------------------------------------------------------------------
 defaults:
   # --- lifecycle / TTL ---
@@ -98,7 +99,8 @@ groups:
     eviction: lru
 
 # ---------------------------------------------------------------------------
-# Tools — one of each of the three documented forms (plan/02 §3, plan/03 §2)
+# Tools — one of each of the three documented forms
+# (docs/configuration-guide.md, "Three ways to define a tool")
 # ---------------------------------------------------------------------------
 tools:
 

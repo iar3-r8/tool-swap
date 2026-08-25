@@ -26,46 +26,45 @@ tswap --help
 
 ## Configuration
 
-Tool-swap is configured by one `tools.yaml` file plus a directory per tool.
-Requirement R4 — a working single-model config must fit in five lines — is
-the design bar, and it holds: the committed
-[`tools/example_echo`](tools/example_echo/tool.yaml) fixture is the proof,
-and
-[`test_the_minimal_config_is_at_most_five_lines`](tests/unit/config/test_minimal_config.py:226)
-asserts it mechanically.
-
-The minimum is a tool name pointing at a directory:
+A working single-model config is three lines: a tool name pointing at a
+directory that holds the tool's configuration file (`tool.yaml`).
 
 ```yaml
+# tools.yaml
 tools:
   example_echo:
     path: ./tools/example_echo
 ```
 
-The committed [`tools.example.yaml`](tools.example.yaml) shows the full
-surface, and every key has its type, default and description in the
-generated reference [`docs/configuration.md`](docs/configuration.md); the
-design rationale is in
-[`plan/02_CONFIGURATION.md`](plan/02_CONFIGURATION.md).
+While this is the minimum that tool-swap requires to configure tools, more options can be provided to overide default values. A full example with all parameters is provided here: [`tools.example.yaml`](tools.example.yaml).
 
-**Validating.** `tswap validate` runs the whole pipeline in one pass; each
-diagnostic carries a `TSWAP-C*`/`TSWAP-S*` code, a location and a remedy.
-Exit 0 (warnings, if any, on stderr), exit 1 (errors; `--strict` also
-promotes warnings), exit 2 (the config file could not be read). `--json`
-prints the report on stdout and nothing else.
+Note that it is possible to use tswap to validate your configuration file. Any error will be reported with clear error message and how to fix it:
 
-**Inspecting.** `tswap config show [tool]` prints the fully-resolved config
-with each value's origin — which layer set it. `--verbose` also shows the
-shadowed values each setting overrode; `--json` emits the
-`{config, router, backend, tools}` envelope on stdout; `--show-secrets`
-prints secret values instead of `***` (local use only, no banner).
+```bash
+tswap validate --config tools.example.yaml --strict
+```
 
-**The example.** `tools.example.yaml` is validated in CI with `--strict`,
-so it is guaranteed free of errors AND warnings — copy from it freely.
+**First steps.**
 
-**Troubleshooting.** Every `TSWAP-C*`/`TSWAP-S*` code maps to a cause and a
-fix in the troubleshooting table in
-[`docs/configuration.md`](docs/configuration.md).
+1. **Check your config.** `tswap validate` loads, resolves and checks the
+   whole file in one pass. Exit 0 means you are good, with any warnings
+   on stderr; exit 1 means errors; exit 2 means the file could not be
+   read. Each diagnostic names the problem with a `TSWAP-C*` or
+   `TSWAP-S*` code, points at the exact spot, and suggests the fix. Add
+   `--strict` to fail on warnings too, or `--json` for a
+   machine-readable report.
+2. **See what tool-swap resolved.** `tswap config show [tool]` prints
+   every effective value with its origin, so you can see which layer set
+   it. `--verbose` also shows the values each setting overrode.
+3. **Keep reading.** The [Configuration guide](docs/configuration-guide.md)
+   walks from this three-line minimum to a full multi-GPU setup: the
+   three ways to define a tool, defaults and groups, how values resolve,
+   and environment variables.
+
+**Go deeper.** Every key's type, default and description lives in the
+generated [Configuration reference](docs/configuration.md), and every
+diagnostic code maps to a cause and a fix in its
+[troubleshooting table](docs/configuration.md#troubleshooting-every-diagnostic-code).
 
 ## Get started
 
@@ -125,14 +124,14 @@ tool-swap/
 │
 ├── docker/                     # Dockerfiles (router base images)
 │   └── base/                   # CPU and CUDA base images
-├── templates/                  # tswap new templates (cpu, cuda, tensorflow, function)
+├── templates/                  # Tool templates (cpu, cuda, tensorflow, function)
 ├── models/                     # Model zoo (gitignored, examples included)
 ├── tests/                      # pytest suite (unit, integration, e2e)
 │   ├── unit/                   # Unit tests mirroring src/ structure
 │   ├── runtime/contract/       # Runtime contract tests
 │   ├── integration/            # Docker-based integration tests
 │   └── e2e/                    # End-to-end quickstart test
-├── docs/                       # Documentation (quickstart, operations, architecture)
+├── docs/                       # User documentation (configuration guide, generated reference)
 ├── deploy/                     # Deployment artifacts (systemd, prometheus, grafana)
 └── plan/                       # Implementation plans and architecture docs
 ```
