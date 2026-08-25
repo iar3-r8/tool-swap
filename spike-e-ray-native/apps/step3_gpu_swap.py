@@ -62,5 +62,8 @@ class ToolTf(Tool):
 
 
 # ── Applications ───────────────────────────────────────────────
-application_torch = serve.Application(ToolTorch.bind())
-application_tf = serve.Application(ToolTf.bind())
+# .bind() already returns an Application; wrapping it again in
+# serve.Application() would fail (its __init__ takes one bound
+# deployment). Same double-wrap fixed in step2_builder.py.
+application_torch = ToolTorch.bind()
+application_tf = ToolTf.bind()

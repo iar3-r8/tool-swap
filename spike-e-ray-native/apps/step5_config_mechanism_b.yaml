@@ -2,24 +2,48 @@
 # Same as mechanism A but without external_scaler_enabled.
 # Replicas are controlled by sending the full config with flipped counts.
 # This is applied dynamically by step5_alternate.py, not via serve deploy.
+#
+# D9 fix: ServeApplicationSchema (ray/serve/schema.py:712) defines neither
+# ray_actor_options nor autoscaling_config at the application level, and sets
+# no extra="forbid", so pydantic's extra="ignore" silently discarded the old
+# application-level keys — mechanism B "worked" while changing nothing (a false
+# step-5 result). Replica/scale keys now live in the deployments list, where
+# DeploymentSchema (schema.py:309) actually reads them.
+#
+# autoscaling_config is set to null at the deployment level on purpose: the
+# @serve.deployment decorator in step3_gpu_swap.py sets an autoscaling_config
+# that survives the config merge (application_state.py:1942), and the
+# controller then drives the replica count from the autoscaler
+# (deployment_state.py:3550), ignoring the YAML num_replicas. Nulling it makes
+# num_replicas authoritative. (Deployment-level autoscaling_config IS a valid
+# key per DeploymentSchema, schema.py:356 — verified from source, not memory.)
+#
+# CAVEAT (reported): num_replicas cannot be 0 in the schema (PositiveInt), so
+# this committed template cannot express the "off" (0) state. The mechanism-B
+# loop (a stub in step5_alternate.py) must handle bringing a tool to 0. See the
+# item-8 report.
 
 applications:
   - name: step5_torch
     import_path: step3_gpu_swap:application_torch
-    ray_actor_options:
-      num_replicas: 1
-      num_gpus: 1
-    autoscaling_config:
-      min_replicas: 1
-      max_replicas: 1
-      downscale_to_zero_delay_s: 60
+    route_prefix: /tool_torch
+    deployments:
+      - name: ToolTorch
+        num_replicas: 1
+        autoscaling_config: null
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
 
   - name: step5_tf
     import_path: step3_gpu_swap:application_tf
-    ray_actor_options:
-      num_replicas: 0
-      num_gpus: 1
-    autoscaling_config:
-      min_replicas: 0
-      max_replicas: 0
-      downscale_to_zero_delay_s: 60
+    route_prefix: /tool_tf
+    deployments:
+      - name: ToolTf
+        num_replicas: 1
+        autoscaling_config: null
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"

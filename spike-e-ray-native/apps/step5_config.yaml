@@ -11,7 +11,8 @@
 
 applications:
   - name: step5_torch
-    import_path: step5_config:application_torch
+    import_path: step3_gpu_swap:application_torch
+    route_prefix: /tool_torch
     deployments:
       - name: ToolTorch
         num_replicas: 1
@@ -22,7 +23,8 @@ applications:
     external_scaler_enabled: true
 
   - name: step5_tf
-    import_path: step5_config:application_tf
+    import_path: step3_gpu_swap:application_tf
+    route_prefix: /tool_tf
     deployments:
       - name: ToolTf
         num_replicas: 1

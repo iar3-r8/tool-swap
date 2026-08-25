@@ -73,9 +73,12 @@ def run() -> None:
         print("\nWaiting for Serve to stabilize...")
         time.sleep(10)
         status = serve_status()
-        apps = status.get("applications", [])
-        for app in apps:
-            print(f"  {app.get('name')}: {app.get('status')}")
+        # In Ray 2.57+, applications is a dict {name: details} or {name: status_str}
+        # (ServeInstanceDetails.applications, schema.py:1764), not a list.
+        apps = status.get("applications", {})
+        for name, a in apps.items():
+            st = a.get("status", "UNKNOWN") if isinstance(a, dict) else str(a)
+            print(f"  {name}: {st}")
         recorder.write(block("serve status after deploy", json.dumps(status, indent=2)))
 
         # ── 4. Request tool_torch (cold start) ──────────────────

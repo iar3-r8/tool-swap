@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from recorder import Recorder, record, block
 from serve_api import serve_status, get_application
 from nvidia import snapshot_vram
-from podman import podman_ps_all, podman_ps_all_json
+from podman import podman_ps_all, podman_ps_count
 
 # ── Identifying the head node process ────────────────────────────
 def find_ray_head() -> int:
@@ -131,7 +131,16 @@ def phase_a(recorder: Recorder) -> None:
         print("\n  No manual steps required")
 
     # Record verdict
-    apps_healthy = all(a.get("status") == "HEALTHY" for a in post_status.get("applications", []))
+    # In Ray 2.57+, applications is a dict {name: details} or {name: status_str}
+    # (ServeInstanceDetails.applications, schema.py:1764), not a list.
+    apps = post_status.get("applications", {})
+    for name, a in apps.items():
+        st = a.get("status", "UNKNOWN") if isinstance(a, dict) else str(a)
+        print(f"  {name}: {st}")
+    apps_healthy = all(
+        (a.get("status") if isinstance(a, dict) else str(a)) == "HEALTHY"
+        for a in apps.values()
+    )
     record("step6", phase="A", apps_healthy=apps_healthy, manual_steps=manual_steps)
 
 
