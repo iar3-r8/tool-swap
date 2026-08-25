@@ -226,8 +226,42 @@ harness work in this workspace. Items 10–17 are host measurements.
   [`podman.py:37`](../spike-e-ray-native/scripts/lib/podman.py:37) — it is just not
   imported. **`NameError` at line 62, before the head node is even killed**, so
   step 6 would fail without testing recovery at all.
-- **Output:** dict-shaped status handling in both gate scripts; the missing import added.
-- **Why grouped:** both are one-line fixes on the same two gate scripts, found together.
+- **Defect (D13 — new, ledger addition, found during item 9 verification):**
+  `step6_restart.py` phase B called `get_application("tool_torch")` → `GET
+  /api/serve/applications/tool_torch`, but the dashboard defines **no**
+  per-application GET route (`serve_head.py`: only `GET/PUT/DELETE
+  /api/serve/applications/`, the scale POST, `/api/ray/version`) — a 404 before
+  recovery was ever tested. It also read `apps.get("replicas")`, the wrong
+  payload shape (replicas nest under `applications[name].deployments[dep].replicas`;
+  `ReplicaDetails.pid` is the PID field, `schema.py:1285`). Fixed by reading
+  `serve_status()` filtered to the deployment, with the recovery check at
+  deployment-level status (the app-level enum is `RUNNING`, never `HEALTHY`,
+  `schema.py:1171`). Phase A and the kill/observe control flow are unchanged.
+- **Output:** dict-shaped status handling in both gate scripts; the missing import
+  added; phase B's data source and payload shape corrected.
+- **Why grouped:** one-line fixes on the same two gate scripts, found together.
+  D13 was found while verifying D10/D11 and committed separately in `85562be`.
+
+**9a. The GATE configs deploy, and step 6 phase B queries a route that exists.
+(Ledger addition — found by the manager's verification of item 9; committed in
+`85562be`.)**
+
+- **Defect (D12 — new):** [`step3_config.yaml`](../spike-e-ray-native/apps/step3_config.yaml)
+  and [`step6_config.yaml`](../spike-e-ray-native/apps/step6_config.yaml) each
+  declare two applications with **no** `route_prefix`, so both default to `/`
+  and `ServeDeploySchema` rejects the deploy ("Found duplicate applications for
+  route prefix '/'" — the same validator as the original step-2 failure). Both
+  configs gate the spike's decision (step 3 is GATE 1; step 6 deploys
+  `step6_config.yaml`), so both steps would have failed at deploy time without
+  measuring anything.
+- **Input:** the two configs, after adding `route_prefix: /tool_torch` and
+  `/tool_tf` (matching what [`step3_gate.py:32-33`](../spike-e-ray-native/scripts/step3_gate.py:32)
+  already polls; step 6 polls no tool URLs).
+- **Verified:** all six spike configs now pass `ServeDeploySchema` under the
+  installed Ray 2.57 — step 1, step 2, step 3, step 5 (both mechanisms),
+  step 6.
+- **D13** (see item 9) is the other half of the addition: the route the script
+  queries must exist, not just the config the deploy accepts.
 
 ### Part C — host measurements
 
