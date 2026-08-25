@@ -263,6 +263,46 @@ harness work in this workspace. Items 10–17 are host measurements.
 - **D13** (see item 9) is the other half of the addition: the route the script
   queries must exist, not just the config the deploy accepts.
 
+**9b. Fixtures bake different bytes per image, and configs render before deploy.
+(Ledger additions found by the manager during pre-run review; committed in
+`c52b678` and `470eb50`.)**
+
+- **Defect (D14 — new):** [`make_assets.py`](../spike-e-ray-native/fixtures/make_assets.py)
+  seeded the weights with a constant (`42`) for **every** image, so
+  `tool_torch` and `tool_tf` baked byte-identical
+  `/opt/spike/weights/ckpt.bin`. Step 2's pass condition requires both apps
+  to load their **own** weights and the verify script's
+  [`weights_sha256` check](../spike-e-ray-native/scripts/step2_verify.py:114)
+  wants the two images to **differ** — it could never pass as built (the tf
+  Dockerfile's comment "different bytes — seed differs in make_assets.py"
+  was false). Fixed: `--seed` arg (default `42` preserves the old bytes),
+  `ASSET_SEED` build args `1001`/`1002`, recorded in `build-info.log`, and
+  [`build_images.sh`](../spike-e-ray-native/fixtures/build_images.sh:107)
+  cross-checks the two weights sha256 and exits 1 if identical.
+  Also: [`step2_config.yaml`](../spike-e-ray-native/apps/step2_config.yaml:21)
+  had `image_uri: ""` (blanked while podman was broken in the devcontainer);
+  on the host that sends both replicas to the controller environment where
+  [`VRAMAllocator`](../spike-e-ray-native/toolkit/vram.py:27) cannot allocate
+  — step 2 could not start at all. Restored, now rendered by the D15 fix.
+- **Defect (D15 — new, gate-blocker):**
+  [`render_env.py`](../spike-e-ray-native/scripts/lib/render_env.py) regex never
+  matched the closing brace — a **prefix** match that broke every default form:
+  `${VAR:default}` unset → literal placeholder (default ignored); set →
+  `value:default}` (corrupted image URI); `${VAR:-default}` → stray `}`.
+  With `SPIKE_IMAGE_*` unset on the host, steps 1 (Part B), 2 and 5 (a
+  **decision step**) would deploy the literal `${SPIKE_IMAGE_TORCH_URI:...}`
+  as the image URI → podman "image not found" before Ray was measured. The
+  08-14 step-2 log already contains the literal placeholder as evidence.
+  Fixed: whole-placeholder match supporting `${VAR}`, `${VAR:-default}` and
+  `${VAR:default}` (single-colon == double-colon, documented — image URIs
+  contain colons). [`step1_verify.py`](../spike-e-ray-native/scripts/step1_verify.py:120)
+  Part B also now deploys via `apply_config` (rendered) instead of raw
+  `serve deploy <yaml>`, which bypassed rendering entirely.
+- **Benign note:** the `+1` seed offset means the torch image's payload bytes
+  equal the tf image's weights bytes (same counter stream, different
+  asset). No check compares cross-asset bytes; recorded so nobody is
+  surprised in the results doc.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
