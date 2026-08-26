@@ -54,6 +54,10 @@ sleep 2
 
 # ── Start head node ────────────────────────────────────────────
 echo "Starting head node (dashboard port ${RAY_DASH})..."
+# D20: Ray passes no --user for `image_uri` workers, so session sockets
+# must be world-writable; umask 0 here mirrors start_cluster.sh (full
+# rationale and the trusted-host trade-off are documented there).
+umask 0
 ray start --head \
     --dashboard-port="${RAY_DASH}" \
     --num-cpus="$(nproc 2>/dev/null || echo 2)" \

@@ -38,7 +38,42 @@ fi
 # We want ray running in the background so step scripts can
 # connect to it; the cluster-up target should only wait for
 # readiness and then return.
+#
+# WHY umask 0 (D20):
+# Ray builds the `podman run` prefix for `runtime_env: {image_uri: ...}`
+# workers in image_uri.py (installed Ray 2.57.0,
+# ray/_private/runtime_env/image_uri.py, lines 76-96). It passes
+# `--userns=keep-id` but NO `--user` flag, and
+# ImageURIPlugin.modify_context (same file, ~line 174) hardcodes
+# `run_options=[]`, so `--user` cannot be injected through the
+# `image_uri` key. The worker therefore runs as the image's own
+# `USER ray` (uid 1000, mapped to a subuid via keep-id), NOT as the
+# host uid.
+#
+# Ray creates its unix sockets under /tmp/ray/session_*/sockets/ with
+# the default umask 0022 (permissions 0755, owned by the host uid)
+# and never chmods them. Connecting to a unix socket requires WRITE
+# permission, which 0755 grants only to the owner — so the container
+# worker gets EACCES and dies before it registers (raylet reports
+# "worker ... dead, probably crashed during start"; no per-worker
+# .err file is ever produced).
+#
+# Fix: run `ray start` under `umask 0` so every file the session
+# creates — in particular the raylet/gcs/plasma sockets — is 0777
+# and a worker running under a different uid can connect().
+#
+# SECURITY TRADE-OFF: while the cluster runs, ANY local user on this
+# host can connect to the raylet socket and submit tasks to the
+# cluster. This is accepted because the host is used by trusted users
+# only. Do NOT deploy this pattern on a shared or untrusted host.
+#
+# The umask is set in the script shell, so the backgrounded
+# `ray start` (and the daemons it forks) inherit it; no later
+# commands in this script create files, and other scripts do not
+# source this file, so nothing unrelated inherits the permissive
+# umask.
 echo "Starting Ray head node (dashboard port ${RAY_DASHBOARD_PORT})..."
+umask 0
 ray start --head \
     --dashboard-port="${RAY_DASHBOARD_PORT}" \
     --num-cpus="$(nproc 2>/dev/null || echo 2)" \
