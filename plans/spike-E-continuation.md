@@ -408,6 +408,70 @@ finding about Ray. They are the cost of the "run it on the real host" step
 that the protocol demands, and they are recorded here so the results
 document does not mistake harness friction for evidence about the framework.
 
+**9e. `image_uri` workers could not start at all — and the harness hid it.
+(Ledger additions from the first real `make step1`; committed in `7e6b757`
+and `b191df1`.)**
+
+- **FINDING ABOUT RAY (not harness friction) — D20.** Serve replicas using
+  `runtime_env.image_uri` never started. The raylet repeated *"worker … dead,
+  probably crashed during start"* every 60 s with **no per-worker `.err` file**,
+  while the non-container deployment in the same app ran normally. Verified
+  against the installed Ray 2.57.0 source:
+  - [`image_uri.py:76-96`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:76)
+    builds the worker's `podman run` prefix with `--userns=keep-id` but **no
+    `--user`** (grep: no `-u`/`--user` in the file), so the worker runs as the
+    **image's** `USER` (uid 1000), not as the host uid (1011).
+  - [`ImageURIPlugin.modify_context:174`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:174)
+    hardcodes `run_options=[]`, so `--user` **cannot be injected** through
+    `image_uri` — while the older `container` plugin *does* forward run options
+    ([`:222`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:222)).
+  - Ray creates its session sockets `0755` owned by the host uid and **never**
+    `chmod`s them or sets a umask (grep of `services.py`, `node.py`: neither
+    appears). `connect()` on a unix socket needs **write** permission, so the
+    container worker gets `EACCES` and dies before registering — a C++ failure,
+    which is why there is no Python traceback and no `.err` file.
+  - The comment at
+    [`image_uri.py:86-94`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:86)
+    states the assumption plainly: the host user is *"usually `ray`"*.
+  - **The finding:** `image_uri` carries an **unenforced precondition** — the
+    host cluster uid must equal the image's `USER` uid — with no check, no
+    escape hatch, and a failure mode that produces no diagnostic. For tool-swap
+    this matters directly: our tool images are third-party-authored, so we
+    cannot assume they run as uid 1000, and we would have to either constrain
+    every tool image's `USER` or abandon `image_uri` for the `container` key.
+  - **Workaround taken (Option D, user's choice):** start Ray under `umask 0`
+    so sockets are `0777`. **Trade-off accepted explicitly:** any local user can
+    reach the raylet socket while the cluster runs; acceptable only because this
+    host has trusted users. Alternatives considered and rejected for now:
+    baking the host uid into the images (non-portable), and switching to the
+    `container` runtime_env key so `--user` can be passed (tests a different
+    mechanism than the one we would ship).
+  - **Applied to both launchers.** The first attempt patched only
+    `start_cluster.sh` — which *every* Makefile step target bypasses, since they
+    all use `run_with_cluster_clean.sh` and its own inline `ray start`. Caught
+    by the subtask, verified with a PATH shim. `step6_restart.py` launches a
+    cluster too and still inherits the operator's umask: noted, not fixed.
+- **Defect (D21 — harness, and the more dangerous one).** `make step1` exited
+  **0** while *both* probes timed out. Every probe error was caught, printed,
+  recorded — and swallowed; nothing mapped a recorded error to the exit status.
+  A broken run was indistinguishable from a passing one, which is precisely the
+  failure this protocol exists to prevent. Both step scripts now exit **2** for
+  a harness failure (observation could not be made), **3** for a negative
+  finding (observation made, answers the step negatively), 0 clean, 1 crash.
+  - Two further defects surfaced while fixing it: step 1 waited for
+    `ApplicationStatus == "HEALTHY"`, which applications never report (Ray 2.57
+    uses `RUNNING`), so the wait always burned its full timeout; and **step 2
+    requested the `introspect` op while comparing `weights_sha256`, which only
+    `startup_report` returns** ([`deployments.py:118`](../spike-e-ray-native/toolkit/deployments.py:118),
+    field at [`:137`](../spike-e-ray-native/toolkit/deployments.py:137)) — its
+    central isolation comparison could **never** have succeeded on any cluster,
+    and it still exited 0.
+  - **Not yet fixed:** steps 3–6 share the swallow-and-exit-0 pattern, and
+    `step3_gate.py` can hit a `NameError` if the torch probe fails. Those carry
+    gate semantics I want to review before changing their exit behaviour — but
+    **no GPU-step result may be trusted until they are fixed**, since a gate
+    that cannot fail is not a gate.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
