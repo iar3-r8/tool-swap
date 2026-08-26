@@ -335,6 +335,52 @@ host during the first real `make fixtures`; committed in `13c6dd0`.)**
   cause was found. Recorded so the reasoning trail is not flattered after the
   fact.
 
+**9d. The host can pull the base image and bake the assets. (Ledger additions
+found on the host while re-running `make fixtures`; committed in `c5d35d5` and
+`260bc23`.)**
+
+- **Defect (D17 — new, host-blocker):** the build reached `FROM` and failed:
+  *"short-name `rayproject/ray:2.57.0-py311-gpu` did not resolve to an alias and
+  no unqualified-search registries are defined in
+  `/etc/containers/registries.conf`"*. Podman, unlike docker, does not assume
+  Docker Hub for unqualified names, and this host defines no
+  `unqualified-search-registries`. `RAY_BASE_TAG` is now
+  `docker.io/rayproject/ray:2.57.0-py311-gpu` in
+  [`.env.example`](../spike-e-ray-native/.env.example:8), in
+  [`env.sh`](../spike-e-ray-native/env.sh:28)'s `:=` default, and in
+  `capture_env.py`'s three copies, so the value cannot drift. Version and
+  variant unchanged.
+  - **Researched, not assumed:** the *fixture* images are also referenced by
+    short name (`tool_torch:spike`) at run time. `podman run`'s `--pull`
+    defaults to `missing`, which pulls only *"if a local image does not
+    exist"*, so a just-built local image never reaches short-name resolution.
+    Docs captured under
+    [`plan/third-party-docs/podman/`](../plan/third-party-docs/podman/INDEX.md)
+    from the podman v3.4.4 git tag, with source URLs.
+  - **Residual risk, deliberately not fixed:** if the local image is absent
+    (`podman system prune -a`, or a node that did not build it), the short
+    name *would* go through registry resolution and fail identically.
+    `localhost/tool_torch:spike` is the hardening; recorded as a
+    recommendation because applying it changes what steps 1 and 2 exercise.
+- **Defect (D18 — new, host-blocker):** both builds then died at STEP 8/15 with
+  `PermissionError: [Errno 13] Permission denied: '/opt/spike'`. The
+  `rayproject/ray` image drops to the unprivileged `ray` user (uid 1000, set by
+  `USER $RAY_UID` in `docker/base-deps/Dockerfile` at tag `ray-2.57.0`), which
+  cannot create a directory under `/opt`. Fixed as a **permission** change, not
+  a path change — `/opt/spike` appears in 20 places across `apps/`, `toolkit/`,
+  `scripts/` and the configs — with `USER root` → `mkdir -p /opt/spike && chown
+  ray` → `USER ray` immediately before the asset step in both Dockerfiles.
+  - **The trailing `USER ray` is load-bearing:** leaving the image as root
+    would change what steps 3 and 7 exercise (step 7 checks that no
+    `--privileged` is required). Verified: the last `USER` in each file is
+    `ray`.
+  - **Noise, investigated and dismissed:** podman warns *"SHELL is not
+    supported for OCI image format"* on every step, because the base image
+    declares `SHELL ["/bin/bash", "-c"]` and OCI has no shell field. Harmless
+    here — every `RUN` line is POSIX, and `ARG`/`ENV` interpolation happens in
+    the builder, not the step shell. `--format docker` would silence it and
+    restore bash parity; optional, not applied.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
