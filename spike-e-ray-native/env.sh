@@ -25,7 +25,7 @@ else
 fi
 
 # Provide defaults for variables that .env.example may not set
-: "${RAY_BASE_TAG:=rayproject/ray:2.57.0-py311-gpu}"
+: "${RAY_BASE_TAG:=docker.io/rayproject/ray:2.57.0-py311-gpu}"
 : "${WEIGHTS_MB:=8}"
 : "${PAYLOAD_MB:=64}"
 : "${SERVE_DEPLOY_DIR:=${SPIKE_ROOT}/apps}"

@@ -90,7 +90,7 @@ def _version_match_assertion(ray_base_tag: str) -> Optional[str]:
 
     host_py = _python_minor_tag()  # e.g. 311 for py311
 
-    # Extract from tag: rayproject/ray:2.57.0-py311-gpu
+    # Extract from tag: docker.io/rayproject/ray:2.57.0-py311-gpu
     tag_parts = ray_base_tag.split(":")[-1]  # e.g. 2.57.0-py311-gpu
     tag_ray = tag_parts.split("-")[0]  # e.g. 2.57.0
     tag_py_suffix = "py" + host_py  # e.g. py311
@@ -100,7 +100,7 @@ def _version_match_assertion(ray_base_tag: str) -> Optional[str]:
             f"VERSION MISMATCH:\n"
             f"  host Ray   {host_ray}\n"
             f"  tag Ray    {tag_ray}\n"
-            f"  Fix: set RAY_BASE_TAG=rayproject/ray:{tag_ray}-py{host_py}-gpu"
+            f"  Fix: set RAY_BASE_TAG=docker.io/rayproject/ray:{tag_ray}-py{host_py}-gpu"
         )
         print(msg)
         return msg
@@ -152,7 +152,7 @@ def main() -> None:
 
     # Source env.sh so RAY_BASE_TAG is available even when run directly
     _source_env()
-    ray_base_tag = os.environ.get("RAY_BASE_TAG", "rayproject/ray:2.57.0-py311-gpu")
+    ray_base_tag = os.environ.get("RAY_BASE_TAG", "docker.io/rayproject/ray:2.57.0-py311-gpu")
 
     sections: list[str] = []
 

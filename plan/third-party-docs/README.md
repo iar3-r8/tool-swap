@@ -10,6 +10,7 @@ Local copies of external documentation that the plan's evaluations depend on, so
 | [`ray-serve/`](ray-serve/INDEX.md) | https://docs.ray.io/en/latest/serve/ | Ray 2.57.0 | Evidence base for [`15_RAY_SERVE_EVALUATION.md`](../15_RAY_SERVE_EVALUATION.md) and [`ADR-0003`](../adr/0003-ray-serve-not-adopted.md) |
 | [`ray-core/`](ray-core/runtime-env-excerpt.md) | https://docs.ray.io/en/latest/ray-core/ | Ray 2.57.0 | The `runtime_env` / `image_uri` reference that **D2** would depend on |
 | [`llama-swap/`](llama-swap/INDEX.md) | https://github.com/mostlygeek/llama-swap | llama-swap v249 | **The acknowledged inspiration** (**D1**, **D4**) and our **sibling service** ([`04_API_CONTRACT.md`](../04_API_CONTRACT.md) §0). Evidence base for [`17_LLAMA_SWAP_PHILOSOPHY.md`](../17_LLAMA_SWAP_PHILOSOPHY.md) |
+| [`podman/`](podman/INDEX.md) | https://github.com/containers/podman + https://github.com/containers/image | podman v3.4.4, containers/image v5.17.0 | **The D17 host-blocker evidence**: why unqualified image names fail on the podman host, and why locally built fixture images resolve from local storage at run time |
 
 **The captures differ in kind, and it matters when reading them.** The Ray material supports a **rejection**, so it only had to be good enough to justify not proceeding. The BentoML material supports an **adoption**, and M4 builds `backends/bentoml_backend.py` directly on it — so its job is to make specific plan claims *checkable*. Several turned out not to survive checking: see §3 of [`bentoml/INDEX.md`](bentoml/INDEX.md).
 
