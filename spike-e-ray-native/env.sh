@@ -13,25 +13,27 @@
 #   bash env.sh            # prints them (debug)
 #   bash scripts/step1.sh  # scripts source us then exec their command
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Namespaced (not the generic SCRIPT_DIR) so sourcing this file cannot
+# clobber a caller's own SCRIPT_DIR local (see fixtures/build_images.sh).
+SPIKE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Allow operator override via .env; fall back to .env.example
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-  set -a; source "${SCRIPT_DIR}/.env"; set +a
+if [[ -f "${SPIKE_ROOT}/.env" ]]; then
+  set -a; source "${SPIKE_ROOT}/.env"; set +a
 else
-  set -a; source "${SCRIPT_DIR}/.env.example"; set +a
+  set -a; source "${SPIKE_ROOT}/.env.example"; set +a
 fi
 
 # Provide defaults for variables that .env.example may not set
 : "${RAY_BASE_TAG:=rayproject/ray:2.57.0-py311-gpu}"
 : "${WEIGHTS_MB:=8}"
 : "${PAYLOAD_MB:=64}"
-: "${SERVE_DEPLOY_DIR:=${SCRIPT_DIR}/apps}"
+: "${SERVE_DEPLOY_DIR:=${SPIKE_ROOT}/apps}"
 
-export SCRIPT_DIR RAY_BASE_TAG WEIGHTS_MB PAYLOAD_MB \
+export SPIKE_ROOT RAY_BASE_TAG WEIGHTS_MB PAYLOAD_MB \
        RAY_CLUSTER_ADDRESS SERVE_DEPLOY_DIR CONTAINER_RUNTIME
 
-export SPIKE_RESULTS_DIR="${SCRIPT_DIR}/results"
+export SPIKE_RESULTS_DIR="${SPIKE_ROOT}/results"
 export SPIKE_RAW_DIR="${SPIKE_RESULTS_DIR}/raw"
 export SPIKE_METRICS_DIR="${SPIKE_RESULTS_DIR}/metrics"
 
@@ -39,4 +41,4 @@ export SPIKE_METRICS_DIR="${SPIKE_RESULTS_DIR}/metrics"
 # (for serve deploy import_path modules like step1_two_deployments).
 # Ray workers inherit PYTHONPATH from the parent process, so this
 # env var flows to the cluster's Python subprocesses too.
-export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/apps:${PYTHONPATH:-}"
+export PYTHONPATH="${SPIKE_ROOT}:${SPIKE_ROOT}/apps:${PYTHONPATH:-}"

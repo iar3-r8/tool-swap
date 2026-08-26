@@ -5,8 +5,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../env.sh"
+# Private dir var (not SCRIPT_DIR): env.sh used to clobber the caller's
+# SCRIPT_DIR, which broke the -f paths and the build context below.
+FIXTURES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${FIXTURES_DIR}/../env.sh"
 
 : "${ASSET_SEED_TORCH:=1001}"
 : "${ASSET_SEED_TF:=1002}"
@@ -28,9 +30,9 @@ podman build \
   --build-arg WEIGHTS_MB="${WEIGHTS_MB}" \
   --build-arg PAYLOAD_MB="${PAYLOAD_MB}" \
   --build-arg ASSET_SEED="${ASSET_SEED_TORCH}" \
-  -f "${SCRIPT_DIR}/tool_torch.Dockerfile" \
+  -f "${FIXTURES_DIR}/tool_torch.Dockerfile" \
   -t tool_torch:spike \
-  "${SCRIPT_DIR}/../"
+  "${FIXTURES_DIR}/.."
 
 TOUCH_ID=$(podman inspect tool_torch:spike --format '{{.Id}}')
 echo "tool_torch image ID: ${TOUCH_ID}"
@@ -43,9 +45,9 @@ podman build \
   --build-arg WEIGHTS_MB="${WEIGHTS_MB}" \
   --build-arg PAYLOAD_MB="${PAYLOAD_MB}" \
   --build-arg ASSET_SEED="${ASSET_SEED_TF}" \
-  -f "${SCRIPT_DIR}/tool_tf.Dockerfile" \
+  -f "${FIXTURES_DIR}/tool_tf.Dockerfile" \
   -t tool_tf:spike \
-  "${SCRIPT_DIR}/../"
+  "${FIXTURES_DIR}/.."
 
 TF_ID=$(podman inspect tool_tf:spike --format '{{.Id}}')
 echo "tool_tf image ID: ${TF_ID}"
