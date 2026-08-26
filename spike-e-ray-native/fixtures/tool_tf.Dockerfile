@@ -20,6 +20,10 @@ ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
 # ASSET_SEED must differ from tool_torch's — step 2 needs distinct weight bytes.
 ARG ASSET_SEED=1002
+# ray (uid 1000) cannot create /opt/spike: pre-create it as root, chown it to ray, then restore the base image's runtime user.
+USER root
+RUN mkdir -p /opt/spike && chown ray /opt/spike
+USER ray
 RUN python /tmp/make_assets.py \
       --weights /opt/spike/weights/ckpt.bin --weights-mb ${WEIGHTS_MB} \
       --payload /opt/spike/data/payload.bin --payload-mb ${PAYLOAD_MB} \

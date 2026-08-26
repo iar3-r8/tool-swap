@@ -19,6 +19,10 @@ COPY fixtures/make_assets.py /tmp/make_assets.py
 ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
 ARG ASSET_SEED=1001
+# ray (uid 1000) cannot create /opt/spike: pre-create it as root, chown it to ray, then restore the base image's runtime user.
+USER root
+RUN mkdir -p /opt/spike && chown ray /opt/spike
+USER ray
 RUN python /tmp/make_assets.py \
       --weights /opt/spike/weights/ckpt.bin --weights-mb ${WEIGHTS_MB} \
       --payload /opt/spike/data/payload.bin --payload-mb ${PAYLOAD_MB} \
