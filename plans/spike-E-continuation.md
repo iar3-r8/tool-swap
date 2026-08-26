@@ -303,6 +303,38 @@ harness work in this workspace. Items 10–17 are host measurements.
   asset). No check compares cross-asset bytes; recorded so nobody is
   surprised in the results doc.
 
+**9c. The host can actually build the fixtures. (Ledger addition found on the
+host during the first real `make fixtures`; committed in `13c6dd0`.)**
+
+- **Defect (D16 — new, host-blocker):** [`env.sh`](../spike-e-ray-native/env.sh:16)
+  assigned `SCRIPT_DIR` (the spike root) and **exported** it. Because `source`
+  runs in the caller's shell, every use of `SCRIPT_DIR` in
+  [`build_images.sh`](../spike-e-ray-native/fixtures/build_images.sh:8) *after*
+  the `source` line silently referred to the spike root instead of `fixtures/`.
+  Host failure was `Error: stat <spike>/tool_torch.Dockerfile: no such file or
+  directory` — note the path is the spike root, not `<spike>/fixtures/`. The
+  build **context** was equally wrong: `"${SCRIPT_DIR}/../"` resolved to the
+  **repo root**, which would also have broken the Dockerfiles' context-relative
+  `COPY fixtures/… toolkit/ apps/` lines and shipped the 114 MB `vendor/`
+  wheel cache to the build.
+- **Fix:** `env.sh` uses a namespaced `SPIKE_ROOT` internally and exports that;
+  nothing outside `env.sh` consumed the exported `SCRIPT_DIR` (grepped the
+  Makefile, every shell script, `apps/`, `toolkit/` and the Python sources).
+  `build_images.sh` captures its own `FIXTURES_DIR` **before** sourcing, so it
+  is immune to whatever `env.sh` exports.
+- **Verified** with a podman shim that echoes its arguments: `-f` absolute under
+  `fixtures/`, context resolving to the spike root, byte-identical from a
+  different cwd, and a `SCRIPT_DIR` sentinel surviving the `source`.
+- **Latent trap noted:** `step7_podman.sh`, `scripts/lib/start_cluster.sh` and
+  `scripts/lib/preflight.sh` follow the same set-then-source pattern but use
+  `SCRIPT_DIR` only on the `source` line itself, so they were unaffected; the
+  rename removes the trap for them too.
+- **Process note (Rule 0.3 honesty):** the manager's first diagnosis — that
+  podman 3.4.4 resolves `-f` relative to the build context — was **wrong**. It
+  was implemented, caught by the shim experiment, and reverted before the real
+  cause was found. Recorded so the reasoning trail is not flattered after the
+  fact.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
