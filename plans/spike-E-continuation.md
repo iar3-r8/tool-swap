@@ -381,6 +381,33 @@ found on the host while re-running `make fixtures`; committed in `c5d35d5` and
     the builder, not the step shell. `--format docker` would silence it and
     restore bash parity; optional, not applied.
 
+- **Defect (D19 — new, host-blocker):** with D18 in place the assets **baked
+  successfully** (both sha256 values printed) and only the cleanup failed:
+  `rm: cannot remove '/tmp/make_assets.py': Operation not permitted`. `COPY`
+  runs with root as owner, so the helper was root-owned, while the `RUN` after
+  it executes as `ray`; `/tmp` is sticky (1777), under which only the file's
+  owner may unlink — hence `EPERM`, not `EACCES`. Fixed with
+  `COPY --chown=ray` in both Dockerfiles.
+  - **Verified, not assumed:** `podman-build.1` states *"podman build uses code
+    sourced from the buildah project"*; podman v3.4.4's `go.mod` pins buildah
+    v1.23.1; that tag's `imagebuildah/stage_executor.go` accepts `--chown` on
+    `COPY`, and `add.go`'s `userForCopy` falls through to `userForRun` for a
+    non-numeric user, resolving it from the image's `/etc/passwd` — the same
+    mechanism the already-working `USER ray` and `chown ray` steps rely on.
+    `podman-build.1` captured under
+    [`plan/third-party-docs/podman/`](../plan/third-party-docs/podman/INDEX.md).
+  - **Nothing requires the helper's absence** (grepped `apps/`, `toolkit/`,
+    `scripts/`, configs and docs), so the `rm` is hygiene — but keeping it
+    working costs less than explaining its absence later.
+
+**Pattern worth noting for the results write-up.** D16–D19 were four
+consecutive *host-only* blockers — a shell variable collision, podman's
+short-name strictness, an unprivileged-user permission, and a sticky-bit
+unlink. None could have been caught by local verification, and none is a
+finding about Ray. They are the cost of the "run it on the real host" step
+that the protocol demands, and they are recorded here so the results
+document does not mistake harness friction for evidence about the framework.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
