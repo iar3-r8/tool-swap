@@ -13,14 +13,16 @@ fully qualified (`docker.io/rayproject/ray:2.57.0-py311-gpu`) for hosts whose
 | [`short-name-resolution.md`](short-name-resolution.md) | synthesis of the two man pages below | podman v3.4.4 | Does `podman run <locally built short name>` hit local storage or registry resolution? **Yes — local storage first** (`--pull missing`, default); registry resolution only when the local image is absent. |
 | [`podman-run.1.v3.4.4.md`](podman-run.1.v3.4.4.md) | https://raw.githubusercontent.com/containers/podman/v3.4.4/docs/source/markdown/podman-run.1.md | podman v3.4.4 | `--pull` semantics (default `missing` ⇒ local image short-circuits the pull). |
 | [`podman-pull.1.v3.4.4.md`](podman-pull.1.v3.4.4.md) | https://raw.githubusercontent.com/containers/podman/v3.4.4/docs/source/markdown/podman-pull.1.md | podman v3.4.4 | What "short name" means and how it is resolved (aliases → `unqualified-search-registries` → prompt/error). |
+| [`podman-build.1.v3.4.4.md`](podman-build.1.v3.4.4.md) | https://raw.githubusercontent.com/containers/podman/v3.4.4/docs/source/markdown/podman-build.1.md | podman v3.4.4 | **`COPY --chown=<user>` with a bare username is supported.** The man page delegates Containerfile-instruction semantics to the vendored `buildah` code ("`podman build` uses code sourced from the `buildah` project"); podman v3.4.4's `go.mod` pins `github.com/containers/buildah v1.23.1`, whose `stage_executor.go` accepts `--chown=` on `COPY` and whose `userForCopy` → `chrootuser.GetUser` resolves a bare username from the image's `/etc/passwd` (gid defaults to the user's primary gid). |
 | [`containers-registries.conf.5.v5.17.0.md`](containers-registries.conf.5.v5.17.0.md) | https://raw.githubusercontent.com/containers/image/v5.17.0/docs/containers-registries.conf.5.md | containers/image v5.17.0 (the exact version vendored by podman v3.4.4, per its `go.mod`) | `registries.conf` rules: `unqualified-search-registries`, `[aliases]`, `short-name-mode`, docker.io normalization, the "always use fully qualified names" recommendation. |
 
 ## Not captured (and why)
 
-- **`podman build` / buildah man pages** — the base-image failure happens in the
-  build step, but the mechanism it exercises (pulling an absent base image through
-  short-name resolution) is fully covered by `podman-pull.1` + the
-  `registries.conf` man page; no additional claim depends on buildah prose.
+- **buildah man pages** — `buildah-image.5` (the Containerfile instruction
+  reference) does not exist at the tag vendored by podman v3.4.4; the
+  `podman-build.1` capture above plus a read of the buildah v1.23.1 source
+  (`add.go`, `imagebuildah/stage_executor.go`) settles the `COPY --chown`
+  question, which is the only build-instruction claim this project makes.
 - **`podman system` / storage internals** — "local image storage" is the
   terminology the man pages use; no deeper storage-doc citation is needed.
 

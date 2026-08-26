@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir \
     requests
 
 # === Baked assets (same paths, same sizes, different bytes — seed differs in make_assets.py) ===
-COPY fixtures/make_assets.py /tmp/make_assets.py
+# --chown=ray so the later `rm` works: /tmp is sticky (1777), only the owner may unlink.
+COPY --chown=ray fixtures/make_assets.py /tmp/make_assets.py
 ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
 # ASSET_SEED must differ from tool_torch's — step 2 needs distinct weight bytes.

@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir \
 
 # === Baked assets (must run before COPY toolkit, so assets are cached) ===
 # ASSET_SEED must differ from tool_tf's — step 2 needs distinct weight bytes.
-COPY fixtures/make_assets.py /tmp/make_assets.py
+# --chown=ray so the later `rm` works: /tmp is sticky (1777), only the owner may unlink.
+COPY --chown=ray fixtures/make_assets.py /tmp/make_assets.py
 ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
 ARG ASSET_SEED=1001
