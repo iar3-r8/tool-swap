@@ -40,7 +40,7 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from recorder import Recorder, block, record
-from serve_api import apply_config, serve_status
+from serve_api import ServeAPIError, json_response, apply_config, serve_status
 
 # One HTTP proxy serves the whole cluster on :8000; the two apps are
 # separated by route_prefix (see apps/step2_config.yaml), not by port.
@@ -70,11 +70,15 @@ def _startup_report(url: str) -> dict:
             STARTUP_TIMEOUT seconds (worker stuck / not started).
         requests.exceptions.ConnectionError: Nothing is listening (proxy
             or app down).
+        ServeAPIError: The proxy answered with a non-2xx status or a
+            non-JSON body (D25: the status code and a body excerpt are
+            carried in the error message instead of an opaque JSON
+            decode failure).
     """
     resp = requests.post(
         url, json={"op": "startup_report"}, timeout=STARTUP_TIMEOUT,
     )
-    return resp.json()
+    return json_response(resp)
 
 
 class StepOutcome:
@@ -148,58 +152,186 @@ def _status_summary(apps: dict[str, Any]) -> str:
     return ", ".join(f"{n}={_app_status(a)}" for n, a in apps.items())
 
 
-def _wait_for_stable(recorder: Recorder, outcome: StepOutcome) -> bool:
+def _deployment_detail(apps: dict[str, Any]) -> str:
+    """Per-deployment statuses for progress lines (Ray 2.57 v2 API).
+
+    The v2 ``/api/serve/applications/`` payload nests a ``deployments``
+    dict under each application, whose values carry the
+    ``DeploymentStatus`` (``UPDATING``/``HEALTHY``/...) of each
+    deployment.  Surfacing these per-poll shows *which* deployment is
+    still starting instead of one coarse application status.
+
+    Args:
+        apps: The applications dict from serve_status().
+
+    Returns:
+        'Dep=STATUS, ...' for all deployments, or "" when the payload
+        carries no deployment detail (e.g. a bare-status shape).
+    """
+    parts: list[str] = []
+    for app in apps.values():
+        if not isinstance(app, dict):
+            continue
+        deps = app.get("deployments")
+        if not isinstance(deps, dict):
+            continue
+        for dep_name, dep in deps.items():
+            if isinstance(dep, dict):
+                parts.append(f"{dep_name}={dep.get('status', 'UNKNOWN')}")
+    return ", ".join(parts)
+
+
+def _readiness_settings() -> tuple[float, float]:
+    """Read the readiness-wait knobs from the environment (D25).
+
+    Read at call time (not import time) so a test can override them.
+
+    Returns:
+        ``(timeout_s, interval_s)``: total wait budget and poll interval,
+        from ``SPIKE_READINESS_TIMEOUT_S`` (default 300s — the fixture
+        images are ~14-19GB and first podman start is slow) and
+        ``SPIKE_READINESS_POLL_S`` (default 5s).
+    """
+    timeout_s = float(os.environ.get("SPIKE_READINESS_TIMEOUT_S", "300"))
+    interval_s = float(os.environ.get("SPIKE_READINESS_POLL_S", "5"))
+    return timeout_s, interval_s
+
+
+def _permanent_failure(apps: dict[str, Any]) -> str | None:
+    """Describe a permanent failure, if the statuses indicate one.
+
+    In Ray 2.57 the terminal failure states are ``DEPLOY_FAILED`` on
+    ``ApplicationStatus`` (``ray/serve/schema.py:1176``) and
+    ``DeploymentStatus`` (``ray/serve/_private/common.py:199``); the
+    deployment's ``message`` field carries the details (``DeploymentDetails``,
+    ``schema.py:1363``). ``UNHEALTHY`` is NOT treated as permanent: Ray
+    can recover it (e.g. after a replica restart), so it keeps waiting.
+
+    Args:
+        apps: The applications dict from serve_status().
+
+    Returns:
+        A human-readable description of the failure, or None if the
+        statuses still look like normal progress.
+    """
+    for name, app in apps.items():
+        if not isinstance(app, dict):
+            continue
+        if str(app.get("status", "")) == "DEPLOY_FAILED":
+            return (
+                f"app {name} is DEPLOY_FAILED: "
+                f"{app.get('message', '<no message>')}"
+            )
+        for dep_name, dep in (app.get("deployments") or {}).items():
+            if not isinstance(dep, dict):
+                continue
+            if str(dep.get("status", "")) == "DEPLOY_FAILED":
+                detail = dep.get("message", "<no message>")
+                dead = dep.get("recent_dead_replicas") or []
+                if dead:
+                    detail = (
+                        f"{detail} ({len(dead)} recently-stopped replica(s))"
+                    )
+                return (
+                    f"deployment {name}/{dep_name} is DEPLOY_FAILED: {detail}"
+                )
+    return None
+
+
+def _wait_for_stable(
+    recorder: Recorder,
+    outcome: StepOutcome,
+    status_fn: Any = serve_status,
+) -> bool:
     """Poll serve_status() until at least two apps report RUNNING.
 
-    Same loop as before (30 polls x 2s, progress lines included). On
-    timeout the final status is recorded and a harness failure is
-    reported: apps that never reach RUNNING cannot answer the startup
-    probes, so the required observation cannot be made.
+    D25: the wait budget is now configurable —
+    ``SPIKE_READINESS_TIMEOUT_S`` (default 300s, was a hard-coded
+    30 polls x 2s = 60s, too short for 14-19GB images) and
+    ``SPIKE_READINESS_POLL_S`` (default 5s). Progress is printed on
+    every status change plus a heartbeat every 6 polls, so a stalled
+    wait is distinguishable from a hung one. A permanent failure
+    (``DEPLOY_FAILED``) fails fast instead of waiting out the budget.
+
+    On timeout the final status is recorded and a harness failure is
+    reported (D21: exit 2): apps that never reach RUNNING cannot
+    answer the startup probes, so the required observation cannot be
+    made.
 
     Args:
         recorder: The step's Recorder, used to log the final status.
-        outcome: Collects the harness failure on timeout.
+        outcome: Collects the harness failure on timeout or failure.
+        status_fn: Status source (defaults to ``serve_status``);
+            inject a stub for testing.
 
     Returns:
         True if at least two applications reached RUNNING in the window.
     """
-    print("\nWaiting for Serve to stabilize...")
-    for i in range(30):
+    timeout_s, interval_s = _readiness_settings()
+    deadline = time.monotonic() + timeout_s
+    print(
+        f"\nWaiting for Serve to stabilize "
+        f"(budget {timeout_s:.0f}s, polling every {interval_s:.0f}s)..."
+    )
+    apps: dict[str, Any] = {}
+    last_content: str | None = None
+    poll = 0
+    while True:
+        poll += 1
         try:
-            status = serve_status()
+            status = status_fn()
         except Exception as e:
-            print(f"  ... serve status unreachable: {e} ...")
-            time.sleep(2)
+            print(f"  [{poll}] serve status unreachable: {e} — retrying")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(interval_s)
             continue
         apps = status.get("applications", {})
-        if not apps:
-            print("  ... waiting for apps to appear ...")
-            time.sleep(2)
-            continue
-        # In Ray 2.57+, applications is a dict {name: details} or
-        # {name: status_str}.
-        healthy = True
-        for a in apps.values():
-            if _app_status(a) not in ("RUNNING", "HEALTHY"):
-                healthy = False
-        if healthy and len(apps) >= 2:
-            print(f"Serve is RUNNING ({len(apps)} apps: {', '.join(apps.keys())})")
-            return True
-        status_str = ", ".join(
-            f"{k}={_app_status(v)}" for k, v in apps.items()
-        )
-        print(f"  [{i + 1}/30] Statuses: {status_str} ... waiting")
-        time.sleep(2)
-    print("Serve did not stabilize — status:")
+        if apps:
+            failed = _permanent_failure(apps)
+            if failed:
+                recorder.write(
+                    block("serve status", json.dumps(status, indent=2))
+                )
+                outcome.harness(
+                    f"Deployment failed permanently: {failed} — further "
+                    "polling is useless, the startup probes cannot be "
+                    "answered."
+                )
+                return False
+            healthy = all(
+                _app_status(a) in ("RUNNING", "HEALTHY")
+                for a in apps.values()
+            )
+            if healthy and len(apps) >= 2:
+                print(
+                    f"Serve is RUNNING ({len(apps)} apps: "
+                    f"{', '.join(apps.keys())}) after {poll} poll(s)"
+                )
+                return True
+            content = _status_summary(apps)
+            detail = _deployment_detail(apps)
+            if detail:
+                content += f"  ({detail})"
+        else:
+            content = "no applications reported yet"
+        line = f"  [{poll}] {content}"
+        if content != last_content or poll % 6 == 0:
+            print(line)
+        last_content = content
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval_s)
+    print(f"Serve did not stabilize within {timeout_s:.0f}s — status:")
     try:
-        status = serve_status()
+        status = status_fn()
         apps = status.get("applications", {})
         recorder.write(block("serve status", json.dumps(status, indent=2)))
     except Exception as e:
         apps = {}
         recorder.write(block("serve status", f"<unreachable: {e}>"))
     outcome.harness(
-        "Apps never reached RUNNING within 60s "
+        f"Apps never reached RUNNING within {timeout_s:.0f}s "
         f"(final statuses: {_status_summary(apps) or '<none>'}) — the "
         "startup probes cannot be answered (worker failed to start? "
         "see the 'serve status' block above)."

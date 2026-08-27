@@ -29,9 +29,16 @@ fi
 : "${WEIGHTS_MB:=8}"
 : "${PAYLOAD_MB:=64}"
 : "${SERVE_DEPLOY_DIR:=${SPIKE_ROOT}/apps}"
+# Readiness wait for the step verify scripts (D25): total budget and
+# poll interval. 300s default — the fixture images are ~14-19GB and a
+# first podman start is slow; 60s (the old hard-coded wait) was not
+# enough. Raise on slower hosts.
+: "${SPIKE_READINESS_TIMEOUT_S:=300}"
+: "${SPIKE_READINESS_POLL_S:=5}"
 
 export SPIKE_ROOT RAY_BASE_TAG WEIGHTS_MB PAYLOAD_MB \
-       RAY_CLUSTER_ADDRESS SERVE_DEPLOY_DIR CONTAINER_RUNTIME
+       RAY_CLUSTER_ADDRESS SERVE_DEPLOY_DIR CONTAINER_RUNTIME \
+       SPIKE_READINESS_TIMEOUT_S SPIKE_READINESS_POLL_S
 
 export SPIKE_RESULTS_DIR="${SPIKE_ROOT}/results"
 export SPIKE_RAW_DIR="${SPIKE_RESULTS_DIR}/raw"

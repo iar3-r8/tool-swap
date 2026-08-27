@@ -33,18 +33,93 @@ SERVE_WORKING_DIR = os.environ.get(
 )
 
 
+class ServeAPIError(Exception):
+    """A Serve REST call failed at the HTTP layer.
+
+    Raised by the response-parsing helpers when the endpoint answers
+    with a non-2xx status or with a body that is not a JSON object.
+    The message carries the HTTP status code and a truncated response
+    body so the real problem is visible (previously an opaque
+    ``Expecting value`` JSON decode error hid it).  Callers that catch
+    bare ``Exception`` are unaffected; the distinct type lets a caller
+    that needs to tell "HTTP/transport failure" apart from "tool
+    returned an error payload" do so.
+    """
+
+
+def _truncate_body(text: str, limit: int = 500) -> str:
+    """Flatten whitespace and cut a response body to ~limit chars.
+
+    Args:
+        text: The raw response body.
+        limit: Maximum number of characters to keep.
+
+    Returns:
+        The whitespace-flattened body, with a '...' suffix if cut.
+    """
+    flat = " ".join(str(text).split())
+    if len(flat) > limit:
+        return flat[:limit] + "..."
+    return flat
+
+
+def json_response(resp: requests.Response) -> dict:
+    """Parse a response as a JSON object, carrying the failure details.
+
+    Shared by every helper that does ``resp.json()``: on a non-2xx
+    status (or a body that is not valid JSON, or is not a JSON
+    object) raises ServeAPIError carrying the status code and the
+    first ~500 chars of the body.
+
+    Args:
+        resp: The completed requests.Response.
+
+    Returns:
+        The parsed JSON object.
+
+    Raises:
+        ServeAPIError: The response was non-2xx or not a JSON object.
+    """
+    if not resp.ok:
+        raise ServeAPIError(
+            f"HTTP {resp.status_code} from {resp.url}: "
+            f"{_truncate_body(resp.text)}"
+        )
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise ServeAPIError(
+            f"HTTP {resp.status_code} from {resp.url} returned a "
+            f"non-JSON body: {_truncate_body(resp.text)} ({e})"
+        ) from e
+    if not isinstance(data, dict):
+        raise ServeAPIError(
+            f"HTTP {resp.status_code} from {resp.url} returned JSON "
+            f"that is not an object: {_truncate_body(resp.text)}"
+        )
+    return data
+
+
 def serve_status() -> dict:
-    """GET /api/serve/applications/ (dashboard port, not proxy)."""
+    """GET /api/serve/applications/ (dashboard port, not proxy).
+
+    Raises:
+        ServeAPIError: On a non-2xx status or a non-JSON body.
+    """
     resp = requests.get(f"{SERVE_DASHBOARD}/api/serve/applications/", timeout=10)
-    return resp.json()
+    return json_response(resp)
 
 
 def get_application(name: str) -> dict:
-    """GET /api/serve/applications/{name} (dashboard port)."""
+    """GET /api/serve/applications/{name} (dashboard port).
+
+    Raises:
+        ServeAPIError: On a non-2xx status or a non-JSON body.
+    """
     resp = requests.get(
         f"{SERVE_DASHBOARD}/api/serve/applications/{name}", timeout=10
     )
-    return resp.json()
+    return json_response(resp)
 
 
 def _deployment_runtime_env(deployment: dict) -> dict:
@@ -172,28 +247,40 @@ def scale_deployment(app: str, dep: str, target: int) -> dict:
 
     Note: the endpoint requires external_scaler_enabled: true on the
     application; otherwise it returns HTTP 412.
+
+    Raises:
+        ServeAPIError: On a non-2xx status (e.g. the 412 above) or a
+            non-JSON body.
     """
     resp = requests.post(
         f"{SERVE_DASHBOARD}/api/v1/applications/{app}/deployments/{dep}/scale",
         json={"target_num_replicas": target}, timeout=30,
     )
-    return resp.json()
+    return json_response(resp)
 
 
 def post_introspect(url: str, timeout: float = 60) -> dict:
-    """POST introspect to a tool deployment URL (proxy port, not dashboard)."""
+    """POST introspect to a tool deployment URL (proxy port, not dashboard).
+
+    Raises:
+        ServeAPIError: On a non-2xx status or a non-JSON body.
+    """
     resp = requests.post(
         url, json={"op": "introspect"}, timeout=timeout,
     )
-    return resp.json()
+    return json_response(resp)
 
 
 def post_predict(url: str, path: str, timeout: float = 120) -> dict:
-    """POST predict with a baked-in local file path (proxy port)."""
+    """POST predict with a baked-in local file path (proxy port).
+
+    Raises:
+        ServeAPIError: On a non-2xx status or a non-JSON body.
+    """
     resp = requests.post(
         url, json={"op": "predict", "path": path}, timeout=timeout,
     )
-    return resp.json()
+    return json_response(resp)
 
 
 def cluster_ready(timeout_s: int = 60, interval_s: int = 2) -> bool:
