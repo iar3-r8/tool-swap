@@ -56,13 +56,17 @@ def introspect(image_marker: str | None = None, ray_version: str | None = None) 
     except ImportError:
         pass  # stays "none" or torch if detected above
 
+    # str(): torch.__version__ is a torch.torch_version.TorchVersion
+    # instance, not a str — coerce so the value stays plain data across
+    # the deployment boundary (D27). tensorflow's is already a str;
+    # wrapped for symmetry so a future change cannot regress it.
     try:
         import torch
-        result["framework_version"] = torch.__version__
+        result["framework_version"] = str(torch.__version__)
     except ImportError:
         try:
             import tensorflow
-            result["framework_version"] = tensorflow.__version__
+            result["framework_version"] = str(tensorflow.__version__)
         except ImportError:
             result["framework_version"] = "none"
 

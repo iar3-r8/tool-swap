@@ -83,11 +83,14 @@ class VRAMAllocator:
             )
             torch.cuda.synchronize()
             self._framework = "torch"
-            self._allocated_mb = torch.cuda.memory_allocated(
-                device="cuda:0"
+            # int(): the torch.cuda counters are plain ints today, but
+            # coerce so this field stays plain data at the deployment
+            # boundary no matter what the framework returns (D27).
+            self._allocated_mb = int(
+                torch.cuda.memory_allocated(device="cuda:0")
             ) // (1024 * 1024)
-            self._reserved_mb = torch.cuda.memory_reserved(
-                device="cuda:0"
+            self._reserved_mb = int(
+                torch.cuda.memory_reserved(device="cuda:0")
             ) // (1024 * 1024)
         else:
             # tensorflow may not expose memory counters the same way, so
@@ -126,13 +129,16 @@ class VRAMAllocator:
             try:
                 import torch
 
+                # int(): same plain-data guarantee as in allocate() —
+                # report() crosses the deployment boundary via the
+                # vram_report op (D27).
                 return {
-                    "allocated_mb": torch.cuda.memory_allocated(
-                        device="cuda:0"
+                    "allocated_mb": int(
+                        torch.cuda.memory_allocated(device="cuda:0")
                     )
                     // (1024 * 1024),
-                    "reserved_mb": torch.cuda.memory_reserved(
-                        device="cuda:0"
+                    "reserved_mb": int(
+                        torch.cuda.memory_reserved(device="cuda:0")
                     )
                     // (1024 * 1024),
                     "framework": "torch",
