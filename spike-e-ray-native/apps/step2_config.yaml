@@ -18,7 +18,7 @@ applications:
       weights_path: /opt/spike/weights/ckpt.bin
       framework: torch
       vram_mb: 4096
-      image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
+      image_uri: "tool_torch:spike"
 
   - name: step2_tf
     import_path: step2_builder:build
@@ -27,4 +27,4 @@ applications:
       weights_path: /opt/spike/weights/ckpt.bin
       framework: tensorflow
       vram_mb: 4096
-      image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"
+      image_uri: "tool_tf:spike"

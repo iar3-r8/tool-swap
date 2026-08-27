@@ -12,9 +12,9 @@ Three placeholder forms are supported:
 - ``${VAR:-default}`` — environment value if set and non-empty, else
   *default*.
 - ``${VAR:default}`` — same semantics as ``:-``.  POSIX shell gives a
-  bare ``:`` no special meaning, but every config in this repo uses
-  the single-colon form, and image URIs (``tool_torch:spike``) contain
-  colons, so ``:`` and ``:-`` are treated identically on purpose.
+  bare ``:`` no special meaning, but image URIs (``tool_torch:spike``)
+  contain colons, and a historical config used the single-colon form,
+  so ``:`` and ``:-`` are treated identically on purpose.
 
 A *default* may contain any character except ``}``.  No nesting is
 supported — a ``${`` sequence inside a default is passed through

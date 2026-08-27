@@ -11,6 +11,7 @@ and does no substitution.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -175,11 +176,49 @@ def _inject_host_pythonpath(config: dict, work_dir: str) -> None:
             env_vars["PYTHONPATH"] = ":".join(new_paths)
 
 
+def _assert_no_unexpanded_placeholders(
+    rendered_text: str, config_path: str
+) -> None:
+    """Reject a rendered config that still contains a ``${`` sequence.
+
+    Ray's ``serve deploy`` performs no variable substitution (it parses
+    the config with ``yaml.safe_load``), so any placeholder that
+    :mod:`render_env` left behind would reach the container runtime
+    verbatim — historically an image name like
+    ``${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}`` went to podman and
+    failed opaquely with ``invalid reference format``.  Failing here,
+    before the temp config is written, makes the error loud and local:
+    it names the source file and every unresolved placeholder.
+
+    Args:
+        rendered_text: The config text after :func:`render_env.render`.
+        config_path: The source config path, for the error message.
+
+    Raises:
+        ServeAPIError: A ``${`` sequence survived rendering.
+    """
+    if "${" not in rendered_text:
+        return
+    closed = sorted(set(re.findall(r"\$\{[^}]*\}", rendered_text)))
+    detail = ", ".join(closed) if closed else "<malformed '${' with no closing '}'"
+    raise ServeAPIError(
+        f"Refusing to deploy {config_path}: the config still contains "
+        f"unexpanded placeholder(s) {detail} after render_env. Ray "
+        f"performs no variable substitution, so the literal string "
+        f"would be passed verbatim (e.g. to podman as an image name). "
+        f"Set the referenced environment variable, give the placeholder "
+        f"a default (${{VAR:-default}}), or hardcode the value."
+    )
+
+
 def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     """Deploy a Serve config file via serve deploy CLI.
 
     The config file is rendered through :func:`~lib.render_env.render`
-    first (expanding ``${VAR}`` and ``${VAR:-default}``), then augmented
+    first (expanding ``${VAR}`` and ``${VAR:-default}``); any ``${``
+    sequence that survives rendering is rejected with :class:`ServeAPIError`
+    before deployment, because Ray would otherwise pass it verbatim to
+    the container runtime.  The rendered config is then augmented
     with host ``PYTHONPATH`` entries in the ``runtime_env.env_vars`` of
     every *host-side* deployment (no ``image_uri``), so Ray worker
     subprocesses can find the application modules.  Containerised
@@ -210,6 +249,7 @@ def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     render_file = _render_env_mod.render_file
 
     rendered = render_file(config_path)
+    _assert_no_unexpanded_placeholders(rendered.decode("utf-8"), config_path)
     config = yaml.safe_load(rendered)
 
     # Resolve working directory to an absolute path

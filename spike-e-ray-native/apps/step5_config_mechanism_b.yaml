@@ -34,7 +34,7 @@ applications:
         ray_actor_options:
           num_gpus: 1
           runtime_env:
-            image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
+            image_uri: "tool_torch:spike"
 
   - name: step5_tf
     import_path: step3_gpu_swap:application_tf
@@ -46,4 +46,4 @@ applications:
         ray_actor_options:
           num_gpus: 1
           runtime_env:
-            image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"
+            image_uri: "tool_tf:spike"
