@@ -48,8 +48,20 @@ RUN pip install --no-cache-dir \
 ARG SPIKE_UID=1011
 ARG SPIKE_GID=1013
 
-# Renumber the base image's EXISTING `ray` user (uid 1000 / gid 100) to the
-# host uid/gid, and make the home dir owned by it. Done once, as root.
+# Renumber the base image's EXISTING `ray` user to the host uid/gid, and make
+# the home dir owned by it. Done once, as root.
+#
+# The base image's ACTUAL user/group layout (ray-project/ray,
+# docker/base-deps/Dockerfile, master; image is docker.io/rayproject/ray) is:
+#     ARG RAY_UID=1000; ARG RAY_GID=100
+#     useradd -ms /bin/bash -d /home/ray ray --uid $RAY_UID --gid $RAY_GID
+# i.e. on Ubuntu 22.04 the user `ray` (uid 1000) has the PRE-EXISTING
+# `users` group (gid 100) as its primary group, and there is NO group named
+# `ray`. The RUN block below must therefore NOT run `groupmod -g <gid> ray`
+# (it fails with "group 'ray' does not exist"); instead it secures a group
+# owning ${SPIKE_GID} (reusing whatever group already has that gid, otherwise
+# creating one named `spike`) and points `ray` at it. It also fails loudly if
+# a DIFFERENT account already owns ${SPIKE_UID}.
 #
 # We renumber the existing `ray` user (option (a)) rather than creating a new
 # uid-1011 user (option (b)): the conda install and WORKDIR live under
@@ -64,7 +76,19 @@ ARG SPIKE_GID=1013
 # site-packages); a recursive chown there is expensive and buys nothing.
 USER root
 RUN set -eux; \
-    groupmod -g "${SPIKE_GID}" ray; \
+    if getent group "${SPIKE_GID}" >/dev/null; then \
+        echo "reusing existing group with gid ${SPIKE_GID}: $(getent group "${SPIKE_GID}")"; \
+    else \
+        groupadd -g "${SPIKE_GID}" spike; \
+    fi; \
+    if getent passwd "${SPIKE_UID}" >/dev/null; then \
+        if [ "$(getent passwd "${SPIKE_UID}" | cut -d: -f1)" = "ray" ]; then \
+            echo "ray already has uid ${SPIKE_UID}"; \
+        else \
+            echo "ERROR: uid ${SPIKE_UID} is already taken by user '$(getent passwd "${SPIKE_UID}" | cut -d: -f1)'; refusing to renumber an unrelated account" >&2; \
+            exit 1; \
+        fi; \
+    fi; \
     usermod -u "${SPIKE_UID}" -g "${SPIKE_GID}" ray; \
     chown "${SPIKE_UID}:${SPIKE_GID}" /home/ray
 USER ${SPIKE_UID}
