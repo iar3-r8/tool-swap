@@ -597,6 +597,47 @@ The Ray-side symptom was an opaque HTTP 500; the actual cause was only visible i
 the *ingress* replica log, not the failing deployment's. Ray attributes the error
 to the caller, which is technically correct and diagnostically misleading.
 
+**9h. STEP 1: PASS — the first real observation the spike has produced.**
+
+`make step1` → **exit code 0**, "all required observations made; no negative
+findings". Both probes answered from their own containers:
+
+| | TorchProbe | TfProbe |
+|---|---|---|
+| `image_marker` | `tool_torch` | `tool_tf` |
+| `framework` | torch | tensorflow |
+| `framework_version` | 2.8.0+cu129 | 2.16.2 |
+| `sys_executable` | `/home/ray/anaconda3/bin/python` | `/home/ray/anaconda3/bin/python` |
+| pid | 4084930 | 4086817 |
+
+**Verdict on behaviour 1 (per-deployment `image_uri`): CONFIRMED.** Two
+deployments in a single Serve application each ran in a different container
+image. `SPIKE_IMAGE_MARKER` is baked into the image at build time and cannot be
+set through `runtime_env`, so it is proof of *which image served the request*,
+not merely of configuration being accepted. `sys_executable` confirms both ran
+the container's interpreter, not the host's. Distinct pids confirm separate
+processes. Both configuration forms — the decorator/`ray_actor_options` form and
+the YAML config form — were accepted (`Deploy exit code: 0` for each).
+
+Timing worth keeping for the cost discussion: the deployments took **12 polls
+(~60s)** to reach RUNNING from a warm image cache, with `TorchProbe` healthy at
+poll 8 and `TfProbe` trailing. The 60s default this harness originally used was
+not merely unlucky — it sat right on the boundary.
+
+**What this does NOT establish.** Behaviour 1 asked only whether per-deployment
+`image_uri` is possible. It is. The expensive questions — GPU swap (behaviour 3),
+payload handling (4), alternation (5), restart (6) — remain untested, and the
+D27 constraint (only plain data may cross a deployment boundary) applies to every
+one of them.
+
+**Honest accounting of what it took.** Seven fixes stood between "the plan says
+this should work" and this result: D20 (socket umask), D21 (steps exiting 0 on
+failure), D22 (container uid vs Ray's 0755 event dirs), D23 (host PYTHONPATH
+overwriting the image's), D24 (VRAMAllocator dropping its argument and demanding
+a GPU), D25 (60s readiness ceiling; HTTP errors hidden behind a JSON decode),
+D27 (framework-typed value crossing the boundary). Two were findings about Ray;
+five were ours. That ratio is itself a result, and belongs in the write-up.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
