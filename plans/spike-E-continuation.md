@@ -534,6 +534,69 @@ defect it was masking (D23).**
   applies — none of it is evidence about Ray Serve's suitability, except D22
   itself, which is.
 
+**9g. THE FINDING (D27): cross-deployment results are pickled, so the
+*receiver* must import the *sender's* types — container isolation does not
+isolate the serialisation contract.**
+
+This is the first result that answers the spike's actual question rather than
+its scaffolding, and it is decisive for tool-swap.
+
+**What happened.** With every earlier blocker fixed, `TorchProbe` started in its
+container and **served the request successfully** — its own log records
+`CALL __call__ OK 5.5ms`. The HTTP 500 came from the **ingress**, which runs on
+the *host* (no torch installed), while **deserialising the reply**:
+```
+ray.exceptions.RaySystemError: System error: No module named 'torch'
+  File ".../ray/_private/serialization.py", line 361, in _deserialize_pickle5_data
+    obj = pickle.loads(in_band)
+ModuleNotFoundError: No module named 'torch'
+```
+`TfProbe` returned 200 on the identical code path.
+
+**Why torch and not tensorflow.** [`introspect.py:61`](../spike-e-ray-native/toolkit/introspect.py:61)
+returns `torch.__version__`, which is **not a `str`** — it is a
+`torch.torch_version.TorchVersion` instance, so its pickle carries a reference to
+a torch module. `tensorflow.__version__` *is* a plain `str`
+([`introspect.py:65`](../spike-e-ray-native/toolkit/introspect.py:65)), so the tf
+reply unpickles anywhere. The asymmetry is not luck about which image is
+"better"; it is a single attribute whose type happens to be framework-specific.
+
+**Why this matters more than any earlier entry.** Per-deployment `image_uri`
+genuinely works — that part of behaviour 1 is confirmed, and `image_marker`
+proves the code ran in the right image. But Ray Serve passes results between
+deployments by **pickle**, so:
+- a value crossing a deployment boundary must be importable by the receiver;
+- isolating tools in separate images does **not** isolate their type
+  dependencies;
+- a router that calls heterogeneous tools would need **every tool's libraries
+  installed in the router**, which defeats the entire purpose of per-tool images.
+
+The isolation `image_uri` provides is process-level, not contract-level. For
+tool-swap, whose whole premise is that tools bring mutually incompatible
+dependencies, that is the crux.
+
+**Consequence for the design.** This is direct empirical support for
+[`ADR-0005`](../plan/adr/0005-one-uniform-batched-calling-convention.md): a
+uniform, framework-neutral calling convention is not stylistic tidiness, it is
+the only thing that makes heterogeneous tools composable. Any boundary between
+tools must carry **plain data only** — str, int, float, bool, list, dict, bytes
+— never a framework object, however incidental. `torch.__version__` is about as
+incidental as it gets, and it was enough to break the call.
+
+**Caveat, stated plainly.** The fixture is at fault for returning a
+framework-typed value, and fixing it (`str(torch.__version__)`) will make step 1
+pass. That fix does **not** retire the finding: it confirms it. The constraint is
+real regardless of whether our fixture trips over it, and a real tool returning a
+tensor, a numpy dtype, or any framework object would hit exactly this wall.
+
+**Diagnostic cost worth recording.** Four wrong hypotheses preceded this one
+(socket permissions, shell quoting, config placeholders, torch failing to import
+in a GPU-less container — the last disproved by `torch OK 2.8.0+cu129,
+cuda_available: False` and a clean standalone `introspect()` in that very image).
+The Ray-side symptom was an opaque HTTP 500; the actual cause was only visible in
+the *ingress* replica log, not the failing deployment's. Ray attributes the error
+to the caller, which is technically correct and diagnostically misleading.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
