@@ -472,6 +472,68 @@ and `b191df1`.)**
     **no GPU-step result may be trusted until they are fixed**, since a gate
     that cannot fail is not a gate.
 
+**9f. The `image_uri` worker crash, finally diagnosed (D22), and a harness
+defect it was masking (D23).**
+
+- **D22 — SIGABRT root cause, captured not inferred.** Container workers died
+  with exit 134 and *empty* `podman logs`. The abort message was finally
+  captured by straceing the worker:
+  ```
+  Unhandled exception: N6spdlog9spdlog_exE. what(): Failed opening file
+  /tmp/ray/session_*/logs/events/event_CORE_WORKER_<pid>.log
+  for writing: Permission denied
+  ```
+  The container worker runs as the image's `USER ray` (uid 1000) while
+  `<session>/logs/events/` and `<session>/logs/export_events/` are mode **755**
+  owned by the cluster uid (1011) — so the C++ core worker's event writer
+  throws an **uncaught** `spdlog_ex`, `std::terminate` fires, and the message is
+  invisible because Ray's `RayLog` has already redirected fd 2 into a session
+  log file. Hence: no container log, no `.err`, only the raylet's "process is
+  dead".
+  - **Proven by intervention, not correlation:** `chmod 777 logs/events` moved
+    the abort to `logs/export_events/` (same exception, next directory);
+    `chmod 777` on *all* `logs/` subdirs eliminated every SIGABRT, and the
+    deployment then failed *differently and visibly*.
+  - **Why D20's `umask 0` did not fix it:** the sockets and `logs/` became 777,
+    but these two subdirectories are still created 755.
+  - **Correction to the subtask's citation, recorded for honesty:** it claimed
+    the 0755 is explicit in
+    [`event_logger.py:114`](/usr/local/lib/python3.11/site-packages/ray/_private/event/event_logger.py:114),
+    but that line is `dir_path.mkdir(exist_ok=True)` with **no mode argument**,
+    which would be umask-derived. The *observed* 755 under `umask 0` is
+    therefore real but **not yet explained** — most likely the directory is
+    created by Ray's C++ side (not inspectable from the Python package). The
+    empirical finding stands; the mechanism is unconfirmed.
+  - **Classification: a genuine Ray defect.** Ray runs the worker as the
+    image's uid *by design* (`--userns=keep-id`, no `--user`, `run_options`
+    hardcoded empty at
+    [`image_uri.py:174`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:174)),
+    then mounts its tmp dir in and requires that differently-uid'd process to
+    write into directories Ray created 755. Two of its own features in mutual
+    contradiction. Aggravating: a **log sink failure is fatal**, and the
+    diagnostic is emitted only after stderr redirection — so the symptom is a
+    silent 134.
+- **D23 — our defect, previously masked.** With the aborts gone, replicas fail
+  with `ModuleNotFoundError: No module named 'toolkit'`, because
+  [`serve_api.py:88-99`](../spike-e-ray-native/scripts/lib/serve_api.py:88)
+  injects **host** paths into `PYTHONPATH` per *application*, and that value is
+  propagated verbatim into the container, overwriting the image's own
+  `PYTHONPATH` where `toolkit`/`apps` actually live (`/home/ray`). The ingress
+  deployment runs on the host and *does* need the host path, so the injection
+  must become per-deployment.
+- **Hypotheses eliminated on the way (all tested, all negative):** host/image
+  Python version mismatch; the podman flag combination; a native import abort
+  (torch, tensorflow and ray all import cleanly under Ray's exact flags);
+  RAY_* env poisoning; stale node/worker ids; socket permissions (re-tested);
+  rlimits and cgroup pid caps; plasma `/dev/shm` under `--ipc=host`.
+- **Incidental, worth guarding later:** at one point another user's Ray cluster
+  owned ports 6379/8265 on this shared host. `make step1` has no check that the
+  cluster it talks to is its own.
+- **Still true after all this: the spike has not yet tested its actual
+  question.** Every failure so far has been environmental or harness. Rule 0.3
+  applies — none of it is evidence about Ray Serve's suitability, except D22
+  itself, which is.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
