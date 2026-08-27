@@ -47,13 +47,68 @@ def get_application(name: str) -> dict:
     return resp.json()
 
 
+def _deployment_runtime_env(deployment: dict) -> dict:
+    """Return the deployment's ``ray_actor_options.runtime_env`` (may be empty)."""
+    actor_options = deployment.get("ray_actor_options")
+    runtime_env = actor_options.get("runtime_env") if actor_options else None
+    return runtime_env if isinstance(runtime_env, dict) else {}
+
+
+def _inject_host_pythonpath(config: dict, work_dir: str) -> None:
+    """Inject host PYTHONPATH into host-side deployments only (in place).
+
+    Ray merges application-level and deployment-level ``runtime_env`` with
+    ``override_runtime_envs_except_env_vars``
+    (``ray/serve/_private/utils.py:370``, invoked from
+    ``ray/serve/_private/application_state.py:1865``): top-level keys are
+    shallow-merged with the deployment winning, but ``env_vars`` are
+    *combined* and the deployment-level value wins per key
+    (``utils.py:411``).  Consequence: an application-level
+    ``PYTHONPATH`` is inherited by *every* deployment in the app, including
+    containerised ones — where it would overwrite the image's own
+    ``PYTHONPATH`` (``/home/ray``) and break ``toolkit``/``apps`` imports
+    inside the container.  So the injection is per-deployment:
+
+    * deployment without ``image_uri`` (runs on the host): the host paths
+      are set in ``ray_actor_options.runtime_env.env_vars.PYTHONPATH``
+      (previous behaviour, moved to deployment level);
+    * deployment with ``image_uri`` (runs in a container): ``PYTHONPATH``
+      is left entirely untouched — the image already sets
+      ``ENV PYTHONPATH="${PYTHONPATH}:/home/ray"`` (see the fixture
+      Dockerfiles), so there is nothing to inject and no host path may
+      leak in.
+
+    Applications without an explicit ``deployments`` list (the builder
+    pattern) are left alone: host-side imports are still resolved because
+    the raylet inherits ``env.sh``'s exported ``PYTHONPATH``, and nothing
+    must leak into the builder's containerised deployments.
+    """
+    for app in config.get("applications", []):
+        for deployment in app.get("deployments", []) or []:
+            runtime_env = _deployment_runtime_env(deployment)
+            if runtime_env.get("image_uri"):
+                # Containerised replica: keep the image's own PYTHONPATH.
+                continue
+            actor_options = deployment.setdefault("ray_actor_options", {})
+            deployment_env = actor_options.setdefault("runtime_env", {})
+            env_vars = deployment_env.setdefault("env_vars", {})
+            existing_pythonpath = env_vars.get("PYTHONPATH", "")
+            # Add both paths, preserving any existing PYTHONPATH
+            new_paths = [str(Path(work_dir).resolve()), work_dir]
+            if existing_pythonpath:
+                new_paths.append(existing_pythonpath)
+            env_vars["PYTHONPATH"] = ":".join(new_paths)
+
+
 def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     """Deploy a Serve config file via serve deploy CLI.
 
     The config file is rendered through :func:`~lib.render_env.render`
     first (expanding ``${VAR}`` and ``${VAR:-default}``), then augmented
-    with a top-level ``runtime_env`` that injects ``PYTHONPATH`` so Ray
-    worker subprocesses can find the application modules.  Finally written
+    with host ``PYTHONPATH`` entries in the ``runtime_env.env_vars`` of
+    every *host-side* deployment (no ``image_uri``), so Ray worker
+    subprocesses can find the application modules.  Containerised
+    deployments keep the image's own ``PYTHONPATH``.  Finally written
     to a temporary file and deployed via::
 
       serve deploy <rendered_yaml>
@@ -61,7 +116,8 @@ def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     Note: Ray's serve deploy CLI ignores ``--working-dir`` when deploying
     from a YAML config file (see Ray serve/scripts.py line 239-242).
     Therefore we must inject the working directory into the YAML itself
-    as ``runtime_env.env_vars.PYTHONPATH``.
+    as ``runtime_env.env_vars.PYTHONPATH`` (per-deployment, see
+    :func:`_inject_host_pythonpath`).
     """
     # Use importlib to load render_env directly — relative imports
     # fail when serve_api.py is imported from a different package
@@ -84,19 +140,9 @@ def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     # Resolve working directory to an absolute path
     work_dir = str(Path(SERVE_WORKING_DIR).resolve())
 
-    # Inject runtime_env with PYTHONPATH into each application.
-    # Ray worker subprocesses inherit env_vars from the deployment-level
-    # runtime_env, which ensures they can import the app modules.
-    # We add both the project root (for toolkit/) and apps/ (for modules).
-    for app in config.get("applications", []):
-        runtime_env = app.setdefault("runtime_env", {})
-        env_vars = runtime_env.setdefault("env_vars", {})
-        existing_pythonpath = env_vars.get("PYTHONPATH", "")
-        # Add both paths, preserving any existing PYTHONPATH
-        new_paths = [str(Path(work_dir).resolve()), work_dir]
-        if existing_pythonpath:
-            new_paths.append(existing_pythonpath)
-        env_vars["PYTHONPATH"] = ":".join(new_paths)
+    # Inject the host PYTHONPATH into host-side deployments only; containerised
+    # (image_uri) deployments keep the image's own PYTHONPATH.
+    _inject_host_pythonpath(config, work_dir)
 
     augmented = yaml.dump(config, default_flow_style=False)
 

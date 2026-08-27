@@ -13,6 +13,15 @@ source "${FIXTURES_DIR}/../env.sh"
 : "${ASSET_SEED_TORCH:=1001}"
 : "${ASSET_SEED_TF:=1002}"
 
+# D22: the container worker must run as the host's cluster uid, because Ray's
+# image_uri launches containers with --userns=keep-id and no --user, while the
+# cluster's <session>/logs/events/ dirs are 0755 owned by the cluster-starting
+# uid. Pass the invoking user's real uid/gid so the image tracks whoever
+# builds it. Override with SPIKE_UID/SPIKE_GID only when you deliberately want
+# a different uid (e.g. building as root for a specific operator).
+: "${SPIKE_UID:=$(id -u)}"
+: "${SPIKE_GID:=$(id -g)}"
+
 echo "============================================================"
 echo "Building Spike E fixture images"
 echo "  RAY_BASE_TAG = ${RAY_BASE_TAG}"
@@ -20,6 +29,8 @@ echo "  WEIGHTS_MB   = ${WEIGHTS_MB}"
 echo "  PAYLOAD_MB   = ${PAYLOAD_MB}"
 echo "  ASSET_SEED_TORCH = ${ASSET_SEED_TORCH}"
 echo "  ASSET_SEED_TF    = ${ASSET_SEED_TF}"
+echo "  SPIKE_UID    = ${SPIKE_UID}"
+echo "  SPIKE_GID    = ${SPIKE_GID}"
 echo "============================================================"
 
 # ── tool_torch ──────────────────────────────────────────────────
@@ -30,6 +41,8 @@ podman build \
   --build-arg WEIGHTS_MB="${WEIGHTS_MB}" \
   --build-arg PAYLOAD_MB="${PAYLOAD_MB}" \
   --build-arg ASSET_SEED="${ASSET_SEED_TORCH}" \
+  --build-arg SPIKE_UID="${SPIKE_UID}" \
+  --build-arg SPIKE_GID="${SPIKE_GID}" \
   -f "${FIXTURES_DIR}/tool_torch.Dockerfile" \
   -t tool_torch:spike \
   "${FIXTURES_DIR}/.."
@@ -45,6 +58,8 @@ podman build \
   --build-arg WEIGHTS_MB="${WEIGHTS_MB}" \
   --build-arg PAYLOAD_MB="${PAYLOAD_MB}" \
   --build-arg ASSET_SEED="${ASSET_SEED_TF}" \
+  --build-arg SPIKE_UID="${SPIKE_UID}" \
+  --build-arg SPIKE_GID="${SPIKE_GID}" \
   -f "${FIXTURES_DIR}/tool_tf.Dockerfile" \
   -t tool_tf:spike \
   "${FIXTURES_DIR}/.."
@@ -61,6 +76,8 @@ mkdir -p "${SPIKE_RAW_DIR}"
   echo "PAYLOAD_MB: ${PAYLOAD_MB}"
   echo "ASSET_SEED_TORCH: ${ASSET_SEED_TORCH}"
   echo "ASSET_SEED_TF: ${ASSET_SEED_TF}"
+  echo "SPIKE_UID: ${SPIKE_UID}"
+  echo "SPIKE_GID: ${SPIKE_GID}"
   echo "tool_torch image ID: ${TOUCH_ID}"
   echo "tool_tf image ID: ${TF_ID}"
   echo ""

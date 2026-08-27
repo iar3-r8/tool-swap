@@ -5,6 +5,12 @@ ARG RAY_BASE_TAG
 FROM ${RAY_BASE_TAG}
 
 # === Framework deps ===
+# NOTE: these run as the base image's ORIGINAL user (uid 1000, `ray`) BEFORE
+# the uid renumbering further down, so they can write into the conda
+# site-packages that is still owned by uid 1000 at this point (the original
+# behaviour). The installed files stay world-readable, which is all the runtime
+# worker needs (it only reads/executes them; Python silently skips .pyc writes
+# into dirs it does not own). Do NOT move the usermod block above these.
 RUN pip install --no-cache-dir \
     torch==2.8.0+cu129 \
     --extra-index-url https://download.pytorch.org/whl/cu129
@@ -13,17 +19,68 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     requests
 
+# =====================================================================
+# D22 — Pin the container runtime user to the HOST cluster uid.
+#
+# WHY the uid is pinned to the host's:
+#   * Ray's `image_uri` runtime env launches the replica container with
+#     `--userns=keep-id` and NO `--user` flag —
+#     ray/_private/runtime_env/image_uri.py:174 hardcodes run_options=[] —
+#     so the container worker runs as whatever uid the image's USER sets.
+#   * The host's Ray session dirs (<session>/logs/events/ and
+#     .../logs/export_events/) are mode 0755 and owned by the uid that started
+#     the cluster. If the container worker's uid does not match that cluster
+#     uid, the C++ core worker's event writer cannot open
+#       <session>/logs/events/event_CORE_WORKER_<pid>.log
+#     for writing; it throws an uncaught spdlog_ex -> std::terminate -> SIGABRT
+#     (exit 134), and the message is invisible because RayLog has already
+#     redirected fd 2.
+#   * Fix (Option 1d, user-chosen): rebuild the image so the container process
+#     runs as the HOST's cluster uid (default 1011 / gid 1013), matching the
+#     cluster-starting user. build_images.sh passes the invoking user's real
+#     uid/gid via --build-arg, so the image tracks whoever builds it.
+#
+# COST: this bakes a specific uid into the image, making it HOST-SPECIFIC.
+# That is the accepted cost of Option 1d and is itself part of the spike's
+# finding.
+# =====================================================================
+ARG SPIKE_UID=1011
+ARG SPIKE_GID=1013
+
+# Renumber the base image's EXISTING `ray` user (uid 1000 / gid 100) to the
+# host uid/gid, and make the home dir owned by it. Done once, as root.
+#
+# We renumber the existing `ray` user (option (a)) rather than creating a new
+# uid-1011 user (option (b)): the conda install and WORKDIR live under
+# /home/ray and the base image's python/PATH assume the `ray` home. A fresh
+# user with a different home (and no passwd entry for the old home) would break
+# conda/python. Renumbering keeps the name `ray` — so paths and $HOME still
+# resolve — while giving it the host uid.
+#
+# chown is the NARROWEST set: only /home/ray itself (so $HOME is writable for
+# the worker). The ~15 GB /home/ray/anaconda3 tree is deliberately left as-is
+# (world-readable: read+execute is enough for the interpreter and
+# site-packages); a recursive chown there is expensive and buys nothing.
+USER root
+RUN set -eux; \
+    groupmod -g "${SPIKE_GID}" ray; \
+    usermod -u "${SPIKE_UID}" -g "${SPIKE_GID}" ray; \
+    chown "${SPIKE_UID}:${SPIKE_GID}" /home/ray
+USER ${SPIKE_UID}
+
 # === Baked assets (must run before COPY toolkit, so assets are cached) ===
 # ASSET_SEED must differ from tool_tf's — step 2 needs distinct weight bytes.
-# --chown=ray so the later `rm` works: /tmp is sticky (1777), only the owner may unlink.
-COPY --chown=ray fixtures/make_assets.py /tmp/make_assets.py
+# --chown=${SPIKE_UID} so the later `rm` works: /tmp is sticky (1777), only
+# the owner may unlink.
+COPY --chown=${SPIKE_UID}:${SPIKE_GID} fixtures/make_assets.py /tmp/make_assets.py
 ARG WEIGHTS_MB=8
 ARG PAYLOAD_MB=64
 ARG ASSET_SEED=1001
-# ray (uid 1000) cannot create /opt/spike: pre-create it as root, chown it to ray, then restore the base image's runtime user.
+# ${SPIKE_UID} cannot create /opt/spike: pre-create it as root, chown it to
+# the runtime user, then run the asset generator as that user.
 USER root
-RUN mkdir -p /opt/spike && chown ray /opt/spike
-USER ray
+RUN mkdir -p /opt/spike && chown "${SPIKE_UID}:${SPIKE_GID}" /opt/spike
+USER ${SPIKE_UID}
 RUN python /tmp/make_assets.py \
       --weights /opt/spike/weights/ckpt.bin --weights-mb ${WEIGHTS_MB} \
       --payload /opt/spike/data/payload.bin --payload-mb ${PAYLOAD_MB} \
@@ -33,11 +90,15 @@ ENV SPIKE_WEIGHTS_PATH=/opt/spike/weights/ckpt.bin
 ENV SPIKE_PAYLOAD_PATH=/opt/spike/data/payload.bin
 
 # === Shared toolkit code ===
-COPY toolkit/ /home/ray/toolkit/
-COPY apps/ /home/ray/apps/
+# --chown so the runtime user owns (and can write __pycache__ into) the code
+# it imports.
+COPY --chown=${SPIKE_UID}:${SPIKE_GID} toolkit/ /home/ray/toolkit/
+COPY --chown=${SPIKE_UID}:${SPIKE_GID} apps/ /home/ray/apps/
 ENV PYTHONPATH="${PYTHONPATH}:/home/ray"
 
 # === Identity (cannot be faked via runtime_env env_vars) ===
 ENV SPIKE_IMAGE_MARKER=tool_torch
 
+# Final runtime user: the pinned host uid (NOT root).
+USER ${SPIKE_UID}
 WORKDIR /home/ray
