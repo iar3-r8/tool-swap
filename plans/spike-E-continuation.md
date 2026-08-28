@@ -638,6 +638,61 @@ a GPU), D25 (60s readiness ceiling; HTTP errors hidden behind a JSON decode),
 D27 (framework-typed value crossing the boundary). Two were findings about Ray;
 five were ours. That ratio is itself a result, and belongs in the write-up.
 
+**9i. STEP 2: PASS — behaviour 2 confirmed, plus one claim I am refusing to
+record as a result.**
+
+`make step2` → **exit 0**.
+
+| | tool_torch | tool_tf |
+|---|---|---|
+| `image_marker` | `tool_torch` | `tool_tf` |
+| `weights_sha256` | `43d5b7a712b5ded7…` | `83faf8738805e750…` |
+| `framework` / version | torch 2.8.0+cu129 | tensorflow 2.16.2 |
+| `weights_bytes` | 8388608 | 8388608 |
+| `init_total_seconds` | 1.83 | 2.72 |
+| `vram_allocated_mb` | 0 | 0 |
+
+**Verdict on behaviour 2 (app builder + per-app baked-in weights): CONFIRMED.**
+A **generic** builder —
+[`step2_builder.py`](../spike-e-ray-native/apps/step2_builder.py), which imports
+neither framework — built two applications from one `import_path` with different
+`args`, each landing in its own image with its own weights. Same byte count,
+**different SHA-256**: the two images genuinely hold different bytes at the same
+path and each replica read its own. That is the isolation proof, and it is the
+check that could never have passed before D21 fixed the op being called.
+`vram_allocated_mb: 0` is correct — these are CPU-only (`num_gpus: 0`) and D24
+skips allocation honestly instead of faking a number.
+
+**The claim I am NOT recording: "Strict builder ACCEPTED — builder may run in
+tool_torch image".** The strict variant
+([`step2_builder.py:79`](../spike-e-ray-native/apps/step2_builder.py:79)) imports
+`torch` at function scope and `serve deploy` returned 0. The conclusion does not
+follow:
+- Exit 0 from `serve deploy` means the request was **accepted**, not that the
+  builder ran, nor where it ran. Every failure in this spike so far also printed
+  `Deploy exit code: 0` — that is exactly how D22 and D28 stayed hidden.
+- The driver runs in the host venv, which **has torch installed**, so a
+  host-side builder import succeeds for a reason that says nothing about images.
+- The step never checked that the strict app reached RUNNING or answered a
+  request.
+
+**Recorded as an open question, not a finding.** Settling it needs a negative
+control: a builder importing a package absent from *both* the host venv and the
+target image, plus confirmation the app reaches RUNNING. Cheap, and it must be
+added before the write-up says anything about where builders execute.
+
+**Timing.** 14 polls (~70s) to RUNNING with warm images, and the two apps
+diverged sharply — `step2_tf` was RUNNING at poll 8 while `step2_torch` was still
+UPDATING at poll 12. Per-replica container start dominates and is not uniform,
+which matters for any latency budget built on it.
+
+**Fixed en route (D28/D28b).** `Tool` had **no `__call__`**, so it could not
+serve HTTP when bound directly as an ingress — which is exactly how step 2 binds
+it. Steps 3, 4 and 5 carried the identical latent bug via
+[`step3_gpu_swap.py`](../spike-e-ray-native/apps/step3_gpu_swap.py)'s dict-only
+overrides; found by reading the source rather than by spending the GPU gate on
+it.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
