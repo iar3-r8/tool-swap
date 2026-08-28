@@ -124,6 +124,73 @@ class Tool:
 
     # ── HTTP handlers ──────────────────────────────────────────────
 
+    async def __call__(self, request_data: Any) -> dict[str, Any]:
+        """Entry point for both deployment roles; delegates to :meth:`handle`.
+
+        Ray Serve invokes ``__call__`` with two different input shapes
+        depending on the deployment's role in the app graph:
+
+        * **Ingress role** (step 2, possibly 4/5): the proxy passes a
+          Starlette ``Request``; the JSON body must be parsed first.
+        * **Downstream role** (step 1): a calling deployment passes the
+          already-parsed request dict via ``.remote()``.
+
+        Shape detection is explicit, never try/except probing:
+        ``isinstance(request_data, dict)`` takes the downstream path,
+        and a callable ``.json`` attribute takes the ingress path. That
+        check is safe because a dict is exactly the plain-data contract
+        that downstream deployments send, while a Starlette ``Request``
+        is a class instance that can never ``isinstance`` a dict. The
+        single ``try`` around ``await .json()`` is error handling, not
+        detection: a malformed body must yield a structured
+        ``{"error": ...}`` (D27: fail in the response, not as an opaque
+        500), so the exception from a bad body cannot propagate.
+
+        Op dispatch is not duplicated: every dispatched request is
+        returned from :meth:`handle`, which alone routes ops and
+        enforces the deployment-boundary plain-data guard on the
+        result. The structured errors produced here are plain-data
+        strings, so they cross the boundary safely without bypassing
+        the guard on any op response.
+
+        Args:
+            request_data: A parsed request dict (downstream role), or
+                a request-like object with an async ``.json()`` method
+                (ingress role — no hard dependency on Starlette).
+
+        Returns:
+            The op response from :meth:`handle`, or a structured
+            ``{"error": ...}`` dict when the input is not a dict, the
+            body is not valid JSON, or the JSON is not an object.
+        """
+        if not isinstance(request_data, dict):
+            json_loader = getattr(request_data, "json", None)
+            if not callable(json_loader):
+                return {
+                    "error": (
+                        f"Unsupported request type"
+                        f" {type(request_data).__name__}: expected a"
+                        " JSON object (downstream role) or a request"
+                        " with a .json() method (ingress role)"
+                    )
+                }
+            try:
+                request_data = await json_loader()
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Rejecting request body that is not valid JSON: %s", exc
+                )
+                return {"error": f"Request body is not valid JSON: {exc}"}
+            if not isinstance(request_data, dict):
+                return {
+                    "error": (
+                        "Request body must be a JSON object; got"
+                        f" {type(request_data).__name__}"
+                    )
+                }
+        return await self.handle(request_data)
+
     async def handle(self, request_data: dict[str, Any]) -> dict[str, Any]:
         """Route to the appropriate op handler, guarding the reply.
 
