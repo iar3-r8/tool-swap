@@ -56,7 +56,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, os.path.join(_SCRIPTS_DIR, "lib"))
 
-from nvidia import snapshot_vram, vram_sampler
+from nvidia import gpu_used_mb, parse_cuda_visible_devices, snapshot_vram, vram_sampler
 from podman import podman_ps_all, podman_ps_count
 from recorder import Recorder, block, record
 from serve_api import apply_config, post_introspect, serve_status
@@ -109,19 +109,85 @@ def _release_tolerance_mb() -> int:
     return int(os.environ.get("SPIKE_VRAM_RELEASE_TOLERANCE_MB", "256"))
 
 
-def _total_vram_mb(gpus: list[dict]) -> int | None:
-    """Sum ``memory.used [MiB]`` over all GPUs in a snapshot.
-
-    Args:
-        gpus: The parsed ``nvidia-smi --format=json`` rows.
+def _gpu_index_override() -> tuple[int | None, str | None]:
+    """Manual GPU choice for a busy host (``SPIKE_GPU_INDEX``).
 
     Returns:
-        The total used MiB, or None when the snapshot is empty (no GPU
-        visible — the comparison cannot be made).
+        ``(index, None)`` when set and valid, ``(None, error)`` when
+        set but not a valid non-negative integer, ``(None, None)``
+        when unset.
     """
-    if not gpus:
+    raw = os.environ.get("SPIKE_GPU_INDEX", "").strip()
+    if not raw:
+        return None, None
+    try:
+        index = int(raw)
+    except ValueError:
+        return None, (
+            f"SPIKE_GPU_INDEX={raw!r} is not an integer — the VRAM "
+            "observations cannot be made."
+        )
+    if index < 0:
+        return None, (
+            f"SPIKE_GPU_INDEX={raw!r} is negative — the VRAM "
+            "observations cannot be made."
+        )
+    return index, None
+
+
+def _gpu_anchor(
+    data: dict,
+    tool: str,
+    recorder: Recorder,
+    outcome: StepOutcome,
+) -> int | None:
+    """Resolve which single GPU the *tool's* replica was placed on.
+
+    The host is shared (other tenants hold tens of GiB on some GPUs),
+    so the gate must never read the machine total: an unattributable
+    change would be misread as our tool's VRAM and could produce a
+    false decisive verdict (Rule 2).
+
+    Args:
+        data: The tool's introspect response (carries the
+            ``cuda_visible_devices`` Ray assigned the replica).
+        tool: The tool being anchored, for messages.
+        recorder: Records the attribution so ``results/raw/`` shows
+            which GPU the VRAM numbers describe.
+        outcome: Collects a harness failure when attribution is
+            impossible (exit 2, never a finding).
+
+    Returns:
+        The host GPU index to measure, or None (harness failure
+        recorded) when the replica cannot be attributed to one GPU.
+    """
+    override, err = _gpu_index_override()
+    if err is not None:
+        outcome.harness(err)
         return None
-    return sum(int(row.get("memory.used [MiB]", 0)) for row in gpus)
+    if override is not None:
+        recorder.write(block(
+            f"GPU attribution ({tool})",
+            f"SPIKE_GPU_INDEX override: measuring GPU {override}",
+        ))
+        return override
+    cuda_val = data.get("cuda_visible_devices")
+    index = parse_cuda_visible_devices(cuda_val)
+    recorder.write(block(
+        f"GPU attribution ({tool})",
+        f"cuda_visible_devices={cuda_val!r} -> "
+        + (f"measuring GPU {index}" if index is not None
+           else "NOT attributable to a single GPU"),
+    ))
+    if index is None:
+        outcome.harness(
+            f"{tool}: VRAM cannot be attributed to the replica's GPU "
+            f"(cuda_visible_devices={cuda_val!r}) — on this shared "
+            "host a machine-total VRAM comparison would be "
+            "unattributable. Set SPIKE_GPU_INDEX to the GPU Ray "
+            "assigned the replica, or run on an idle host."
+        )
+    return index
 
 
 def _gpu_guard() -> str | None:
@@ -235,33 +301,37 @@ def _check_vram_held(
     baseline: list[dict] | None,
     current: list[dict] | None,
     tool: str,
+    gpu_index: int,
 ) -> None:
-    """VRAM must grow while a tool replica is resident (gate tests 2/3).
+    """VRAM must grow on the replica's GPU while it is resident.
 
-    The fixture allocates ~4096 MiB in __init__ (apps/step3_gpu_swap.py);
-    no growth means the replica never touched a GPU.
+    The fixture allocates ~4096 MiB in __init__
+    (apps/step3_gpu_swap.py); no growth on the attributed GPU means
+    the replica never touched a GPU. Only GPU *gpu_index* is read —
+    the other GPUs belong to other tenants.
 
     Args:
         outcome: Collects the finding when VRAM did not grow.
         baseline: The pre-request snapshot (None = already a harness failure).
         current: The post-request snapshot (same).
         tool: The tool whose replica should be resident.
+        gpu_index: The host GPU the replica was attributed to.
     """
     if baseline is None or current is None:
         return  # the snapshots failed; a harness failure was recorded
-    before = _total_vram_mb(baseline)
-    after = _total_vram_mb(current)
+    before = gpu_used_mb(baseline, gpu_index)
+    after = gpu_used_mb(current, gpu_index)
     if before is None or after is None:
         outcome.harness(
-            f"nvidia-smi reported no GPU in the {tool} VRAM "
-            "snapshots — the comparison could not be made."
+            f"nvidia-smi did not report GPU {gpu_index} in the {tool} "
+            "VRAM snapshots — the comparison could not be made."
         )
         return
     if after <= before:
         outcome.finding(
-            f"VRAM was NOT held after the {tool} request: "
-            f"{before} MiB before vs {after} MiB after — the replica "
-            "started but holds no resident GPU memory, so the "
+            f"VRAM was NOT held on GPU {gpu_index} after the {tool} "
+            f"request: {before} MiB before vs {after} MiB after — the "
+            "replica started but holds no resident GPU memory, so the "
             "single-GPU swap cannot work."
         )
 
@@ -270,33 +340,37 @@ def _check_vram_released(
     outcome: StepOutcome,
     baseline: list[dict] | None,
     after_idle: list[dict] | None,
+    gpu_index: int,
 ) -> None:
-    """VRAM must return to baseline after the replica downscales (test 2).
+    """VRAM on the replica's GPU must return to baseline after idle.
 
     This is the decisive observation: the incumbent must free the GPU
     for the other tool. Anything beyond the driver-noise tolerance
-    still occupied after idle is a negative finding.
+    still occupied on the attributed GPU after idle is a negative
+    finding. Changes on other GPUs (other tenants) are ignored by
+    design.
 
     Args:
         outcome: Collects the finding when VRAM was not released.
         baseline: The pre-request snapshot (None = already a harness failure).
         after_idle: The post-idle snapshot (same).
+        gpu_index: The host GPU the incumbent was attributed to.
     """
     if baseline is None or after_idle is None:
         return
-    base = _total_vram_mb(baseline)
-    idle = _total_vram_mb(after_idle)
+    base = gpu_used_mb(baseline, gpu_index)
+    idle = gpu_used_mb(after_idle, gpu_index)
     if base is None or idle is None:
         outcome.harness(
-            "nvidia-smi reported no GPU in the release snapshots — "
-            "the comparison could not be made."
+            f"nvidia-smi did not report GPU {gpu_index} in the release "
+            "snapshots — the comparison could not be made."
         )
         return
     tol = _release_tolerance_mb()
     if idle > base + tol:
         outcome.finding(
-            f"VRAM was NOT released after downscale to zero: "
-            f"{idle} MiB after idle vs {base} MiB baseline "
+            f"VRAM was NOT released on GPU {gpu_index} after downscale "
+            f"to zero: {idle} MiB after idle vs {base} MiB baseline "
             f"(tolerance {tol} MiB) — the incumbent still occupies "
             "the GPU, so the second tool cannot start on it. Decisive "
             "negative result (Rule 2)."
@@ -431,6 +505,11 @@ def run(recorder: Recorder) -> int:
         baseline_vram = _snapshot_vram_block(
             "Baseline nvidia-smi", recorder, outcome
         )
+        # A malformed override would otherwise surface mid-run as a
+        # confusing attribution failure; classify it up front (exit 2).
+        _ovr_idx, _ovr_err = _gpu_index_override()
+        if _ovr_err is not None:
+            outcome.harness(_ovr_err)
 
         # ── 3. Deploy step 3 config ─────────────────────────────
         print("\n=== Deploying step 3 config ===")
@@ -476,10 +555,18 @@ def run(recorder: Recorder) -> int:
             vram_after_request = _snapshot_vram_block(
                 "VRAM after request", recorder, outcome
             )
+            torch_gpu = None
             if torch_result is not None:
-                _check_vram_held(
-                    outcome, baseline_vram, vram_after_request, "tool_torch"
+                # Anchor to the GPU Ray actually assigned the replica:
+                # on a shared host the other GPUs are other tenants'.
+                torch_gpu = _gpu_anchor(
+                    torch_result, "tool_torch", recorder, outcome
                 )
+                if torch_gpu is not None:
+                    _check_vram_held(
+                        outcome, baseline_vram, vram_after_request,
+                        "tool_torch", torch_gpu,
+                    )
                 print("\n=== CUDA_VISIBLE_DEVICES inside container ===")
                 _check_cuda_visible(
                     outcome, "tool_torch", torch_result, recorder
@@ -521,8 +608,10 @@ def run(recorder: Recorder) -> int:
                 recorder.write(block(
                     "serve status after idle", f"<unreachable: {e}>"
                 ))
-            if torch_result is not None:
-                _check_vram_released(outcome, baseline_vram, final_vram)
+            if torch_gpu is not None:
+                _check_vram_released(
+                    outcome, baseline_vram, final_vram, torch_gpu
+                )
 
             # ── 8/9. Swap to tool_tf, then alternate back ───────
             # Only when the gate has not already failed: once a
@@ -543,12 +632,17 @@ def run(recorder: Recorder) -> int:
                     phase="cold_start",
                 )
                 if tf_result is not None:
+                    tf_gpu = _gpu_anchor(
+                        tf_result, "tool_tf", recorder, outcome
+                    )
                     vram_after_tf = _snapshot_vram_block(
                         "VRAM after tool_tf request", recorder, outcome
                     )
-                    _check_vram_held(
-                        outcome, baseline_vram, vram_after_tf, "tool_tf"
-                    )
+                    if tf_gpu is not None:
+                        _check_vram_held(
+                            outcome, baseline_vram, vram_after_tf,
+                            "tool_tf", tf_gpu,
+                        )
                     _check_cuda_visible(
                         outcome, "tool_tf", tf_result, recorder
                     )
