@@ -693,6 +693,72 @@ it. Steps 3, 4 and 5 carried the identical latent bug via
 overrides; found by reading the source rather than by spending the GPU gate on
 it.
 
+**9j. FINDING (D32): YAML `ray_actor_options` REPLACES the decorator's
+wholesale — silently dropping `image_uri`, so the tools ran on the host.**
+
+Step 3's first real run failed, and the cause is a genuine Ray behaviour with
+sharp consequences for tool-swap.
+
+**Evidence.** `ToolTorch` failed to start three times with:
+```
+FileNotFoundError: [Errno 2] No such file or directory: '/opt/spike/weights/ckpt.bin'
+  File "/home/mgaron/Repositories/tool-swap/spike-e-ray-native/toolkit/deployments.py", line 107
+```
+`/opt/spike/weights/` exists **only inside the fixture images**, and the
+traceback path is the **host checkout** — so the replica ran on the host, in no
+container at all. `serve status` confirms it: the deployed `runtime_env`
+contains only `env_vars`, with **no `image_uri`**, even though
+[`step3_gpu_swap.py:22`](../spike-e-ray-native/apps/step3_gpu_swap.py:22) sets
+`"runtime_env": {"image_uri": IMAGE_TORCH}` in the decorator.
+
+**Cause, read from Ray's source** —
+[`application_state.py:1827-1833`](/usr/local/lib/python3.11/site-packages/ray/serve/_private/application_state.py:1827):
+```python
+if "ray_actor_options" in options:
+    # If specified, get ray_actor_options from config
+    override_actor_options = options.pop("ray_actor_options", {})
+else:
+    # Otherwise, get options from application code
+    override_actor_options = replica_config.ray_actor_options or {}
+```
+Whole-value **replacement, not a merge**.
+[`step3_config.yaml:24`](../spike-e-ray-native/apps/step3_config.yaml:24) sets
+`ray_actor_options: {num_gpus: 1}`, which replaced the decorator's
+`{num_gpus: 1, runtime_env: {image_uri: …}}` and discarded the image.
+
+**Why this is a finding and not merely our bug.** The failure is **silent**:
+Ray accepts the deploy, reports RUNNING, and runs the tool in the wrong
+environment. Nothing warns that an image requested in code was dropped by
+config. For tool-swap the implication lands on the exact axis the project cares
+about — *which environment a tool executes in*: a config that sets **any** actor
+option (a GPU count, a CPU count) silently voids the image the tool author
+specified, and the tool then runs against whatever is on the host. It also
+explains why step 1 passed: its YAML sets `ray_actor_options` *including* the
+`image_uri`, so nothing was lost.
+
+**Consequence for the spike.** The remedy is to name `image_uri` in the YAML
+beside `num_gpus`, as step 1 does. That does not retire the finding: the
+constraint is real, and any deployment mixing decorator options with config
+overrides will meet it.
+
+**Secondary defects exposed in the same run:**
+- `_require_same_gpu` crashed with `UnboundLocalError: tf_gpu` when the tf probe
+  never ran — the same bug class D29 fixed at
+  [`step3_gate.py`](../spike-e-ray-native/scripts/step3_gate.py), reintroduced by
+  the D31 invariant. A guard added *to make the gate trustworthy* crashed the
+  gate: exit 1, no verdict. Sobering, and worth stating plainly.
+- The 120s probe timeouts were **consequences** of the replicas never starting.
+  The gate classified them correctly as harness failures, but only surfaced the
+  three `REPLICA_STARTUP_FAILED` events in the post-idle status dump. It should
+  read `recent_dead_replicas` and fail fast.
+- `Podman containers: 70` — Ray's `image_uri` launcher passes no `--rm`
+  ([`image_uri.py:77-96`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:77)),
+  unlike its own throwaway inspection container at
+  [`:27`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:27).
+  Every crashed worker from three days is still on disk. It helped diagnose D22,
+  but on a long-running host a crash loop accumulates containers without bound —
+  a second, operational finding about `image_uri`.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
