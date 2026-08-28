@@ -72,12 +72,40 @@ fi
 # commands in this script create files, and other scripts do not
 # source this file, so nothing unrelated inherits the permissive
 # umask.
-echo "Starting Ray head node (dashboard port ${RAY_DASHBOARD_PORT})..."
+# D31: the old hard-coded --num-gpus=0 is gone. In Ray 2.57 an explicit
+# 0 is NOT "auto-detect": auto-detection runs only when the value is
+# None, so --num-gpus=0 registered a raylet with zero GPUs,
+# permanently. Steps 3-6 deploy num_gpus: 1 actors and can never be
+# scheduled on a zero-GPU raylet, so the step 3 gate would exit 2
+# without ever testing GPU swap.
+#
+# We pin exactly 1 GPU (SPIKE_RAY_NUM_GPUS, default 1) for EVERY step
+# instead of auto-detecting all of the host's: with several idle GPUs
+# Ray may place tool_torch and tool_tf on DIFFERENT GPUs, and the
+# per-GPU VRAM checks would then pass without ever observing
+# contention — a false pass of the decisive gate. A 1-GPU cluster
+# makes contention structural. Steps 1/2 are unaffected: their
+# num_gpus: 0 deployments request zero GPU units and are schedulable
+# on a node regardless of its registered GPU count.
+#
+# If the single GPU is unavailable (busy, MIG-partitioned), set
+# SPIKE_RAY_NUM_GPUS=0 deliberately and re-run only the steps that do
+# not need GPUs — never silently. The resolved count is printed above
+# so the recorded log shows what the cluster actually had.
+RAY_NUM_GPUS="${SPIKE_RAY_NUM_GPUS:-1}"
+case "${RAY_NUM_GPUS}" in
+    ''|*[!0-9]*)
+        echo "ERROR: SPIKE_RAY_NUM_GPUS='${SPIKE_RAY_NUM_GPUS}' is not a" >&2
+        echo "       non-negative integer." >&2
+        exit 1
+        ;;
+esac
+echo "Starting Ray head node (dashboard port ${RAY_DASHBOARD_PORT}, ${RAY_NUM_GPUS} GPU(s))..."
 umask 0
 ray start --head \
     --dashboard-port="${RAY_DASHBOARD_PORT}" \
     --num-cpus="$(nproc 2>/dev/null || echo 2)" \
-    --num-gpus=0 \
+    --num-gpus="${RAY_NUM_GPUS}" \
     --no-redirect-output \
     --disable-usage-stats \
     &

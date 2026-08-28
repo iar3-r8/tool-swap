@@ -35,10 +35,15 @@ fi
 # enough. Raise on slower hosts.
 : "${SPIKE_READINESS_TIMEOUT_S:=300}"
 : "${SPIKE_READINESS_POLL_S:=5}"
+# Step 3 gate (D31): GPUs the cluster registers. Pinned at 1 so the
+# step 3 tools are forced onto the same GPU (contention is structural,
+# not observed after the fact); see scripts/lib/start_cluster.sh.
+: "${SPIKE_RAY_NUM_GPUS:=1}"
 
 export SPIKE_ROOT RAY_BASE_TAG WEIGHTS_MB PAYLOAD_MB \
        RAY_CLUSTER_ADDRESS SERVE_DEPLOY_DIR CONTAINER_RUNTIME \
-       SPIKE_READINESS_TIMEOUT_S SPIKE_READINESS_POLL_S
+       SPIKE_READINESS_TIMEOUT_S SPIKE_READINESS_POLL_S \
+       SPIKE_RAY_NUM_GPUS
 
 export SPIKE_RESULTS_DIR="${SPIKE_ROOT}/results"
 export SPIKE_RAW_DIR="${SPIKE_RESULTS_DIR}/raw"

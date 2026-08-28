@@ -11,16 +11,19 @@ Tests:
   4. CUDA_VISIBLE_DEVICES reaches the container
   5. The swap is repeatable
 
-Exit status (D29)
+Exit status (D29, same-GPU invariant added by D31)
     0  Every required observation was made and nothing answers the gate
-       negatively: both tools cold-started, VRAM was held and released,
-       the GPU assignment reached the containers, and the swap repeated.
+       negatively: both tools cold-started, both were anchored to the
+       SAME GPU, VRAM was held and released on that GPU, the GPU
+       assignment reached the containers, and the swap repeated.
     1  Unexpected internal error (traceback printed).
     2  Harness/environment failure — a required observation could NOT be
        made: nvidia-smi or podman is absent, the config could not be
        deployed, a deployment never reached RUNNING, a probe was
-       unreachable, or a VRAM snapshot could not be taken. The gate
-       proves nothing and must be re-run on a healthy environment.
+       unreachable, a VRAM snapshot could not be taken, or the two
+       tools were anchored to DIFFERENT GPUs. The gate proves nothing
+       and must be re-run in an environment that forces contention
+       (see the same-GPU invariant below).
     3  Negative finding — the observations WERE made and answer the gate
        negatively: VRAM was not held after a request, VRAM was not
        released after the replica downscaled, the GPU assignment did not
@@ -88,10 +91,10 @@ def _downscale_settings() -> tuple[float, float]:
 
     Returns:
         ``(delay_s, buffer_s)`` from ``SPIKE_DOWNSCALE_DELAY_S``
-        (default 60) and ``SPIKE_DOWNSCASE_BUFFER_S`` (default 5).
+        (default 60) and ``SPIKE_DOWNSCALE_BUFFER_S`` (default 5).
     """
     delay_s = float(os.environ.get("SPIKE_DOWNSCALE_DELAY_S", "60"))
-    buffer_s = float(os.environ.get("SPIKE_DOWNSCASE_BUFFER_S", "5"))
+    buffer_s = float(os.environ.get("SPIKE_DOWNSCALE_BUFFER_S", "5"))
     return delay_s, buffer_s
 
 
@@ -188,6 +191,68 @@ def _gpu_anchor(
             "assigned the replica, or run on an idle host."
         )
     return index
+
+
+def _require_same_gpu(
+    outcome: StepOutcome,
+    recorder: Recorder,
+    torch_gpu: int | None,
+    tf_gpu: int | None,
+) -> None:
+    """Assert the same-GPU invariant: both tools used ONE GPU (D31).
+
+    The gate asks whether two conflicting tools can share a single
+    GPU — torch takes it, releases it, tf takes it. The per-GPU VRAM
+    checks only answer that question if BOTH tools were attributed to
+    the SAME GPU: with several idle GPUs, Ray may place tool_torch on
+    GPU 0 and tool_tf on GPU 4, and the per-GPU checks would then
+    verify that each tool held and released its own GPU and the gate
+    would exit 0 — a false pass of the decisive gate, which is worse
+    than a false failure because it wrongly credits Ray.
+
+    Classification: a DIFFERENT-GPU placement is a HARNESS FAILURE
+    (exit 2), not a negative finding. The observation the gate exists
+    to make (contention on one GPU) was not made: nothing was learned
+    about whether Ray can swap tools on a shared GPU. Calling it a
+    finding (exit 3) would wrongly record a "Ray loses" verdict on an
+    environment that never tested the question. The message tells the
+    operator how to re-run so the observation can be made.
+
+    With a 1-GPU cluster (``SPIKE_RAY_NUM_GPUS=1``) the placement is
+    forced and this assertion is the belt to the suspenders: it is
+    checked from the anchors the tools actually reported, never from
+    the configuration.
+
+    Args:
+        outcome: Collects the harness failure on a mismatch.
+        recorder: Records the comparison so ``results/raw/`` shows
+            the two anchors side by side.
+        torch_gpu: The GPU tool_torch was anchored to.
+        tf_gpu: The GPU tool_tf was anchored to.
+    """
+    if torch_gpu is None or tf_gpu is None:
+        return  # a tool was already unattributable (harness recorded)
+    recorder.write(block(
+        "Same-GPU invariant (D31)",
+        f"tool_torch anchored to GPU {torch_gpu}, "
+        f"tool_tf anchored to GPU {tf_gpu} "
+        + ("— SAME GPU, contention tested."
+           if torch_gpu == tf_gpu else
+           f"— DIFFERENT GPUs, contention NOT tested."),
+    ))
+    if torch_gpu != tf_gpu:
+        outcome.harness(
+            f"Both tools were placed on DIFFERENT GPUs (tool_torch on "
+            f"GPU {torch_gpu}, tool_tf on GPU {tf_gpu}): the gate's "
+            "observation — two tools contending for ONE GPU — was "
+            "never made, so the gate proves nothing. This is a "
+            "harness failure, NOT a verdict on Ray. Re-run with "
+            "contention forced: set SPIKE_RAY_NUM_GPUS=1 in .env so "
+            "the cluster exposes exactly one GPU (the launcher "
+            "prints the resolved count), or set SPIKE_GPU_INDEX to a "
+            "single free GPU so both anchors measure the same "
+            "physical device, then re-run step 3."
+        )
 
 
 def _gpu_guard() -> str | None:
@@ -454,8 +519,9 @@ def _print_summary(outcome: StepOutcome) -> None:
     if not outcome.harness_failures and not outcome.findings:
         print("")
         print("STEP 3 RESULT: gate CLEAN — exit code 0")
-        print("Both tools swapped on one GPU; VRAM was held and released;")
-        print("the GPU assignment reached the containers; the swap repeated.")
+        print("Both tools swapped on the SAME GPU (verified); VRAM was")
+        print("held and released; the GPU assignment reached the")
+        print("containers; the swap repeated.")
 
 
 def run(recorder: Recorder) -> int:
@@ -646,6 +712,14 @@ def run(recorder: Recorder) -> int:
                     _check_cuda_visible(
                         outcome, "tool_tf", tf_result, recorder
                     )
+
+                # ── 8b. Same-GPU invariant (D31) ───────────────
+                # The per-GPU VRAM checks above only answer the gate's
+                # question if both tools sat on the same GPU; with
+                # several idle GPUs Ray may have given each its own.
+                # A mismatch is a harness failure (the observation
+                # was not made), never a verdict on Ray.
+                _require_same_gpu(outcome, recorder, torch_gpu, tf_gpu)
 
                 # ── 9. Alternate once more (repeatability) ──────
                 if not outcome.findings and tf_result is not None:
