@@ -3,7 +3,7 @@ SHELL := /bin/bash
 ENV  := bash -c 'set -a; . ./env.sh; set +a; exec "$$@"' _
 CAPTURE_ENV := $(ENV) python scripts/capture_env.py
 
-.PHONY: all env cluster-up fixtures step1 step2 step3 step4 step5 step6 step7 clean preflight
+.PHONY: all env cluster-up fixtures step1 step2 step3 step3-container step4 step5 step6 step7 clean preflight
 
 all: env fixtures step1 step2 step3 step4 step5 step6 step7
 
@@ -27,6 +27,18 @@ step2: env
 
 step3: env
 	@$(ENV) bash scripts/lib/run_with_cluster_clean.sh env python scripts/step3_gate.py
+
+# Step 3 variant — the same gate through the legacy `container`
+# runtime_env key (D34: its run_options can pass
+# --runtime nvidia-container-runtime, which image_uri cannot). The
+# gate script is identical; only the config and the recording step
+# name differ (SPIKE_STEP3_CONFIG / SPIKE_STEP). Runs exactly like
+# step3: own cluster, same recorder conventions, same exit codes.
+step3-container: env
+	@$(ENV) bash scripts/lib/run_with_cluster_clean.sh env \
+		SPIKE_STEP3_CONFIG=apps/step3_config_container.yaml \
+		SPIKE_STEP=step3-container \
+		python scripts/step3_gate.py
 
 step4: env
 	@$(ENV) bash scripts/lib/run_with_cluster_clean.sh env python scripts/step4_payload.py

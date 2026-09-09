@@ -1,0 +1,86 @@
+# Step 3 (variant) — Two conflicting tools, one GPU, on-demand start,
+# through Ray's LEGACY `container` runtime_env key (D34).
+#
+# Why this variant exists: the recorded step 3 gate (exit 3, "VRAM was
+# NOT held") ran through `image_uri`, which structurally cannot give
+# the worker container a GPU — ImageURIPlugin.modify_context passes a
+# hardcoded empty run_options list (ray/_private/runtime_env/
+# image_uri.py:174), so `--runtime` is unreachable. The legacy
+# `container` key forwards run_options (image_uri.py:222-229), which is
+# the only path to the nvidia-container-runtime that injects both the
+# device nodes and the driver libraries on this host (ledger 9L).
+#
+# The gate measures the SAME behaviour as step3_config.yaml:
+#   - num_gpus: 1
+#   - min_replicas: 0 (on-demand)
+#   - max_replicas: 1
+#   - downscale_to_zero_delay_s: 60
+# autoscaling_config and ray_actor_options MUST be inside the
+# deployments list; ServeApplicationSchema ignores them at the
+# application level.
+#
+# D32: the container runtime_env MUST be repeated inside each
+# deployment's ray_actor_options below, exactly as for image_uri —
+# when a config sets ray_actor_options it REPLACES the
+# @serve.deployment decorator's ray_actor_options wholesale (Ray
+# performs no merge, ray/serve/_private/application_state.py:1827-1833).
+# Do not "tidy" it away.
+#
+# D26: image names are written literally — no env-var placeholders.
+# Note: serve_api._assert_no_unexpanded_placeholders rejects the
+# dollar-brace placeholder sequence anywhere in the rendered config,
+# so even comments must not contain it.
+#
+# `container` mutual exclusivity: it permits only `config` and
+# `env_vars` alongside it (ray/runtime_env/runtime_env.py:397-404).
+# Serve itself injects env_vars (deployment context vars,
+# ray/serve/_private/deployment_state.py:130-148), so the key set is
+# exactly {container, env_vars} and passes validation.
+
+applications:
+  # Explicit route_prefixes: two applications both defaulting to "/" are
+  # rejected by ServeDeploySchema ("duplicate applications for route
+  # prefix '/'"). step3_gate.py polls /tool_torch and /tool_tf.
+  - name: tool_torch
+    route_prefix: /tool_torch
+    import_path: step3_gpu_swap_container:application_torch
+    deployments:
+      - name: ToolTorch
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            container:
+              image: "tool_torch:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60
+          upscale_delay_s: 5
+          metrics_interval_s: 5
+          look_back_period_s: 15
+
+  - name: tool_tf
+    route_prefix: /tool_tf
+    import_path: step3_gpu_swap_container:application_tf
+    deployments:
+      - name: ToolTf
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            container:
+              image: "tool_tf:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+        autoscaling_config:
+          min_replicas: 0
+          max_replicas: 1
+          downscale_to_zero_delay_s: 60
+          upscale_delay_s: 5
+          metrics_interval_s: 5
+          look_back_period_s: 15

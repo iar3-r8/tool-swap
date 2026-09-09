@@ -48,6 +48,12 @@ Both failure kinds are printed with an explicit label and a final
 "STEP 3 RESULT:" summary line, and all raw output is recorded to
 results/raw/step3-*.log and results/metrics/step3.jsonl regardless of
 the exit status.
+
+The observations are identical for both step 3 forms; the config path
+and the recording step name are parameterised via SPIKE_STEP3_CONFIG
+and SPIKE_STEP (defaults: apps/step3_config.yaml and "step3"), so the
+legacy container-key variant (make step3-container) reuses this exact
+gate code.
 """
 from __future__ import annotations
 
@@ -73,6 +79,18 @@ from step1_verify import StepOutcome, _wait_for_running
 SERVE_BASE = os.environ.get("SERVE_BASE_URL", "http://localhost:8000")
 TOOL_TORCH_URL = f"{SERVE_BASE}/tool_torch"
 TOOL_TF_URL = f"{SERVE_BASE}/tool_tf"
+
+# ── Configurable step identity (D34: container-key variant) ─────
+# The gate measures whichever config it is pointed at, so the same
+# observation code runs both step 3 forms byte-identically: the
+# recorded image_uri form (the default, unchanged) and the legacy
+# `container`-key form. STEP_NAME labels the recordings so the
+# variants land in separate results/raw/*.log and results/metrics/
+# *.jsonl files; the defaults keep `make step3` byte-identical.
+STEP_NAME = os.environ.get("SPIKE_STEP", "step3")
+STEP3_CONFIG = os.environ.get(
+    "SPIKE_STEP3_CONFIG", "apps/step3_config.yaml"
+)
 
 # Expected per-tool identity. Each fixture image bakes its own marker
 # (fixtures/*.Dockerfile: SPIKE_IMAGE_MARKER) and its own framework, so
@@ -480,7 +498,7 @@ def _probe(
         result = post_introspect(url, timeout=120)
     except Exception as e:
         print(f"Error: {e}")
-        record("step3", tool=tool, phase=phase, error=str(e))
+        record(STEP_NAME, tool=tool, phase=phase, error=str(e))
         recorder.write(block(f"{tool} introspect error", str(e)))
         # Unreachable probe = harness/environment failure, not a
         # finding: the observation could not be made at all.
@@ -491,7 +509,7 @@ def _probe(
         return None
     elapsed = time.monotonic() - t0
     record(
-        "step3",
+        STEP_NAME,
         tool=tool,
         phase=phase,
         end_to_end_seconds=round(elapsed, 3),
@@ -499,7 +517,7 @@ def _probe(
     label = "Cold start" if phase == "cold_start" else "Probe"
     print(f"{label} end-to-end: {elapsed:.3f}s")
     print(f"Tool introspect: {json.dumps(result, indent=2)}")
-    record("step3", tool=tool, phase="introspect", result=result)
+    record(STEP_NAME, tool=tool, phase="introspect", result=result)
     recorder.write(block(f"{tool} introspect", json.dumps(result, indent=2)))
     _check_identity(outcome, tool, result)
     return result
@@ -583,7 +601,7 @@ def run(recorder: Recorder) -> int:
     # ── 1. Start VRAM sampler ──────────────────────────────────
     print("\n=== Starting VRAM sampler ===")
     vram_csv = os.path.join(
-        os.environ["SPIKE_METRICS_DIR"], "step3_vram.csv"
+        os.environ["SPIKE_METRICS_DIR"], f"{STEP_NAME}_vram.csv"
     )
     stop_event = threading.Event()
     sampler = threading.Thread(
@@ -619,10 +637,10 @@ def run(recorder: Recorder) -> int:
             outcome.harness(_ovr_err)
 
         # ── 3. Deploy step 3 config ─────────────────────────────
-        print("\n=== Deploying step 3 config ===")
+        print(f"\n=== Deploying step 3 config ({STEP3_CONFIG}) ===")
         deploy_ok = False
         try:
-            result = apply_config("apps/step3_config.yaml")
+            result = apply_config(STEP3_CONFIG)
             recorder.write(
                 block("serve deploy output", result.stdout + result.stderr)
             )
@@ -631,7 +649,7 @@ def run(recorder: Recorder) -> int:
                 deploy_ok = True
             else:
                 outcome.harness(
-                    f"`serve deploy` of apps/step3_config.yaml exited "
+                    f"`serve deploy` of {STEP3_CONFIG} exited "
                     f"{result.returncode} — the step 3 config could not "
                     "be deployed, so the gate observations cannot be "
                     "made."
@@ -802,7 +820,7 @@ if __name__ == "__main__":
         print("")
         print("STEP 3 RESULT: HARNESS FAILURE — exit code 2")
         sys.exit(2)
-    _recorder = Recorder("step3")
+    _recorder = Recorder(STEP_NAME)
     try:
         _exit_code = run(_recorder)
     except Exception:
@@ -812,8 +830,8 @@ if __name__ == "__main__":
         print("STEP 3: UNEXPECTED ERROR — recording and exiting")
         print("=" * 60)
         traceback.print_exc()
-        print("Step failed with an unexpected error; review "
-              "results/raw/step3-*.log")
+        print(f"Step failed with an unexpected error; review "
+              f"results/raw/{STEP_NAME}-*.log")
         _recorder.close()
         sys.exit(1)
     _recorder.close()

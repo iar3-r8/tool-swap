@@ -130,6 +130,20 @@ def _deployment_runtime_env(deployment: dict) -> dict:
     return runtime_env if isinstance(runtime_env, dict) else {}
 
 
+def _is_containerised_deployment(runtime_env: dict) -> bool:
+    """Whether the deployment runs in a container (image_uri or container key).
+
+    Both container runtime_env keys launch the replica through
+    ray/_private/runtime_env/image_uri.py, so both keep the image's
+    own PYTHONPATH: a host PYTHONPATH leak would overwrite the image's
+    ``ENV PYTHONPATH="${PYTHONPATH}:/home/ray"`` and break
+    ``toolkit``/``apps`` imports inside the container.
+    """
+    return bool(runtime_env.get("image_uri")) or bool(
+        runtime_env.get("container")
+    )
+
+
 def _inject_host_pythonpath(config: dict, work_dir: str) -> None:
     """Inject host PYTHONPATH into host-side deployments only (in place).
 
@@ -148,7 +162,8 @@ def _inject_host_pythonpath(config: dict, work_dir: str) -> None:
     * deployment without ``image_uri`` (runs on the host): the host paths
       are set in ``ray_actor_options.runtime_env.env_vars.PYTHONPATH``
       (previous behaviour, moved to deployment level);
-    * deployment with ``image_uri`` (runs in a container): ``PYTHONPATH``
+    * deployment with a container runtime_env (``image_uri`` or the
+      legacy ``container`` key, runs in a container): ``PYTHONPATH``
       is left entirely untouched — the image already sets
       ``ENV PYTHONPATH="${PYTHONPATH}:/home/ray"`` (see the fixture
       Dockerfiles), so there is nothing to inject and no host path may
@@ -162,7 +177,7 @@ def _inject_host_pythonpath(config: dict, work_dir: str) -> None:
     for app in config.get("applications", []):
         for deployment in app.get("deployments", []) or []:
             runtime_env = _deployment_runtime_env(deployment)
-            if runtime_env.get("image_uri"):
+            if _is_containerised_deployment(runtime_env):
                 # Containerised replica: keep the image's own PYTHONPATH.
                 continue
             actor_options = deployment.setdefault("ray_actor_options", {})
@@ -256,7 +271,7 @@ def apply_config(config_path: str) -> subprocess.CompletedProcess[str]:
     work_dir = str(Path(SERVE_WORKING_DIR).resolve())
 
     # Inject the host PYTHONPATH into host-side deployments only; containerised
-    # (image_uri) deployments keep the image's own PYTHONPATH.
+    # (image_uri / container) deployments keep the image's own PYTHONPATH.
     _inject_host_pythonpath(config, work_dir)
 
     augmented = yaml.dump(config, default_flow_style=False)
