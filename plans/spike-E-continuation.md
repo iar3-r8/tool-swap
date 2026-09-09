@@ -1068,6 +1068,58 @@ independent faults — it deployed nothing (its cluster was empty), and its prob
 URL was the bare root while the config serves `tool_torch` at `/tool_torch`.
 Either alone would have yielded a confident exit 2 measuring nothing.
 
+**9P. STEP 6 GATE: PASS — exit 0, and phase B now earns it (D41).**
+
+`make step6` → **exit 0**, `gate CLEAN`. Both phases produced real observations
+for the first time.
+
+**Phase A — partial head-node crash, operator recovery.** `kill -9` on the
+**GCS server** pid (raylet, dashboard and workers survive):
+- pre-kill state genuinely live: apps RUNNING, replica woken by a request,
+  VRAM **913 → 5163 MiB** on GPU 0;
+- recovery = the documented operator procedure: `ray stop --force` →
+  `ray start --head` **with the cluster's own flags** (`--num-gpus=1` etc.) →
+  re-apply the config → poll. All four steps exited 0;
+- apps back to RUNNING after **2 polls (~10s)**, `No manual steps required`
+  beyond the scripted procedure, and VRAM **647 → 5163 MiB** again after a
+  wake-up request.
+
+**Phase B — replica kill, unattended recovery.** The trace is the evidence:
+```
+kill -9 3437362: process gone 2s after the kill
+  [1] HEALTHY, UPSCALE_COMPLETED, PID: 3437362, RUNNING
+      (the killed PID is still reported — not a replacement)
+  [2] UNHEALTHY, HEALTH_CHECK_FAILED, PID: None, STARTING
+      recent_dead_replicas: [... replica_id i3klx8ni, STOPPED, pid 3437362]
+  [3] HEALTHY, PID: 3439230, RUNNING
+  Recovery confirmed — replacement PID 3439230 (killed PID was 3437362)
+```
+Ray replaced the killed replica **unattended** in ~15s: it detected the death
+(`HEALTH_CHECK_FAILED`), recorded the corpse in `recent_dead_replicas`, and
+started a fresh replica with a **new pid**. The kill was verified to have landed
+(`process gone 2s after the kill`), so the recovery is a response to a real
+death.
+
+**Verdict on behaviour 6 (restart and recovery): CONFIRMED, with the
+distinction stated.** Two different properties, and only one of them is
+automatic:
+- **replica death → automatic.** Ray notices and replaces it with no human
+  involvement. This is genuine self-healing.
+- **head-node/GCS death → operator-driven.** `ray start` alone is *not* enough
+  (an earlier run proved it: *"Ray is trying to start … but is already running"*,
+  because `kill -9` on the head pid leaves the GCS, raylet and dashboard alive).
+  Recovery needs `ray stop --force` first, then restart, then a **re-apply of
+  the config** — Serve applications do **not** come back by themselves. For an
+  unattended deployment that means a supervisor must own that runbook; Ray will
+  not do it for you.
+
+**The D40 fix earned its keep, visibly.** Poll 1 reported the just-killed pid as
+`RUNNING` — precisely the stale reading that made the *previous* version of this
+check pass on its first poll while measuring nothing. Requiring a **different**
+pid is what turned an unfalsifiable check into a real one. Third unfalsifiable
+check found in this harness (after step 1's silent exit 0 and step 2's wrong-op
+comparison), and all three had been *passing*.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
