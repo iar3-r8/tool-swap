@@ -28,10 +28,12 @@ Exit status (D29, same-GPU invariant added by D31)
        and must be re-run in an environment that forces contention
        (see the same-GPU invariant below).
     3  Negative finding — the observations WERE made and answer the gate
-       negatively: VRAM was not held after a request, VRAM was not
-       released after the replica downscaled, the GPU assignment did not
-       reach the container, or a tool answered with the wrong identity.
-       This is the decisive "Ray loses" result: record it and stop.
+       negatively: VRAM was not held after a request, the incumbent
+       replica never scaled to zero within the downscale budget (D35),
+       VRAM was not released after the replica downscaled, the GPU
+       assignment did not reach the container, or a tool answered with
+       the wrong identity. This is the decisive "Ray loses" result:
+       record it and stop.
 
 The 2-vs-3 boundary is deliberate and load-bearing: a probe that could
 not be reached, or an nvidia-smi that cannot run, means nothing was
@@ -63,6 +65,7 @@ import shutil
 import sys
 import threading
 import time
+from typing import Any
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
@@ -101,22 +104,181 @@ EXPECTED: dict[str, dict[str, str]] = {
 }
 
 
-def _downscale_settings() -> tuple[float, float]:
-    """Read the idle-wait knobs from the environment (D29).
+# D35: seconds to settle after the replica list is empty, before the
+# release snapshot. Actor death and the driver reclaiming the
+# replica's CUDA context are not synchronous; a few seconds covers a
+# clean teardown without reintroducing the timer-based wait D35
+# removes (a few seconds, not a minute — the measurement fault was
+# the 65s timer, not any post-teardown lag).
+_VRAM_SETTLE_S = 5.0
 
-    The step must idle past the deployment's
-    ``downscale_to_zero_delay_s`` (60s in apps/step3_config.yaml) plus
-    a buffer, so the wait is configurable rather than the old
-    hard-coded ``delay = 60`` — the same convention as the D25
-    readiness knobs. Read at call time so a test can override it.
+
+def _tool_torch_downscale_state(status: dict) -> tuple[int | None, list]:
+    """ToolTorch's (target_num_replicas, replicas) from a status payload.
+
+    Extracts per-deployment state from the v2 ``serve_status()``
+    payload the same way the readiness helpers do (step1_verify):
+    ``applications`` nests a ``deployments`` dict under each
+    application, and each deployment carries ``target_num_replicas``
+    (the autoscaler's decision) and ``replicas`` (the live replica
+    details, each with a ``state``).
+
+    Args:
+        status: The serve_status() response.
 
     Returns:
-        ``(delay_s, buffer_s)`` from ``SPIKE_DOWNSCALE_DELAY_S``
-        (default 60) and ``SPIKE_DOWNSCALE_BUFFER_S`` (default 5).
+        ``(target, replicas)`` — ``target`` is None when the payload
+        does not carry the field (the caller keeps waiting rather
+        than concluding); ``replicas`` is the replica-details list
+        (or [] when absent).
     """
-    delay_s = float(os.environ.get("SPIKE_DOWNSCALE_DELAY_S", "60"))
-    buffer_s = float(os.environ.get("SPIKE_DOWNSCALE_BUFFER_S", "5"))
-    return delay_s, buffer_s
+    apps = status.get("applications") or {}
+    app = apps.get("tool_torch")
+    if not isinstance(app, dict):
+        return None, []
+    dep = (app.get("deployments") or {}).get("ToolTorch")
+    if not isinstance(dep, dict):
+        return None, []
+    replicas = dep.get("replicas")
+    if not isinstance(replicas, list):
+        replicas = []
+    return dep.get("target_num_replicas"), replicas
+
+
+def _wait_for_scale_to_zero(
+    recorder: Recorder,
+    outcome: StepOutcome,
+    status_fn: Any = serve_status,
+) -> bool:
+    """Poll serve_status() until ToolTorch's target_num_replicas is 0.
+
+    D35: the old wait slept a fixed delay_s + buffer_s BEFORE the
+    release snapshot. That measured before Ray's own timer could
+    expire: the autoscaler starts the downscale clock only after the
+    request rate has decayed over look_back_period_s (15s), and only
+    then does downscale_to_zero_delay_s (60s) run, so the earliest
+    release is ~75-80s — a 65s sleep took the snapshot while
+    target_num_replicas was still 1 and the replica still RUNNING,
+    producing a false "VRAM not released" verdict (ledger §9M). The
+    wait is now driven by Ray's own state: the post-idle VRAM
+    snapshot is taken only once target_num_replicas is 0 AND the
+    replica list is empty (a target of 0 with a replica still
+    shutting down would measure mid-teardown).
+
+    Progress is printed on every state change plus a heartbeat every
+    6 polls (the D25 convention), so a slow downscale reads as
+    tracking, not a hang.
+
+    Timeout classification: if the polls ANSWERED for the whole
+    budget but the target never reached 0, that is a NEGATIVE
+    FINDING (exit 3) — "Ray did not scale to zero within Ns". The
+    observation was made: Ray's downscale decision is exactly what
+    the polls watched, and it answers the gate's question
+    negatively, because an incumbent that keeps its replica never
+    yields the GPU. It is deliberately not phrased as "VRAM was not
+    released": that claim belongs to the different case where Ray
+    DID scale to zero but the GPU memory persisted (a leak). Only
+    polls that NEVER answered are a harness failure (exit 2) — the
+    decision could not be observed.
+
+    Args:
+        recorder: Records the final status (or the last error).
+        outcome: Collects the harness failure / finding.
+        status_fn: Status source (defaults to ``serve_status``);
+            inject a stub for testing.
+
+    Returns:
+        True when the deployment scaled to zero and all its replicas
+        were gone within the budget.
+    """
+    wait_s = float(os.environ.get("SPIKE_DOWNSCALE_WAIT_S", "240"))
+    interval_s = float(os.environ.get("SPIKE_READINESS_POLL_S", "5"))
+    start = time.monotonic()
+    deadline = start + wait_s
+    print(
+        f"Waiting for Ray to scale tool_torch to zero "
+        f"(budget {wait_s:.0f}s, polling every {interval_s:.0f}s)..."
+    )
+    last_content: str | None = None
+    poll = 0
+    answered = False
+    last_target: int | None = None
+    last_replicas: list = []
+    last_error: Exception | None = None
+    while True:
+        poll += 1
+        try:
+            status = status_fn()
+        except Exception as e:
+            last_error = e
+            print(f"  [{poll}] serve status unreachable: {e} — retrying")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(interval_s)
+            continue
+        answered = True
+        target, replicas = _tool_torch_downscale_state(status)
+        last_target, last_replicas = target, replicas
+        if target == 0 and not replicas:
+            elapsed = time.monotonic() - start
+            print(
+                f"tool_torch scaled to zero after {poll} poll(s) "
+                f"({elapsed:.0f}s): target_num_replicas=0, no replicas "
+                "listed."
+            )
+            time.sleep(_VRAM_SETTLE_S)
+            print(
+                f"  (settled {_VRAM_SETTLE_S:.0f}s for the driver to "
+                f"reclaim the replica's VRAM)"
+            )
+            return True
+        states = ", ".join(str(r.get("state", "?")) for r in replicas)
+        content = (
+            "target_num_replicas="
+            f"{target if target is not None else '<absent>'}, "
+            f"replicas={len(replicas)}"
+            + (f" ({states})" if replicas else "")
+        )
+        if content != last_content or poll % 6 == 0:
+            print(f"  [{poll}] {content} — waiting")
+        last_content = content
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(interval_s)
+    print(f"tool_torch did not scale to zero within {wait_s:.0f}s — "
+          "final status:")
+    try:
+        final = status_fn()
+        recorder.write(block(
+            "serve status after downscale wait",
+            json.dumps(final, indent=2),
+        ))
+    except Exception as e:
+        recorder.write(block(
+            "serve status after downscale wait", f"<unreachable: {e}>"
+        ))
+    if not answered:
+        outcome.harness(
+            f"serve status was unreachable for the full {wait_s:.0f}s "
+            f"downscale wait: {last_error} — Ray's downscale decision "
+            "could not be observed."
+        )
+        return False
+    states = ", ".join(str(r.get("state", "?")) for r in last_replicas)
+    outcome.finding(
+        f"Ray did not scale tool_torch to zero within {wait_s:.0f}s: "
+        "final target_num_replicas="
+        f"{last_target if last_target is not None else '<absent>'}, "
+        f"{len(last_replicas)} replica(s) still listed"
+        + (f" ({states})" if last_replicas else "")
+        + ". This is a negative finding about Ray's downscale behaviour "
+        "— the incumbent KEEPS its replica and never yields the GPU "
+        "for the second tool. It is distinct from a VRAM leak (Ray "
+        "scaled to zero but GPU memory persisted), and no VRAM "
+        "release comparison is made because the replica was never "
+        "stopped."
+    )
+    return False
 
 
 def _release_tolerance_mb() -> int:
@@ -697,12 +859,17 @@ def run(recorder: Recorder) -> int:
                     outcome, "tool_torch", torch_result, recorder
                 )
 
-            # ── 7. Idle past downscale_to_zero_delay_s ──────────
-            delay_s, buffer_s = _downscale_settings()
-            print(f"\n=== Waiting {delay_s + buffer_s:.0f}s for the replica "
-                  f"to scale to zero (delay {delay_s:.0f}s + "
-                  f"buffer {buffer_s:.0f}s) ===")
-            time.sleep(delay_s + buffer_s)
+            # ── 7. Wait for Ray's scale-to-zero decision (D35) ───
+            # Poll Ray's own state instead of sleeping a fixed
+            # delay: the autoscaler's downscale clock starts only
+            # after the request rate decays over look_back_period_s,
+            # so the earliest release is ~75-80s and the old
+            # delay_s + buffer_s sleep (65s) measured before Ray had
+            # even started the timer — a false "VRAM not released"
+            # (ledger §9M). The post-idle VRAM snapshot is taken
+            # only after the decision is observed.
+            print("\n=== Waiting for Ray to scale tool_torch to zero ===")
+            scaled_to_zero = _wait_for_scale_to_zero(recorder, outcome)
 
             try:
                 final_podman = podman_ps_all()
@@ -716,9 +883,18 @@ def run(recorder: Recorder) -> int:
                     f"podman ps could not be run after idle: {e} — the "
                     "container observation could not be made."
                 )
-            final_vram = _snapshot_vram_block(
-                "VRAM after idle", recorder, outcome
-            )
+            final_vram = None
+            if scaled_to_zero:
+                final_vram = _snapshot_vram_block(
+                    "VRAM after idle", recorder, outcome
+                )
+            else:
+                print("\n=== VRAM release check SKIPPED: the scale-to-zero "
+                      "decision was not observed ===")
+                print("  The replica was never confirmed stopped, so a")
+                print("  release comparison would measure the incumbent")
+                print("  still serving — not a leak. See the downscale")
+                print("  wait outcome above (finding or harness failure).")
             try:
                 final_status = serve_status()
                 recorder.write(block(
@@ -733,7 +909,7 @@ def run(recorder: Recorder) -> int:
                 recorder.write(block(
                     "serve status after idle", f"<unreachable: {e}>"
                 ))
-            if torch_gpu is not None:
+            if scaled_to_zero and torch_gpu is not None:
                 _check_vram_released(
                     outcome, baseline_vram, final_vram, torch_gpu
                 )
