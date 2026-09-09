@@ -965,6 +965,71 @@ accepting a decisive negative, verify the system was actually *asked* to do the
 thing being measured. A gate that fires on the wrong side of a timing boundary is
 a random number generator with a persuasive label.
 
+**9N. STEP 3 GATE: PASS — exit 0. Ray Serve clears the decisive Rule 2 gate,
+through the legacy `container` key (D36).**
+
+`make step3-container` → **exit code 0**, `STEP 3 RESULT: gate CLEAN`. The full
+swap cycle was observed on **one physical GPU**, with the same-GPU invariant
+confirming contention was genuinely tested:
+```
+Same-GPU invariant (D31): tool_torch anchored to GPU 0,
+tool_tf anchored to GPU 0 — SAME GPU, contention tested.
+```
+
+**The measured cycle, GPU 0 throughout:**
+
+| phase | GPU 0 VRAM | evidence |
+|---|---|---|
+| baseline (both at 0 replicas) | 647 MiB | — |
+| tool_torch serving | **5163 MiB** | +4516; `image_marker: tool_torch`, torch 2.8.0+cu129, cold start 11.1s |
+| after Ray's own scale-to-zero | **579 MiB** | released *below* baseline; `status_trigger: DOWNSCALE_COMPLETED`, `target_num_replicas: 0`, `replicas: []` |
+| tool_tf serving | **38909 MiB** | `image_marker: tool_tf`, tensorflow 2.16.2, cold start 12.3s |
+| alternate back to tool_torch | served | `image_marker: tool_torch`, probe 84.2s |
+
+**Verdict on behaviour 3 (two conflicting tools, one GPU, on demand):
+CONFIRMED.** Every element the gate demanded:
+- **GPU reached the container** — VRAM actually moved, and `cuda_visible_devices:
+  "0"` inside a container that also reported its own baked-in `image_marker`.
+- **VRAM was held** — +4516 MiB on the attributed GPU, matching the tool's
+  4096 MiB allocation plus CUDA context.
+- **VRAM was released** — and critically, *because Ray decided to*: the D35 poll
+  observed `DOWNSCALE_COMPLETED` at 80s (17 polls), including a `STOPPING`
+  transition, before any measurement was taken. This is the fix that turned a
+  false negative into a real result.
+- **The swap worked both ways** — tf occupied the same GPU after torch released
+  it, then torch returned. Repeatable, not a one-shot.
+- **Contention was real** — a single-GPU cluster (D31) plus the anchor invariant
+  means the two tools genuinely competed for one device.
+
+**Cost observations for the write-up.** Cold starts ~11-12s per tool from a warm
+image cache. The alternate-back probe took **84.2s**, because it had to wait out
+the incumbent's scale-to-zero (~80s: `look_back_period_s` decay + 60s
+`downscale_to_zero_delay_s`) before the GPU freed. **That is the swap latency
+Ray's autoscaler imposes by default**, and it is the number that matters for
+tool-swap's TTL design — not the 11s cold start. It is tunable
+(`downscale_to_zero_delay_s`), but the metric-decay component is not.
+
+**The caveat that must travel with this pass — it is not incidental.** This
+result is reachable **only through Ray's legacy `container` runtime_env key**,
+because it accepts `run_options` and can therefore pass
+`--runtime=/usr/bin/nvidia-container-runtime`. The modern, documented
+`image_uri` key **cannot**:
+[`ImageURIPlugin.modify_context`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:174)
+hardcodes `run_options=[]`. The `image_uri` run of the same gate allocated
+**zero** VRAM (647 → 579) while Ray reported `GPU: 1.0` reserved and the replica
+HEALTHY. So:
+- adopting Ray for GPU tools means depending on the older API;
+- `container` is mutually exclusive with most other runtime_env fields
+  ([`runtime_env.py:397-404`](/usr/local/lib/python3.11/site-packages/ray/runtime_env/runtime_env.py:397)
+  permits only `config` and `env_vars` alongside it), so `pip`, `working_dir`
+  and friends are unavailable to a GPU tool;
+- the run options are host-specific (an absolute path to the host's
+  nvidia-container-runtime), so tool configs are not portable across hosts.
+
+**Rule 2 status: Ray Serve PASSES the decisive gate.** The spike continues to
+step 4. The earlier exit-3 results (§9k, §9M) are both retracted as measurement
+faults of mine, and this run supersedes them.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
