@@ -911,6 +911,60 @@ absence, and a *negative* result deserves the same scrutiny as a positive one �
 I had been careful all spike about false passes, and then nearly shipped a false
 failure.
 
+**9M. STEP 3 via the `container` key: the GPU reached the tool — and the second
+"decisive negative" is MY measurement error too (D35).**
+
+`make step3-container` → exit 3, *"VRAM was NOT released on GPU 0 after downscale
+to zero: 5163 MiB after idle vs 579 MiB baseline"*. **Not recorded as the Rule 2
+verdict: the gate measured before Ray was due to release anything.**
+
+**First, the real result — the `container` key works.** VRAM on GPU 0 went
+**579 → 5163 MiB** after the request: **+4584 MiB**, matching the tool's 4096 MiB
+allocation plus CUDA context. The `image_uri` run moved 647 → 579 (nothing at
+all). So:
+- Ray's **legacy `container` key can host a GPU-bound containerised tool**.
+  `run_options` carried `--runtime=/usr/bin/nvidia-container-runtime` and the
+  driver libraries were injected; `serve status` shows the options intact on both
+  deployments.
+- The tool answered from inside its container (`image_marker: tool_torch`, the
+  container's `sys_executable`), reached HEALTHY, and **genuinely allocated
+  VRAM**.
+- This **confirms 9L**: the "a GPU cannot reach a container" conclusion was
+  wrong, and `image_uri`'s hardcoded `run_options=[]` is the *only* reason the
+  modern API cannot do it.
+
+**Why the release check is invalid.** Per
+[`autoscaling_policy.py:124-130`](/usr/local/lib/python3.11/site-packages/ray/serve/autoscaling_policy.py:124),
+the delay clock starts when Ray **first wants** to scale down — not when the
+request ends. Getting there requires the request-rate metric to decay over
+`look_back_period_s` (15s), sampled every `metrics_interval_s` (5s); **only
+then** does the 60s `downscale_to_zero_delay_s` start
+([`:112-118`](/usr/local/lib/python3.11/site-packages/ray/serve/autoscaling_policy.py:112),
+which also shows scale-to-zero is permitted only from 1 → 0). Earliest possible
+release is **~75-80s**. The gate waited **65s** (`SPIKE_DOWNSCALE_DELAY_S=60` +
+`SPIKE_DOWNSCALE_BUFFER_S=5`).
+
+The run's own data proves the replica had not been asked to stop:
+`"target_num_replicas": 1`, replica `"state": "RUNNING"`, container `Up About a
+minute ago`. **The VRAM was still held because the tool was still running by
+Ray's own intent** — correct behaviour, misread as a leak.
+
+**Corrected status: the Rule 2 gate is still UNDECIDED.** Neither step-3 result
+is a verdict on Ray — the `image_uri` run measured a tool that never had a GPU,
+and this run measured release before release was due. Re-run needs a wait
+exceeding `look_back_period_s + downscale_to_zero_delay_s` with margin (e.g.
+`SPIKE_DOWNSCALE_BUFFER_S=45`, total 105s), and should **poll
+`target_num_replicas` until it reaches 0** rather than sleeping a fixed period,
+so the measurement is triggered by Ray's decision instead of a guess.
+
+**Process note.** Second time on this gate that I nearly recorded a
+framework-killing verdict from a measurement fault of my own. Both times the tell
+was already in the data: a VRAM delta of *minus 68 MiB* in the first run, and
+`target_num_replicas: 1` in this one. The rule I am carrying forward: before
+accepting a decisive negative, verify the system was actually *asked* to do the
+thing being measured. A gate that fires on the wrong side of a timing boundary is
+a random number generator with a persuasive label.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
