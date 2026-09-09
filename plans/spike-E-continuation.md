@@ -759,6 +759,84 @@ overrides will meet it.
   but on a long-running host a crash loop accumulates containers without bound —
   a second, operational finding about `image_uri`.
 
+**9k. STEP 3 GATE: FAILED — exit 3. The cause is decisive: `image_uri` cannot
+give a container a GPU, while Ray's scheduler believes it did.**
+
+`make step3` → **exit code 3**, `STEP 3 RESULT: NEGATIVE FINDING(S)`. This is
+the Rule 2 gate, so the spike stops here.
+
+**What the gate observed.** `tool_torch` cold-started in 10.8s and answered
+`introspect` from inside its container — `image_marker: tool_torch`,
+`sys_executable: /home/ray/anaconda3/bin/python`, `cuda_visible_devices: "0"` —
+and reached `HEALTHY`/`RUNNING`. But VRAM on GPU 0 went **647 MiB → 579 MiB**
+across the request. The tool allocates 4096 MiB and added **nothing**.
+
+**Why — established by four independent checks, not inferred:**
+1. Ray's container command
+   ([`image_uri.py:76-96`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:76))
+   is `podman run -v … --cgroup-manager=cgroupfs --network=host --pid=host
+   --ipc=host --userns=keep-id`. Grep for `--device`, `--gpus`, `nvidia`:
+   **nothing**. No device is passed and no GPU-aware runtime is selected.
+2. A container run with Ray's exact flags reports
+   `cuda_available: False, device_count: 0`.
+3. Even passing the raw device nodes (`--device /dev/nvidia0 --device
+   /dev/nvidiactl --device /dev/nvidia-uvm …`), the container reports
+   `libcuda.so.1: cannot open shared object file` → `cuda: False, 0`. Device
+   nodes alone are insufficient: the **driver libraries** must be injected, which
+   is the job of `nvidia-container-runtime` — present at
+   `/usr/bin/nvidia-container-runtime`, and never invoked by Ray.
+4. [`ImageURIPlugin.modify_context`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:174)
+   hardcodes `run_options=[]`, so **`--runtime`, `--device` and `--gpus` cannot
+   be supplied through `image_uri` at all**. The legacy `container` key forwards
+   run options; the modern key does not.
+
+**The finding.** Ray reserved `GPU: 1.0` for the replica, set
+`CUDA_VISIBLE_DEVICES=0` in its environment, and reported it HEALTHY — while the
+container had **no GPU whatsoever**. Ray's accounting claimed an A100 was
+occupied while zero bytes of VRAM were allocated and the tool ran on CPU. The
+two capabilities tool-swap needs *simultaneously* — **per-tool container images**
+and **GPU residency** — do not compose in Ray 2.57. And the failure is silent:
+nothing in the deploy, in `serve status`, or in the replica's own view reveals
+that the promised GPU is absent. A scheduler built on this would hand out GPUs
+that its tools cannot use, and never know.
+
+**Rule 2 verdict: Ray Serve FAILS the decisive gate.** The question was whether
+two conflicting tools can share one GPU on demand. They cannot — a containerised
+tool cannot reach a GPU at all.
+
+**Scope of the claim, stated precisely, including what would overturn it:**
+- Tested on Ray 2.57 + **rootless podman 3.4.4**. That podman predates CDI, so
+  the 17 devices `nvidia-ctk` registered (`nvidia.com/gpu=0…7`) are unusable by
+  it — `--device nvidia.com/gpu=0` fails with *"stat … no such file or
+  directory"*, i.e. the name is treated as a path. A podman ≥4.x host might
+  reach a GPU **if Ray passed the device** — but Ray passes none and
+  `run_options` is hardcoded empty, so the Ray-side blocker stands independently
+  of the podman version.
+- Under **Docker** with `nvidia-container-runtime` as the default runtime,
+  library injection can occur without an explicit flag, so `image_uri` might
+  behave differently there. **Untested, and unreachable here**: Ray hardcodes
+  `container_driver = "podman"` at
+  [`image_uri.py:76`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:76).
+  This is the single biggest caveat on the verdict and must be carried into the
+  write-up as such.
+- The legacy `container` runtime_env key accepts `run_options` and could carry
+  `--runtime=nvidia`. That is a different API from the one under test, mutually
+  exclusive with most other runtime_env fields, and would need its own run
+  before any claim is made about it.
+
+**What is not in doubt:** with the modern, documented `image_uri` key, on this
+host, a GPU-bound containerised tool is impossible, and Ray misreports the GPU
+as allocated.
+
+**Also observed:**
+- The same-GPU invariant never fired because the gate stopped at the first
+  finding and never probed `tool_tf` — correct behaviour: further probes would
+  only have recorded consequences of the decisive result.
+- The D32 fix worked. `serve status` shows
+  `runtime_env: {image_uri: "tool_torch:spike"}` present and the replica running
+  the container's interpreter — the image reached the replica this time.
+- 71 containers on disk (one still `Up`), continuing the `--rm` accumulation.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
