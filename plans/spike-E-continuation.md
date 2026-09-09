@@ -1187,6 +1187,57 @@ question only; the "re-apply the whole config" alternative is unmeasured.
 externally-driven displacement, with a P90 of 103s as the cost.** Reliability is
 not the problem — 20/20, no errors. Latency variance is.
 
+**9R. STEP 7: record-only, no verdict. Three facts observed, three items left
+undone (D43).**
+
+`make step7` → exit 0, but step 7 **produces no pass/fail by design** — it is a
+shared-node fitness record.
+
+**Correction to my own framing, recorded rather than dropped:** I told the user
+step 7 was a "plain podman baseline" to compare against Ray's latency. It is
+not, and **no such baseline exists in this spike**. If we want to know how much
+of step 5's 103s P90 is Ray's orchestration versus the cost of starting a
+14-19 GB container, that measurement still has to be built. Until then the
+attribution is unproven.
+
+**What it actually observed:**
+1. **Docker and rootless podman coexist.** Docker 27.5.1 with **9 running
+   containers** (`vllm-openai`, `llama-swap:unified-cuda`, `qdrant`, several
+   devcontainers) was unaffected by podman use — checked before and after:
+   *"Docker still running"*. This matters because the host is shared and
+   tool-swap would never be its only tenant.
+2. **`--privileged` is not required** for the host-raylet topology: podman is
+   **rootless** (`rootless: true`, `runRoot: /run/user/1011`), driven by the
+   host user. The step also notes that a **devcontainer-hosted** raylet *would*
+   need `--privileged` plus a `/var/lib/containers` mount — worth knowing before
+   anyone tries to run the raylet inside a container.
+3. **Storage driver is `overlay`**, with `Native Overlay Diff: true`. Ray's docs
+   warn of *"very slow or hanging container startup"* under `vfs`, so this host
+   is on the good path — which matters because our ~12s cold starts would likely
+   be far worse otherwise, and the step-5 latency figures implicitly depend on
+   this.
+
+**Also in the output, worth carrying forward:** the podman store now holds
+**109 stopped containers** and 120 images — the `--rm`-less accumulation from
+Ray's `image_uri` worker launches
+([`image_uri.py:77-96`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:77))
+compounding across the spike. Harmless on this host, unbounded in principle.
+
+**Three things the step explicitly did NOT do, and says so instead of
+pretending:**
+- **the vfs-vs-overlay A/B** — it "requires temporarily switching the storage
+  driver and pulling a multi-GB image with each … should be done on a disposable
+  machine". Correctly skipped: it mutates configuration on a shared host.
+- **the `/tmp/ray` permission check** — the `ports_by_node.json.lock` error is
+  described but never exercised. Note we hit the *same class* of failure for
+  real in D22 (host uid 1011 vs the image's 1000 against Ray's 0755 event
+  dirs), so the concern is genuine and this version of it stays unverified.
+- **a real `--privileged` experiment** — fact 2 is inferred from configuration,
+  not from a run that tried without it and failed.
+
+**Verdict: none, and none should be claimed.** Step 7 contributes environment
+context to the write-up, not evidence for or against Ray.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
