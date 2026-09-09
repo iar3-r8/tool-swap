@@ -1,7 +1,7 @@
 """Step 4 — Local payload read (D18 NOT tested per §0a).
 
-Reads a baked-in file from the running tool_torch.
-No S3, no remote payload, no credential plumbing.
+Deploys the container-key tool_torch (D38), then reads a baked-in file
+from it. No S3, no remote payload, no credential plumbing.
 D18 remains an untested assumption.
 
 Exit status (D29)
@@ -10,9 +10,11 @@ Exit status (D29)
        verified against its sidecar.
     1  Unexpected internal error (traceback printed).
     2  Harness/environment failure — an observation could NOT be made:
-       the warm-up probe was unreachable, or a read request failed
-       (connection error, timeout, non-2xx, non-JSON). The numbers from
-       this run are incomplete and must not be treated as a pass.
+       the config could not be deployed, the deployment never reached
+       RUNNING, the warm-up probe was unreachable, or a read request
+       failed (connection error, timeout, non-2xx, non-JSON). The
+       numbers from this run are incomplete and must not be treated as
+       a pass.
     3  Negative finding — the observation WAS made and answers the step
        negatively: a read returned but the payload did not verify
        (size or hash mismatch against the sidecar).
@@ -40,10 +42,30 @@ sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, os.path.join(_SCRIPTS_DIR, "lib"))
 
 from recorder import Recorder, block, record
-from serve_api import post_introspect, post_predict
-from step1_verify import StepOutcome
+from serve_api import apply_config, post_introspect, post_predict
+from step1_verify import StepOutcome, _wait_for_running
 
-TOOL_URL = os.environ.get("SPIKE_SERVE_URL_TORCH", "http://localhost:8000")
+# D38: step 4 deploys the tools it needs itself, so `make step4` is
+# self-contained like steps 1/2/3/5 (make step4 starts its own clean
+# cluster, so nothing is running before this script does). The config
+# is the container-key step 3 variant: its tool_torch app and
+# deployment are the ones that hold a GPU (D34: image_uri hardcodes
+# run_options=[] at ray/_private/runtime_env/image_uri.py:174), and
+# step 4's payload read is the same baked-in /opt/spike/data asset the
+# step 3 image bakes. Reusing step 3's config keeps one authoritative
+# GPU-holding tool_torch definition; a step-4-specific config would
+# duplicate it and nothing in this step's measurements differs.
+STEP4_CONFIG = os.environ.get(
+    "SPIKE_STEP4_CONFIG", "apps/step3_config_container.yaml"
+)
+
+# The proxy URL must match the config's tool_torch route_prefix
+# (/tool_torch in the step 3 container config): requests to the bare
+# root would hit no route. (The old default "http://localhost:8000"
+# assumed a root-routed deployment and could never answer here.)
+TOOL_URL = os.environ.get(
+    "SPIKE_SERVE_URL_TORCH", "http://localhost:8000/tool_torch"
+)
 PAYLOAD_PATH = os.environ.get("SPIKE_PAYLOAD_PATH", "/opt/spike/data/payload.bin")
 
 N_READS = 3
@@ -94,6 +116,44 @@ def run(recorder: Recorder) -> int:
     payload_path = PAYLOAD_PATH
     print(f"  Payload path: {payload_path}")
 
+    # ── Deploy the tools this step measures (D38) ─────────────
+    # The cluster is clean (run_with_cluster_clean.sh), so without a
+    # deploy here the warm-up probe below would fail against an empty
+    # proxy and the step would exit 2 having measured nothing.
+    # D29: a failed deploy means the reads cannot be observed —
+    # harness, exit 2, with the same labels as a failed probe.
+    print(f"\n=== Deploying the tool_torch config ({STEP4_CONFIG}) ===")
+    deploy_ok = False
+    try:
+        result = apply_config(STEP4_CONFIG)
+        recorder.write(
+            block("serve deploy output", result.stdout + result.stderr)
+        )
+        print(f"Exit code: {result.returncode}")
+        if result.returncode == 0:
+            deploy_ok = True
+        else:
+            outcome.harness(
+                f"`serve deploy` of {STEP4_CONFIG} exited "
+                f"{result.returncode} — the payload reads cannot be "
+                "observed."
+            )
+    except Exception as e:
+        recorder.write(block("serve deploy error", str(e)))
+        print(f"Deploy error: {e}")
+        outcome.harness(
+            f"Could not deploy {STEP4_CONFIG}: {e} — the payload "
+            "reads cannot be observed."
+        )
+
+    if deploy_ok:
+        # D25 readiness convention (shared with steps 1/2/3/5): poll
+        # until the deployed applications report RUNNING instead of
+        # hoping the warm-up probe reaches a replica that is still
+        # starting. Never reached RUNNING within the budget → harness
+        # failure (exit 2), recorded by the helper.
+        _wait_for_running(recorder, outcome)
+
     # ── Warm up ────────────────────────────────────────────────
     # The measurement is a *warm* local read (min_replicas: 0), so the
     # replica must be awake before any timing starts. If the warm-up
@@ -101,26 +161,33 @@ def run(recorder: Recorder) -> int:
     # a read that has to cold-start a 14-19GB container would not be
     # measuring what this step claims to measure.
     print("\n=== Warming up tool_torch ===")
-    try:
-        post_introspect(TOOL_URL)
-        print("  Warm")
-    except Exception as e:
-        print(f"Warm-up error: {e}")
-        recorder.write(block("warm-up introspect error", str(e)))
-        record("step4", phase="warmup", harness_failure=str(e))
-        outcome.harness(
-            f"Warm-up probe could not be reached at {TOOL_URL} ({e}) — "
-            "a warm read cannot be observed without a warm replica; "
-            "skipping the timed reads."
-        )
-        print("  Skipping the timed reads: no warm replica.")
+    if not deploy_ok:
+        print("  Skipping the warm-up: the config could not be deployed.")
+    else:
+        # (The warm-up is attempted even if _wait_for_running timed
+        # out, as in step 3: a probe that does answer is information,
+        # not noise.)
+        try:
+            post_introspect(TOOL_URL)
+            print("  Warm")
+        except Exception as e:
+            print(f"Warm-up error: {e}")
+            recorder.write(block("warm-up introspect error", str(e)))
+            record("step4", phase="warmup", harness_failure=str(e))
+            outcome.harness(
+                f"Warm-up probe could not be reached at {TOOL_URL} ({e}) "
+                "— a warm read cannot be observed without a warm "
+                "replica; skipping the timed reads."
+            )
+            print("  Skipping the timed reads: no warm replica.")
 
     # ── Three reads ────────────────────────────────────────────
     print("\n=== Reading payload (3x) ===")
     timings = []
     for i in range(N_READS):
         if outcome.harness_failures:
-            # The warm-up failed: the reads would not be warm.
+            # A deploy or warm-up failure is already recorded: the reads
+            # would not be warm (or the tool would not exist).
             print(f"  Read {i+1}: SKIPPED (no warm replica)")
             continue
         t0 = time.monotonic()

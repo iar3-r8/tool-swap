@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.join(_SCRIPTS_DIR, "lib"))
 from nvidia import snapshot_vram
 from podman import podman_ps_all, podman_ps_count
 from recorder import Recorder, block, record
-from serve_api import serve_status
+from serve_api import apply_config, serve_status
 from step1_verify import StepOutcome, _readiness_settings
 
 # Application-level healthy statuses (D29 fix): Ray 2.57's
@@ -60,6 +60,20 @@ _APP_HEALTHY = ("RUNNING", "HEALTHY")
 
 # Deployment-level healthy status (schema.py DeploymentStatus).
 _DEP_HEALTHY = "HEALTHY"
+
+# The config re-deployed on the recovery path (D38, mirroring D34's
+# SPIKE_STEP3_CONFIG for step 3): the legacy ``container``-key config,
+# which is what the phase A/B observations assume (D34: only the
+# container key's run_options can pass the nvidia-container-runtime;
+# image_uri hardcodes run_options=[] at
+# ray/_private/runtime_env/image_uri.py:174, so an image_uri replica
+# holds no GPU and step 6's VRAM observations would measure nothing).
+# D37 repointed the step 6 config at the container-key module; the
+# recovery deploy must use the same config, so the restarted replicas
+# are what the gate is actually observing. Read at import time like
+# the step 3 knob, so the path is visible and overridable rather than
+# buried in a list literal.
+STEP6_CONFIG = os.environ.get("SPIKE_STEP6_CONFIG", "apps/step6_config.yaml")
 
 
 def _app_status(app) -> str:
@@ -325,11 +339,18 @@ def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
 
     time.sleep(5)
 
+    # Deploy through the harness's own apply_config (the D26/D23
+    # guards it carries: the D26 placeholder guard rejects any ${ that
+    # survived rendering, and the D23 per-deployment PYTHONPATH skip
+    # keeps the host PYTHONPATH out of containerised replicas) rather
+    # than a raw `serve deploy` subprocess: the raw form bypassed both,
+    # and it deployed the wrong file (the image_uri config, whose
+    # replicas hold no GPU — see STEP6_CONFIG above). Killing the
+    # cluster is orthogonal: recovery is still a plain re-apply of the
+    # same config the step was started with, which is exactly what
+    # apply_config does.
     try:
-        result = subprocess.run(
-            ["serve", "deploy", "apps/step3_config.yaml"],
-            capture_output=True, text=True, timeout=120,
-        )
+        result = apply_config(STEP6_CONFIG)
         recorder.write(block("serve deploy (recovery)", result.stdout + result.stderr))
         print(f"serve deploy exit: {result.returncode}")
         if result.returncode != 0:
