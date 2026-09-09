@@ -19,7 +19,10 @@ Exit status (D29, same-GPU invariant added by D31)
     1  Unexpected internal error (traceback printed).
     2  Harness/environment failure — a required observation could NOT be
        made: nvidia-smi or podman is absent, the config could not be
-       deployed, a deployment never reached RUNNING, a probe was
+       deployed, a deployment never reached RUNNING (D32: including
+       the fail-fast case where the deployment is UNHEALTHY with
+       status_trigger=REPLICA_STARTUP_FAILED — the replica's startup
+       exception is surfaced in the message), a probe was
        unreachable, a VRAM snapshot could not be taken, or the two
        tools were anchored to DIFFERENT GPUs. The gate proves nothing
        and must be re-run in an environment that forces contention
@@ -230,6 +233,13 @@ def _require_same_gpu(
         torch_gpu: The GPU tool_torch was anchored to.
         tf_gpu: The GPU tool_tf was anchored to.
     """
+    # D32 (structural): both anchors are explicit parameters of this
+    # signature, so a missing anchor is a None VALUE, never an
+    # unassigned name — the caller is required to have resolved both
+    # before calling (see _resolve_gpu_anchor in run()). An anchor
+    # that is None means a harness failure was already recorded when
+    # the probe or attribution failed, so the guard is complete as a
+    # no-op here.
     if torch_gpu is None or tf_gpu is None:
         return  # a tool was already unattributable (harness recorded)
     recorder.write(block(
@@ -524,6 +534,37 @@ def _print_summary(outcome: StepOutcome) -> None:
         print("containers; the swap repeated.")
 
 
+def _resolve_gpu_anchor(
+    result: dict | None,
+    tool: str,
+    recorder: Recorder,
+    outcome: StepOutcome,
+) -> int | None:
+    """Resolve the tool's GPU anchor, or None (harness already recorded).
+
+    D32 (structural): every anchor used by the same-GPU guard is
+    resolved through this helper, which is called UNCONDITIONALLY and
+    ALWAYS returns a value — the anchor index, or None when the probe
+    never answered (``result is None``; the unreachable-probe harness
+    failure was recorded by ``_probe``) or the replica cannot be
+    attributed (``_gpu_anchor`` records that harness failure). The
+    guard therefore never reads an unassigned name.
+
+    Args:
+        result: The tool's introspect response, or None when the probe
+            never answered.
+        tool: The tool being anchored, for messages.
+        recorder: Records the attribution.
+        outcome: Collects the attribution harness failure.
+
+    Returns:
+        The host GPU index the replica was attributed to, or None.
+    """
+    if result is None:
+        return None
+    return _gpu_anchor(result, tool, recorder, outcome)
+
+
 def run(recorder: Recorder) -> int:
     """Run step 3's gate observations and return the process exit code.
 
@@ -697,10 +738,22 @@ def run(recorder: Recorder) -> int:
                     recorder, outcome, "tool_tf", TOOL_TF_URL,
                     phase="cold_start",
                 )
+                # D32 (structural fix for the UnboundLocalError on
+                # tf_gpu): the anchor was previously assigned only
+                # inside the ``tf_result is not None`` branch, so the
+                # _require_same_gpu call below read an unassigned
+                # local when the tf probe never answered — the same
+                # bug class D29 fixed for torch_result. The anchor
+                # resolution is now hoisted out of the conditional
+                # into _resolve_gpu_anchor, which ALWAYS returns a
+                # value (the anchor, or None with the harness
+                # failure already recorded). Both anchors therefore
+                # exist as values before the guard reads them, no
+                # matter which probes answered.
+                tf_gpu = _resolve_gpu_anchor(
+                    tf_result, "tool_tf", recorder, outcome
+                )
                 if tf_result is not None:
-                    tf_gpu = _gpu_anchor(
-                        tf_result, "tool_tf", recorder, outcome
-                    )
                     vram_after_tf = _snapshot_vram_block(
                         "VRAM after tool_tf request", recorder, outcome
                     )

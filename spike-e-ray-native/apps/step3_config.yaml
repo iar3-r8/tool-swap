@@ -10,6 +10,16 @@
 # autoscaling_config and ray_actor_options MUST be inside the
 # deployments list; ServeApplicationSchema ignores them at the
 # application level.
+#
+# D32: image_uri MUST be repeated inside each deployment's
+# ray_actor_options below. When a config sets ray_actor_options it
+# REPLACES the @serve.deployment decorator's ray_actor_options
+# wholesale — Ray performs no merge
+# (ray/serve/_private/application_state.py:1827-1833). Omitting
+# image_uri here silently dropped the decorator's
+# runtime_env.image_uri and the replica ran on the host with no
+# container (FileNotFoundError on the fixture weights path). Do not
+# "tidy" it away.
 
 applications:
   # Explicit route_prefixes: two applications both defaulting to "/" are
@@ -22,6 +32,8 @@ applications:
       - name: ToolTorch
         ray_actor_options:
           num_gpus: 1
+          runtime_env:
+            image_uri: "tool_torch:spike"
         autoscaling_config:
           min_replicas: 0
           max_replicas: 1
@@ -37,6 +49,8 @@ applications:
       - name: ToolTf
         ray_actor_options:
           num_gpus: 1
+          runtime_env:
+            image_uri: "tool_tf:spike"
         autoscaling_config:
           min_replicas: 0
           max_replicas: 1

@@ -173,6 +173,24 @@ def _readiness_settings() -> tuple[float, float]:
     return timeout_s, interval_s
 
 
+def _deployment_failure_detail(dep: dict[str, Any]) -> str:
+    """A deployment's failure message, annotated with dead-replica count.
+
+    Args:
+        dep: One deployment dict from the serve status payload.
+
+    Returns:
+        The deployment's ``message`` field, with
+        ``(N recently-stopped replica(s))`` appended when
+        ``recent_dead_replicas`` is non-empty.
+    """
+    detail = dep.get("message", "<no message>")
+    dead = dep.get("recent_dead_replicas") or []
+    if dead:
+        detail = f"{detail} ({len(dead)} recently-stopped replica(s))"
+    return detail
+
+
 def _permanent_failure(apps: dict[str, Any]) -> str | None:
     """Describe a permanent failure, if the statuses indicate one.
 
@@ -180,8 +198,25 @@ def _permanent_failure(apps: dict[str, Any]) -> str | None:
     ``ApplicationStatus`` (``ray/serve/schema.py:1176``) and
     ``DeploymentStatus`` (``ray/serve/_private/common.py:199``); the
     deployment's ``message`` field carries the details (``DeploymentDetails``,
-    ``schema.py:1363``). ``UNHEALTHY`` is NOT treated as permanent: Ray
-    can recover it (e.g. after a replica restart), so it keeps waiting.
+    ``schema.py:1363``). A bare ``UNHEALTHY`` is NOT treated as
+    permanent: Ray can recover it (e.g. after a replica restart), so
+    it keeps waiting.
+
+    D32: a replica whose startup raised is the exception. Ray 2.57
+    reports it as ``UNHEALTHY`` with
+    ``status_trigger=REPLICA_STARTUP_FAILED``
+    (``DeploymentStatusTrigger``, ``common.py:222``) and does NOT
+    promote the deployment to ``DEPLOY_FAILED`` — the D32 run stayed
+    ``UNHEALTHY`` after three failed starts, so the ``DEPLOY_FAILED``
+    check alone waited out the whole readiness budget. The *trigger*,
+    not the status, is what makes it permanent: the same exception
+    raises identically on every restart, so further polling is
+    useless; the deployment's ``message`` carries the replica's
+    exception text, and the returned description surfaces it so the
+    operator sees the actual cause, not just "never reached RUNNING".
+    Both detections classify as a harness failure at the call site
+    (exit 2) — the observation could not be made; neither is a
+    negative finding about GPU swap.
 
     Args:
         apps: The applications dict from serve_status().
@@ -201,15 +236,25 @@ def _permanent_failure(apps: dict[str, Any]) -> str | None:
         for dep_name, dep in (app.get("deployments") or {}).items():
             if not isinstance(dep, dict):
                 continue
-            if str(dep.get("status", "")) == "DEPLOY_FAILED":
-                detail = dep.get("message", "<no message>")
-                dead = dep.get("recent_dead_replicas") or []
-                if dead:
-                    detail = (
-                        f"{detail} ({len(dead)} recently-stopped replica(s))"
-                    )
+            status = str(dep.get("status", ""))
+            if status == "DEPLOY_FAILED":
                 return (
-                    f"deployment {name}/{dep_name} is DEPLOY_FAILED: {detail}"
+                    f"deployment {name}/{dep_name} is DEPLOY_FAILED: "
+                    f"{_deployment_failure_detail(dep)}"
+                )
+            # D32: replica startup failure surfaces as UNHEALTHY +
+            # REPLICA_STARTUP_FAILED and never as DEPLOY_FAILED —
+            # keyed on the trigger, see the docstring.
+            if (
+                status == "UNHEALTHY"
+                and str(dep.get("status_trigger", ""))
+                == "REPLICA_STARTUP_FAILED"
+            ):
+                return (
+                    f"deployment {name}/{dep_name} cannot start its "
+                    f"replicas (UNHEALTHY, "
+                    f"status_trigger=REPLICA_STARTUP_FAILED): "
+                    f"{_deployment_failure_detail(dep)}"
                 )
     return None
 
