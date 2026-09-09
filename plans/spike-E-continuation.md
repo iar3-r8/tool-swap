@@ -1120,6 +1120,73 @@ pid is what turned an unfalsifiable check into a real one. Third unfalsifiable
 check found in this harness (after step 1's silent exit 0 and step 2's wrong-op
 comparison), and all three had been *passing*.
 
+**9Q. STEP 5: PASS — exit 0, 20/20 cycles, 0 errors. The latency distribution is
+the most important number the spike has produced (D42).**
+
+`SPIKE_STEP5_MAX_ERRORS=2 make step5` → **exit 0**, all 20 alternations
+completed, **zero** failures (the tolerance was never needed).
+
+**The timings are bimodal, and that is the finding:**
+```
+ 1 torch   5.853s     11 torch   8.279s
+ 2 tf     99.470s     12 tf       9.370s
+ 3 torch   8.557s     13 torch  101.192s
+ 4 tf      9.481s     14 tf     101.316s
+ 5 torch 100.507s     15 torch   8.363s
+ 6 tf      9.385s     16 tf       9.417s
+ 7 torch   8.513s     17 torch  100.824s
+ 8 tf    103.245s     18 tf       9.592s
+ 9 torch   8.570s     19 torch   8.451s
+10 tf    101.570s     20 tf     103.587s
+```
+| statistic | value |
+|---|---|
+| min | 5.85s |
+| **median** | **9.48s** |
+| **P90** | **103.2s** |
+| max | 103.6s |
+
+**Two clean clusters, nothing in between:** ~12 cycles at **6-10s**, ~8 cycles
+at **99-104s**. A **12× spread**, and the slow path is not an outlier — it is
+**40% of requests**.
+
+**Why this matters more than the pass.** A mean (≈45s) would describe no actual
+request and would have hidden the whole structure; reporting only the median
+(9.5s) would have hidden a 100-second tail that nearly half of all requests hit.
+For a router that must answer requests on demand, **P90 is the number that
+matters, and it is 103 seconds**. Any SLA built on the median would be wrong
+about 40% of the time.
+
+**What causes the split — recorded as a hypothesis, not a conclusion.** The
+~100s cluster closely matches step 3's measured ~80s scale-to-zero plus a
+~12s container cold start, and step 3 independently recorded an 84.2s
+alternate-back for the same reason. So the likely mechanism is that a cycle is
+fast when the target's container is still warm and slow when the incumbent must
+be fully torn down and the target cold-started. **This is not proven here**: the
+step records per-cycle end-to-end latency only, not the underlying replica
+transitions, so attributing the split needs a run that also samples
+`target_num_replicas` per cycle. Worth doing before any sizing work leans on it.
+
+**What this step does and does not test — the script says so itself, and it is
+right to:**
+> With `external_scaler_enabled`, the `downscale_to_zero_delay_s` timer does not
+> exist. The incumbent is displaced by explicit scale-to-zero, not by the timer
+> expiring. This tests whether Ray can be **driven** to preempt at cadence, not
+> whether its own timer is **pre-emptible**.
+
+That distinction is load-bearing for tool-swap: it means an external scheduler
+*can* drive displacement, which is the architecture tool-swap would use — but it
+does **not** show that Ray's own autoscaler can be pre-empted when a higher
+priority request arrives. The latter remains untested.
+
+**Mechanism B (declarative config re-apply) was NOT implemented**, and the run
+says so rather than quietly skipping it. So step 5 answers the external-scaler
+question only; the "re-apply the whole config" alternative is unmeasured.
+
+**Verdict on behaviour 5 (alternation at cadence): CONFIRMED for
+externally-driven displacement, with a P90 of 103s as the cost.** Reliability is
+not the problem — 20/20, no errors. Latency variance is.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
