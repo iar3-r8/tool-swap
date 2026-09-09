@@ -1030,6 +1030,44 @@ HEALTHY. So:
 step 4. The earlier exit-3 results (§9k, §9M) are both retracted as measurement
 faults of mine, and this run supersedes them.
 
+**9O. STEP 4: PASS — exit 0. Payload read verified; D18 explicitly NOT tested.**
+
+`make step4` → **exit 0**, now self-contained after D38 (it deploys the
+container-key config itself and waits for readiness before probing).
+
+| read | time | size | sha256 |
+|---|---|---|---|
+| 1 | 0.122s | 67108864 | `363824c7a5e0bbdc…` |
+| 2 | 0.097s | 67108864 | `363824c7a5e0bbdc…` |
+| 3 | 0.095s | 67108864 | `363824c7a5e0bbdc…` |
+
+Median **0.097s**, min 0.095s, max 0.122s for a **64 MiB** baked-in payload.
+Identical hash across all three reads, each verified against the image's sidecar
+`.meta.json` (`hash_match`/`size_match` in `read_and_verify`), so the tool
+genuinely read its own bytes rather than reporting a cached value.
+
+**Verdict on behaviour 4 (payload handling): CONFIRMED, narrowly.** A
+containerised tool can read and verify a large baked-in payload from inside its
+image, fast and repeatably. The first read is ~26% slower (0.122 vs 0.095) —
+page-cache warming, not worth more than a note.
+
+**What this deliberately does NOT establish, and the step says so itself:**
+> D18 (payload-by-reference via `s3://` URI) was NOT tested. Reason: §0a scope
+> reduction — weights and payloads are baked in. The credential plumbing via
+> `env_vars` was never exercised. D18 remains an open assumption.
+
+That matters for tool-swap: these numbers are **local disk reads inside a
+container**, not the cost of fetching a payload at request time. Any latency
+budget that cites 0.097s must not also assume remote payloads. The §0a scope
+reduction removed the fetch path, and with it the only measurement that would
+have priced the thrash. Carry it into the write-up as an open input to sizing,
+not as a solved question.
+
+**Also of note:** step 4 only produced a result at all because D38 fixed two
+independent faults — it deployed nothing (its cluster was empty), and its probe
+URL was the bare root while the config serves `tool_torch` at `/tool_torch`.
+Either alone would have yielded a confident exit 2 measuring nothing.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
