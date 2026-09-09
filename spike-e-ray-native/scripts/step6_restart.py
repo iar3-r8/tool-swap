@@ -1,29 +1,39 @@
 """Step 6 GATE: cluster restart and recovery.
 
 Two phases:
-  A. Kill the head node (kill -9), restart Ray and Serve, observe recovery.
-  B. Kill a replica actor, observe unattended recovery.
+  A. With the step 6 apps deployed and a GPU-holding torch replica live,
+     kill the GCS server process (kill -9) — a realistic *partial*
+     crash of the head node, leaving the raylet and the other head
+     processes behind — then run the documented recovery procedure
+     (ray stop --force, ray start --head with the cluster's own flags,
+     re-apply the config) and observe recovery.
+  B. Kill a replica actor, observe unattended recovery. Skipped when
+     phase A did not fully recover (its observations would only measure
+     consequences).
 
-Per rule 0.5: if Ray's own docs say "Serve cannot recover without KubeRay",
-expect manual intervention. Record every command and its output verbatim.
-If an undocumented step is needed, record it as a required manual step —
-do not quietly do it.
+Per rule 0.5: if Ray's own docs say "Serve cannot recover without
+KubeRay", expect manual intervention. Record every command and its
+output verbatim. If an undocumented step is needed, record it as a
+required manual step — do not quietly do it.
 
 Exit status (D29)
     0  Every required observation was made and nothing answers the gate
-       negatively: after the head-node kill the documented recovery
-       brought the apps back to RUNNING, and after the replica kill the
-       replica was replaced unattended.
+       negatively: the pre-kill baseline showed the apps RUNNING with
+       VRAM held, after the GCS kill the documented recovery brought
+       the apps back to RUNNING with VRAM held, and after the replica
+       kill the replica was replaced unattended.
     1  Unexpected internal error (traceback printed).
     2  Harness/environment failure — an observation could NOT be made:
-       the head/replica process could not be found or killed, the
-       recovery commands themselves could not be run, or the status
-       polls after the kill could not be answered. The gate proves
-       nothing and must be re-run.
+       the step 6 config could not be deployed or made live before the
+       kill, the head/replica process could not be found or killed,
+       the recovery commands themselves could not be run, or the
+       status polls after the kill could not be answered. The gate
+       proves nothing and must be re-run.
     3  Negative finding — the observation WAS made and answers the gate
        negatively: after the recovery commands the apps were NOT back
-       to RUNNING (manual intervention was required), or the killed
-       replica was NOT replaced within the recovery window
+       to RUNNING (manual intervention was required), the VRAM the
+       torch replica held pre-kill is no longer held post-recovery, or
+       the killed replica was NOT replaced within the recovery window
        (recovered=False).
 
 Both failure kinds are printed with an explicit label and a final
@@ -44,11 +54,20 @@ _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
 sys.path.insert(0, os.path.join(_SCRIPTS_DIR, "lib"))
 
-from nvidia import snapshot_vram
+from nvidia import gpu_used_mb, snapshot_vram
 from podman import podman_ps_all, podman_ps_count
 from recorder import Recorder, block, record
-from serve_api import apply_config, serve_status
-from step1_verify import StepOutcome, _readiness_settings
+from serve_api import (
+    apply_config,
+    cluster_ready,
+    post_introspect,
+    serve_status,
+)
+from step1_verify import (
+    StepOutcome,
+    _readiness_settings,
+    _wait_for_running,
+)
 
 # Application-level healthy statuses (D29 fix): Ray 2.57's
 # ApplicationStatus (ray/serve/schema.py) reports RUNNING when healthy —
@@ -74,6 +93,15 @@ _DEP_HEALTHY = "HEALTHY"
 # the step 3 knob, so the path is visible and overridable rather than
 # buried in a list literal.
 STEP6_CONFIG = os.environ.get("SPIKE_STEP6_CONFIG", "apps/step6_config.yaml")
+
+# The torch tool's proxy URL (the same route step 3's gate uses): a
+# request to it starts the tool_torch replica, which
+# apps/step6_config.yaml keeps at min_replicas: 0. Without this
+# wake-up the cluster would report both apps RUNNING while holding no
+# GPU, and the kill would have nothing GPU-related to lose.
+TOOL_TORCH_URL = os.environ.get(
+    "SPIKE_SERVE_URL_TORCH", "http://localhost:8000/tool_torch"
+)
 
 
 def _app_status(app) -> str:
@@ -227,8 +255,217 @@ def _wait_for_recovery(
     return last_status
 
 
+def _cluster_start_flags() -> list[str]:
+    """The ``ray start`` flags a recovered cluster must be started with.
+
+    They must match the flags the harness used to start the cluster
+    (``run_with_cluster_clean.sh``), most importantly ``--num-gpus``
+    (D31): the D39 run restarted with a bare ``ray start --head``,
+    which registered the raylet with the host's default GPU count
+    instead of the cluster's pinned one. A recovery that brings the
+    cluster back with the wrong GPU count would leave the ``num_gpus:
+    1`` tools unschedulable (or spread across GPUs) and produce a
+    spurious negative. The dashboard port, CPU count and
+    usage-stats flag mirror the launcher so the recovered cluster is
+    indistinguishable from the one it replaces.
+
+    Returns:
+        The flag list for ``ray start`` (without the binary name).
+    """
+    num_gpus = os.environ.get("SPIKE_RAY_NUM_GPUS", "1")
+    if not num_gpus.isdigit():
+        num_gpus = "1"
+    return [
+        "--head",
+        f"--dashboard-port={os.environ.get('RAY_DASHBOARD_PORT', '8265')}",
+        f"--num-cpus={os.cpu_count() or 2}",
+        f"--num-gpus={num_gpus}",
+        "--disable-usage-stats",
+    ]
+
+
+def _vram_held(vram: list[dict], baseline: list[dict]) -> bool:
+    """Whether any GPU holds a real allocation relative to a baseline.
+
+    Args:
+        vram: The snapshot to test.
+        baseline: The host VRAM snapshot taken before anything was
+            deployed.
+
+    Returns:
+        True when at least one GPU's used memory rose more than
+        ``SPIKE_VRAM_RELEASE_TOLERANCE_MB`` (default 256 MiB — driver
+        noise vs the fixture's 4096 MiB allocation) above the
+        baseline.
+    """
+    tol = int(os.environ.get("SPIKE_VRAM_RELEASE_TOLERANCE_MB", "256"))
+    for gpu in baseline:
+        index = gpu["index"]
+        if (gpu_used_mb(vram, index) or 0) - (
+            gpu_used_mb(baseline, index) or 0
+        ) > tol:
+            return True
+    return False
+
+
+def _wake_torch_replica(
+    recorder: Recorder,
+    outcome: StepOutcome,
+    baseline_vram: list[dict],
+) -> bool:
+    """Start the torch replica with a request and confirm it holds VRAM.
+
+    apps/step6_config.yaml autoscales both tools down to zero
+    (min_replicas: 0): a freshly deployed cluster reports both apps
+    RUNNING while holding no GPU. A kill of such a cluster would have
+    nothing GPU-related to lose, so the step sends the same
+    introspect request step 3's gate uses to cold-start the replica,
+    and then requires a GPU's used memory to have moved past driver
+    noise relative to the host baseline.
+
+    Args:
+        recorder: Records the introspect response and the VRAM
+            snapshot.
+        outcome: Collects the harness failure when the replica
+            could not be started or holds no VRAM.
+        baseline_vram: The host VRAM snapshot taken before anything
+            was deployed; the allocation is measured against it.
+
+    Returns:
+        True when the torch replica answered and a GPU shows the
+        allocation.
+    """
+    print(f"\n=== Waking the torch replica: "
+          f"POST introspect {TOOL_TORCH_URL} ===")
+    try:
+        response = post_introspect(TOOL_TORCH_URL, timeout=120)
+    except Exception as e:
+        recorder.write(block("torch introspect (pre-kill)", str(e)))
+        outcome.harness(
+            f"the tool_torch replica could not be started at "
+            f"{TOOL_TORCH_URL}: {e} — a cluster with no GPU-holding "
+            "tool would have nothing to lose in the kill, so the "
+            "observation could not be made."
+        )
+        return False
+    recorder.write(
+        block("torch introspect (pre-kill)", json.dumps(response, indent=2))
+    )
+    print(json.dumps(response, indent=2))
+    if isinstance(response.get("error"), str):
+        recorder.write(block(
+            "torch introspect (pre-kill) error payload",
+            json.dumps(response, indent=2),
+        ))
+        outcome.harness(
+            "the tool_torch replica answered with an error "
+            f"({response['error']!r}) — the replica is not live, so "
+            "the observation could not be made."
+        )
+        return False
+    after = snapshot_vram()
+    recorder.write(block(
+        "VRAM after waking the torch replica", json.dumps(after, indent=2),
+    ))
+    if not _vram_held(after, baseline_vram):
+        outcome.harness(
+            "no GPU's used memory rose past the driver-noise "
+            "tolerance after the torch replica started — the replica "
+            "holds no VRAM (wrong image or runtime?), so the kill "
+            "would destroy nothing GPU-related and the observation "
+            "could not be made."
+        )
+        return False
+    print("VRAM rose past the driver-noise tolerance — the torch "
+          "replica holds the GPU.")
+    return True
+
+
+def _redeploy(
+    recorder: Recorder,
+    outcome: StepOutcome,
+    label: str,
+    wait_kind: str = "harness",
+) -> tuple[str, dict | None]:
+    """Re-apply STEP6_CONFIG and wait until every app is RUNNING.
+
+    Used before the pre-kill baseline (the harness starts a CLEAN
+    cluster — ``run_with_cluster_clean.sh`` — so nothing is live
+    unless this step deploys it; D39: the old step killed an empty
+    cluster) and on the recovery path (a restarted cluster serves no
+    applications until the config is applied again).
+
+    Args:
+        recorder: Records the deploy output (and, via the wait, the
+            final status).
+        outcome: Collects the failure; see ``wait_kind``.
+        label: Where this deploy happens, for the messages
+            ("pre-kill" / "recovery").
+        wait_kind: "harness" (pre-kill) classifies apps that never
+            reach RUNNING as a harness failure — the environment
+            cannot even start the step's own config; "finding"
+            (recovery) classifies it as a negative finding — the
+            recovery commands ran and the apps still did not come
+            back, which is the gate's own observation.
+
+    Returns:
+        ``(state, status)`` where state is "ok" (every app RUNNING),
+        "harness" (the config could not be applied or the dashboard
+        never answered — a harness failure is already recorded), or
+        "finding" (the recovery wait ran out and the apps never came
+        back — a finding is already recorded). The matching failure
+        is recorded here and the caller must NOT record another one
+        for the same observation; it decides what to do with the
+        state (skip phase B, label the run, ...).
+    """
+    try:
+        result = apply_config(STEP6_CONFIG)
+    except Exception as e:
+        recorder.write(block(f"serve deploy ({label}) error", str(e)))
+        outcome.harness(
+            f"Could not invoke `serve deploy` for {STEP6_CONFIG} "
+            f"({label}): {e} — the observation could not be made."
+        )
+        return "harness", None
+    recorder.write(
+        block(f"serve deploy ({label})", result.stdout + result.stderr)
+    )
+    print(f"serve deploy ({label}) exit: {result.returncode}")
+    if result.returncode != 0:
+        outcome.harness(
+            f"`serve deploy` of {STEP6_CONFIG} exited "
+            f"{result.returncode} ({label}) — the config is not live, "
+            "so the observation could not be made."
+        )
+        return "harness", None
+    if wait_kind == "finding":
+        status = _wait_for_recovery(recorder, outcome, f"re-deploy {label}")
+        if status is None:
+            # The dashboard never answered: harness failure recorded
+            # by the wait.
+            return "harness", None
+        if _apps_healthy(status.get("applications", {})):
+            return "ok", status
+        # The wait recorded the finding (not RUNNING within the
+        # budget, or DEPLOY_FAILED).
+        return "finding", status
+    # The readiness wait consumed the status polls; the caller reads
+    # its own baseline/status afterwards, so no extra call here.
+    if _wait_for_running(recorder, outcome):
+        return "ok", None
+    return "harness", None
+
+
 def find_ray_head() -> int:
-    """Find the Ray head node GCS process PID.
+    """Find the GCS server PID — the process the phase A kill targets.
+
+    The head node is a *process tree* (gcs_server, raylet, dashboard,
+    workers); killing only the GCS server deliberately simulates a
+    realistic *partial* crash (the D39 option b): the documented
+    recovery procedure must work from exactly the state such a crash
+    leaves — a half-dead head node with surviving processes. The
+    raylet fallback keeps the step runnable on hosts where the
+    gcs_server name is not visible to pgrep.
 
     Raises:
         RuntimeError: No gcs_server or raylet process is found.
@@ -249,28 +486,87 @@ def find_ray_head() -> int:
     raise RuntimeError("Could not find Ray head node process")
 
 
-# ── Phase A: Head node kill ──────────────────────────────────────
-def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
-    """Kill head node, attempt documented recovery.
+# ── Phase A: GCS kill and documented recovery ────────────────────
+def phase_a(recorder: Recorder, outcome: StepOutcome) -> bool:
+    """Deploy the tools, kill the GCS server, run the documented recovery.
+
+    Crash scenario (D39, option b): only the GCS server process is
+    killed (``kill -9``) — a realistic *partial* head-node crash that
+    leaves the raylet, dashboard and workers behind. The gate asks
+    whether the *documented recovery procedure* works from whatever
+    state such a crash leaves, so the recovery is the full operator
+    procedure: ``ray stop --force`` (the cleanup an operator must
+    perform — the D39 run showed a bare ``ray start --head`` collides
+    with the survivors: "already running at <head>:6379"), then
+    ``ray start --head`` with the cluster's own flags, then a
+    re-apply of the step 6 config.
+
+    Order: deploy → wait for RUNNING → wake the torch replica →
+    pre-kill baseline (apps RUNNING + VRAM held) → kill → recover →
+    poll. Every earlier stage that cannot be made into an observation
+    is a harness failure (exit 2) *before* any kill is attempted, so
+    the gate never measures an empty or replica-less cluster.
 
     Classification (D29):
-      * the kill itself fails, or the recovery commands cannot be run
-        (non-zero exit / exception) → HARNESS: the recovery procedure
-        was not executed, so recovery could not be observed;
-      * the recovery commands ran but the apps are not back RUNNING
-        → NEGATIVE FINDING: the observation was made and it answers
-        the gate negatively (manual intervention was required).
+      * the config cannot be deployed/made live, or the torch replica
+        cannot be started to hold a GPU, or the kill itself fails, or
+        the recovery commands cannot be run → HARNESS: recovery could
+        not be observed;
+      * the recovery commands ran but the apps (or the VRAM) are not
+        back → NEGATIVE FINDING: the observation was made and it
+        answers the gate negatively (manual intervention was
+        required).
 
     Args:
         recorder: Records the raw command outputs and statuses.
         outcome: Collects the harness failures and findings.
+
+    Returns:
+        True only when every observation was made and recovery was
+        confirmed (apps RUNNING and VRAM held again) — the condition
+        under which phase B may run. False when a harness failure or
+        a finding was recorded, so phase B is skipped (item 3:
+        consequences of a failed recovery must not be reported as
+        independent failures).
     """
     print("")
     print("=" * 60)
-    print("STEP 6, PHASE A: Head node kill and recovery")
+    print("STEP 6, PHASE A: GCS kill and recovery")
     print("=" * 60)
+    print("Crash scenario: kill -9 on the GCS server PID only — a")
+    print("partial head-node crash (raylet/dashboard/workers survive).")
+    print("Recovery: ray stop --force, ray start --head "
+          "(cluster flags), re-apply config.")
 
-    # 1. Snapshot before
+    # 1. Host baseline BEFORE anything is deployed (VRAM reference
+    # point for "the torch replica holds the GPU").
+    print("\n=== Host VRAM baseline ===")
+    host_vram = snapshot_vram()
+    recorder.write(block("Host VRAM baseline", json.dumps(host_vram, indent=2)))
+    print(f"VRAM baseline: {json.dumps(host_vram, indent=2)}")
+
+    # 2. Deploy the step 6 config. The harness starts a CLEAN cluster
+    # (run_with_cluster_clean.sh), so nothing is live unless this
+    # step deploys it — D39: the old step killed an empty cluster and
+    # then "recovered" apps that were never deployed.
+    print(f"\n=== Deploying {STEP6_CONFIG} (pre-kill) ===")
+    pre_state, _ = _redeploy(
+        recorder, outcome, "pre-kill", wait_kind="harness",
+    )
+    if pre_state != "ok":
+        record("step6", phase="A", deployed=False)
+        return False
+    record("step6", phase="A", deployed=True)
+
+    # 3. min_replicas: 0 — the apps are RUNNING at zero replicas; a
+    # request must start the torch replica and it must hold VRAM.
+    if not _wake_torch_replica(recorder, outcome, host_vram):
+        record("step6", phase="A", replica_woken=False)
+        return False
+    record("step6", phase="A", replica_woken=True)
+
+    # 4. Pre-kill baseline: apps RUNNING (step 2 waited for it) and
+    # VRAM held (step 3 verified it).
     print("\n=== Before kill ===")
     try:
         pre_status = serve_status()
@@ -279,36 +575,59 @@ def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
             f"serve status unreachable before the kill: {e} — the "
             "pre-kill baseline could not be observed."
         )
-        return
+        record("step6", phase="A", baseline_observed=False)
+        return False
     pre_vram = snapshot_vram()
     pre_podman = podman_ps_all()
     print(f"Serve apps: {json.dumps(pre_status, indent=2)}")
     print(f"VRAM: {json.dumps(pre_vram, indent=2)}")
     print(f"Containers: {podman_ps_count()}")
     recorder.write(block("Before kill — serve status", json.dumps(pre_status, indent=2)))
+    recorder.write(block("Before kill — VRAM", json.dumps(pre_vram, indent=2)))
     recorder.write(block("Before kill — podman ps -a", pre_podman))
+    pre_apps = pre_status.get("applications", {})
+    if not _apps_healthy(pre_apps):
+        outcome.harness(
+            f"the pre-kill baseline does not show the apps RUNNING "
+            f"(final statuses: "
+            f"{', '.join(f'{n}={_app_status(a)}' for n, a in pre_apps.items())}),"
+            " — nothing is live to lose, so the observation could "
+            "not be made."
+        )
+        record("step6", phase="A", baseline_observed=False)
+        return False
+    if not _vram_held(pre_vram, host_vram):
+        outcome.harness(
+            "the pre-kill baseline shows no VRAM held past the "
+            "driver-noise tolerance — the kill would destroy nothing "
+            "GPU-related, so the observation could not be made."
+        )
+        record("step6", phase="A", baseline_observed=False)
+        return False
+    record("step6", phase="A", baseline_observed=True)
 
-    # 2. Kill head node
-    print("\n=== Killing head node ===")
+    # 5. Kill the GCS server PID (the partial crash; see the docstring).
+    print("\n=== Killing the GCS server (partial crash) ===")
     try:
         pid = find_ray_head()
-        print(f"Head node PID: {pid}")
-        recorder.write(block("Head node PID", str(pid)))
+        print(f"GCS server PID: {pid}")
+        recorder.write(block("GCS server PID", str(pid)))
         subprocess.run(["kill", "-9", str(pid)], check=True)
         print(f"kill -9 {pid} sent")
     except Exception as e:
-        print(f"Error finding/killing head: {e}")
-        recorder.write(block("Kill head error", str(e)))
+        print(f"Error finding/killing GCS server: {e}")
+        recorder.write(block("Kill GCS error", str(e)))
         record("step6", phase="A", kill_ok=False, error=str(e))
         # The kill did not happen: recovery cannot be observed.
         outcome.harness(
-            f"Could not find or kill the head node: {e} — the "
+            f"Could not find or kill the GCS server: {e} — the "
             "recovery procedure was not executed, so recovery could "
             "not be observed."
         )
-        return
+        return False
+    record("step6", phase="A", kill_ok=True, gcs_pid=pid)
 
-    # 3. Immediate snapshot
+    # 6. Immediate snapshot (evidence the survivors were there).
     print("\n=== Immediate snapshot after kill ===")
     post_vram = snapshot_vram()
     post_podman = podman_ps_all()
@@ -317,53 +636,74 @@ def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
     recorder.write(block("After kill — VRAM", json.dumps(post_vram, indent=2)))
     recorder.write(block("After kill — podman ps -a", post_podman))
 
-    # 4. Attempt recovery with documented commands
-    print("\n=== Recovery: restarting Ray ===")
+    # 7. The documented recovery procedure (option b). Step 1 is the
+    # cleanup an operator must perform after a partial crash — the
+    # D39 run proved a bare `ray start --head` cannot recover from
+    # this state (it collides with the surviving processes), and that
+    # collision is recorded as a required manual step below.
+    print("\n=== Recovery: the documented procedure ===")
     manual_steps = []
     recovery_commands_ok = True
 
+    start_flags = _cluster_start_flags()
+    print(f"Restart command: ray start {' '.join(start_flags)}")
+
     try:
         result = subprocess.run(
-            ["ray", "start", "--head"],
-            capture_output=True, text=True, timeout=30,
+            ["ray", "stop", "--force"],
+            capture_output=True, text=True, timeout=120,
         )
-        recorder.write(block("ray start --head", result.stdout + result.stderr))
-        print(f"ray start exit: {result.returncode}")
+        recorder.write(block("ray stop --force", result.stdout + result.stderr))
+        print(f"ray stop --force exit: {result.returncode}")
         if result.returncode != 0:
-            manual_steps.append("ray start --head failed — may need manual cleanup")
-            recovery_commands_ok = False
+            manual_steps.append(
+                "ray stop --force failed — manual cleanup needed"
+            )
     except Exception as e:
-        recorder.write(block("ray start --head error", str(e)))
-        manual_steps.append(f"ray start --head could not run: {e}")
-        recovery_commands_ok = False
+        recorder.write(block("ray stop --force error", str(e)))
+        manual_steps.append(f"ray stop --force could not run: {e}")
 
     time.sleep(5)
 
-    # Deploy through the harness's own apply_config (the D26/D23
-    # guards it carries: the D26 placeholder guard rejects any ${ that
-    # survived rendering, and the D23 per-deployment PYTHONPATH skip
-    # keeps the host PYTHONPATH out of containerised replicas) rather
-    # than a raw `serve deploy` subprocess: the raw form bypassed both,
-    # and it deployed the wrong file (the image_uri config, whose
-    # replicas hold no GPU — see STEP6_CONFIG above). Killing the
-    # cluster is orthogonal: recovery is still a plain re-apply of the
-    # same config the step was started with, which is exactly what
-    # apply_config does.
+    start_cmd = ["ray", "start"] + start_flags
+    start_desc = "ray start " + " ".join(start_flags)
     try:
-        result = apply_config(STEP6_CONFIG)
-        recorder.write(block("serve deploy (recovery)", result.stdout + result.stderr))
-        print(f"serve deploy exit: {result.returncode}")
+        result = subprocess.run(
+            start_cmd,
+            capture_output=True, text=True, timeout=120,
+        )
+        recorder.write(block(start_desc, result.stdout + result.stderr))
+        print(f"{start_desc} exit: {result.returncode}")
         if result.returncode != 0:
-            manual_steps.append("serve deploy failed — manual re-apply needed")
+            manual_steps.append(
+                f"{start_desc} failed — may need manual cleanup"
+            )
             recovery_commands_ok = False
     except Exception as e:
-        recorder.write(block("serve deploy (recovery) error", str(e)))
-        manual_steps.append(f"serve deploy could not run: {e}")
+        recorder.write(block(f"{start_desc} error", str(e)))
+        manual_steps.append(f"{start_desc} could not run: {e}")
         recovery_commands_ok = False
 
+    # Wait for the dashboard to answer again before re-deploying:
+    # `serve deploy` against a half-dead dashboard fails with
+    # RemoteDisconnected (the D39 run).
+    if recovery_commands_ok:
+        print("Waiting for the dashboard to answer after the restart ...")
+        if not cluster_ready(timeout_s=90, interval_s=3):
+            manual_steps.append(
+                "the dashboard never answered after the restart — "
+                "manual inspection needed"
+            )
+            recovery_commands_ok = False
+
+    redeploy_state, post_status = _redeploy(
+        recorder, outcome, "recovery", wait_kind="finding",
+    )
     if not recovery_commands_ok:
         # The recovery procedure could not be executed, so whether the
-        # cluster recovers on its own cannot be observed.
+        # cluster recovers on its own cannot be observed. (No
+        # double-recording: the failed command itself is described in
+        # manual_steps; the re-deploy state, if any, is a consequence.)
         record("step6", phase="A", apps_healthy=False,
                manual_steps=manual_steps)
         outcome.harness(
@@ -371,19 +711,27 @@ def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
             f"({manual_steps}) — the recovery observation could not "
             "be made."
         )
-        return
-
-    # 5. Observe recovery (D29: the old single check 10s after the
-    # recovery commands is too early — the apps are still starting —
-    # so poll within a configurable budget, like the D25 waits).
-    print("\n=== Post-recovery state ===")
-    post_status = _wait_for_recovery(recorder, outcome, "phase A")
-    if post_status is None:
-        # The dashboard was never reachable: a harness failure was
-        # already recorded; the verdict below cannot be made.
+        return False
+    if redeploy_state == "harness":
+        # The re-apply could not be run, or the dashboard never
+        # answered: a harness failure is already recorded by
+        # _redeploy — do not mask it with a second one.
         record("step6", phase="A", apps_healthy=False,
-               manual_steps=manual_steps, status_unreachable=True)
-        return
+               manual_steps=manual_steps)
+        return False
+    if redeploy_state == "finding":
+        # The re-apply ran and the recovery wait answered, but the
+        # apps never came back: a FINDING is already recorded by the
+        # wait — it is the gate's own observation, not a harness
+        # failure, and it must not be masked by one (D29).
+        record("step6", phase="A", apps_healthy=False,
+               vram_held=False, manual_steps=manual_steps)
+        return False
+
+    # 8. Post-recovery state (the recovery wait inside _redeploy
+    # already polled within a configurable budget — D29 — so the
+    # final status is the one it returned).
+    print("\n=== Post-recovery state ===")
     post_vram2 = snapshot_vram()
     post_podman2 = podman_ps_all()
 
@@ -407,11 +755,43 @@ def phase_a(recorder: Recorder, outcome: StepOutcome) -> None:
         st = _app_status(a)
         print(f"  {name}: {st}")
     apps_healthy = _apps_healthy(apps)
+    vram_held = _vram_held(post_vram2, host_vram)
+    # The torch replica started again after the re-apply only on the
+    # next request; with min_replicas: 0 the apps can report RUNNING
+    # while the VRAM is not (yet) held. The baseline promised VRAM
+    # held pre-kill, so the post-recovery comparison is against the
+    # same host baseline. When the replica has not re-allocated yet
+    # the step sends it the same wake-up request and re-checks.
+    if apps_healthy and not vram_held:
+        print("Apps RUNNING but VRAM not held yet (min_replicas: 0 — "
+              "the replica re-allocates on the first request).")
+        if _wake_torch_replica(recorder, outcome, host_vram):
+            post_vram2 = snapshot_vram()
+            recorder.write(block(
+                "Post recovery — VRAM after wake-up",
+                json.dumps(post_vram2, indent=2),
+            ))
+            vram_held = _vram_held(post_vram2, host_vram)
+    if apps_healthy and not vram_held:
+        rises = [
+            max(0, (gpu_used_mb(post_vram2, g["index"]) or 0)
+                   - (gpu_used_mb(host_vram, g["index"]) or 0))
+            for g in host_vram
+        ]
+        peak = max(rises) if rises else 0
+        outcome.finding(
+            "the apps were RUNNING after the recovery commands but no "
+            "GPU held the allocation the torch replica held pre-kill "
+            f"(used memory rose at most {peak} MiB over the host "
+            "baseline) — the GPU-holding tool did not come back; "
+            "recovery requires manual intervention."
+        )
     record("step6", phase="A", apps_healthy=apps_healthy,
-           manual_steps=manual_steps)
+           vram_held=vram_held, manual_steps=manual_steps)
     # The finding for "not all RUNNING" (if any) was already recorded
     # by _wait_for_recovery, which owns the 2-vs-3 classification for
-    # this observation.
+    # that observation; the VRAM finding above is this function's.
+    return not outcome.findings and not outcome.harness_failures
 
 
 # ── Phase B: Replica actor kill ──────────────────────────────────
@@ -587,12 +967,20 @@ def _print_summary(outcome: StepOutcome) -> None:
     if not outcome.harness_failures and not outcome.findings:
         print("")
         print("STEP 6 RESULT: gate CLEAN — exit code 0")
-        print("The cluster recovered after the head-node kill and the")
-        print("killed replica was replaced unattended.")
+        print("The cluster recovered after the GCS kill (partial")
+        print("head-node crash) and the killed replica was replaced")
+        print("unattended.")
 
 
 def run(recorder: Recorder) -> int:
     """Run step 6's gate observations and return the process exit code.
+
+    Phase B is skipped when phase A did not fully recover (item 3): a
+    broken or half-recovered cluster makes the replica-kill
+    observations impossible or meaningless, and a consequence of phase
+    A's failure must not be reported as an independent failure —
+    exactly as step 3's gate skips its remaining probes once a
+    finding is recorded.
 
     Args:
         recorder: The step's Recorder (stdout/stderr tee to the log).
@@ -607,8 +995,20 @@ def run(recorder: Recorder) -> int:
     print("=" * 60)
 
     try:
-        phase_a(recorder, outcome)
-        phase_b(recorder, outcome)
+        phase_a_recovered = phase_a(recorder, outcome)
+        if phase_a_recovered:
+            phase_b(recorder, outcome)
+        else:
+            print("")
+            print("=" * 60)
+            print("STEP 6, PHASE B: SKIPPED — phase A did not recover")
+            print("=" * 60)
+            print("The replica-kill observations require the cluster to")
+            print("be back to RUNNING with the tools live; phase A's")
+            print("recovery did not succeed, so phase B would only")
+            print("measure consequences of that failure.")
+            record("step6", phase="B", skipped=True,
+                   reason="phase A did not recover")
     finally:
         print("")
         print("--- STEP 6 OBSERVATIONS COMPLETE ---")
