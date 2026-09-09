@@ -759,6 +759,12 @@ overrides will meet it.
   but on a long-running host a crash loop accumulates containers without bound —
   a second, operational finding about `image_uri`.
 
+> **⚠ RETRACTED IN PART — read 9L before citing 9k.** The exit-3 result and the
+> VRAM measurements below are real, but the *attribution* in 9k is wrong: I
+> concluded a GPU could not reach a podman container on this host. It can. See
+> **9L** for the corrected finding. 9k is kept verbatim, not edited, because a
+> retracted decisive verdict is itself part of the record.
+
 **9k. STEP 3 GATE: FAILED — exit 3. The cause is decisive: `image_uri` cannot
 give a container a GPU, while Ray's scheduler believes it did.**
 
@@ -836,6 +842,74 @@ as allocated.
   `runtime_env: {image_uri: "tool_torch:spike"}` present and the replica running
   the container's interpreter — the image reached the replica this time.
 - 71 containers on disk (one still `Up`), continuing the `--rm` accumulation.
+
+**9L. CORRECTION to 9k (D33): a GPU CAN reach a podman container on this host.
+The real blocker is that `image_uri` gives you no way to ask for it.**
+
+The user challenged my 9k conclusion — podman is supposed to support GPUs — and
+was right to. I had ruled out the container path without testing the mechanism
+that actually works here.
+
+**The decisive test.** With `nvidia-container-runtime` (installed at
+`/usr/bin/nvidia-container-runtime`) named explicitly, using **our own fixture
+image**:
+```
+podman run --rm --runtime /usr/bin/nvidia-container-runtime \
+  -e NVIDIA_VISIBLE_DEVICES=0 -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  --entrypoint python tool_torch:spike -c "import torch; ..."
+→ podman+nvidia-runtime cuda: True 1
+```
+`True`, and exactly **1** GPU visible — precisely what the gate needs. Docker
+confirms the host plumbing independently (`--gpus all` → all 8 A100s listed;
+`docker info` shows an `nvidia` runtime registered).
+
+**Why every earlier attempt failed, and what each ruled out:**
+| attempt | result | what it shows |
+|---|---|---|
+| Ray's exact flags (no device) | `False, 0` | Ray's launch cannot see a GPU |
+| `--gpus all` | `False, 0` | podman 3.4.4 does not implement `--gpus` |
+| `--device nvidia.com/gpu=0` | *"stat … no such file"* | podman 3.4.4 predates CDI; treats the name as a path |
+| raw `/dev/nvidia*` device nodes | `libcuda.so.1` missing | device nodes alone are insufficient — the **driver libraries** must be injected |
+| `NVIDIA_VISIBLE_DEVICES` env only | `False, 0` | the OCI hook is absent (no `hooks.d` directories at all) |
+| **`--runtime nvidia-container-runtime`** | **`True, 1`** | **the runtime injects both devices and libraries — this is the working path** |
+
+**The corrected finding.** The container is not the obstacle; **the missing
+`--runtime` flag is**, and Ray's modern API structurally cannot supply it:
+- [`ImageURIPlugin.modify_context`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:174)
+  passes `run_options=[]` — a **hardcoded empty list**. There is no
+  `image_uri` field for run options, so `--runtime`, `--device` and `--gpus`
+  are all unreachable through it.
+- The **legacy `container` key does forward run options**
+  ([`:222-229`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:222)),
+  so `runtime_env: {container: {image: …, run_options: ["--runtime=/usr/bin/nvidia-container-runtime"]}}`
+  should work — **untested, and the obvious next experiment.**
+- Ray still reserves `GPU: 1.0` and sets `CUDA_VISIBLE_DEVICES` regardless, so
+  the mismatch between Ray's accounting and the container's reality (9k's core
+  observation) **stands unchanged**: Ray believes it granted a GPU it never
+  passed through.
+
+**Revised verdict on the Rule 2 gate.** Not "Ray cannot swap GPUs", and not
+"containers cannot have GPUs". The accurate statement is narrower and more
+useful:
+
+> With `runtime_env.image_uri` — the modern, documented API — a container cannot
+> be given GPU access, because the plugin hardcodes empty run options. Ray
+> nonetheless reserves the GPU and reports the replica healthy. The capability
+> exists in Ray's *legacy* `container` API, which accepts run options.
+
+Whether that constitutes "Ray fails the gate" now depends on a test not yet run
+(the `container` key). **The exit-3 result therefore stands as a real
+observation but NOT as the final Rule 2 verdict.** Step 3 must be re-run through
+the `container` key before the gate is called either way.
+
+**Process note, recorded deliberately.** I committed a decisive
+framework-killing verdict (`2bc79d6`) on incomplete evidence, having tested five
+GPU-passthrough mechanisms but not the one the host actually supports. It took
+the user asking "podman is supposed to support GPUs" to catch it. Two lessons
+worth carrying: an absence of evidence about a mechanism is not evidence of its
+absence, and a *negative* result deserves the same scrutiny as a positive one —
+I had been careful all spike about false passes, and then nearly shipped a false
+failure.
 
 ### Part C — host measurements
 
