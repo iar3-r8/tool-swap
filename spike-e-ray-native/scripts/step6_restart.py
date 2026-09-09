@@ -815,14 +815,68 @@ def _tool_torch_dep(status: dict) -> dict:
     return app.get("deployments", {}).get("ToolTorch", {})
 
 
+def _pid_alive(pid: int) -> bool | None:
+    """Whether a process with this PID is (still) in the host namespace.
+
+    Probes with signal 0 (no signal is actually sent). The replica
+    worker of a containerised deployment runs with ``--pid=host``
+    (ray/_private/runtime_env/image_uri.py), so its PID is a host PID
+    and the probe is meaningful from here.
+
+    Args:
+        pid: The PID to probe.
+
+    Returns:
+        True when a (non-zombie) process answers, False when the
+        kernel reports no such process (ESRCH), None when the probe
+        itself failed for another reason (EPERM: exists but owned by
+        another user). A zombie still answers the probe but is being
+        reaped, so it is treated as gone.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().split(")")[-1].split()[0]
+    except OSError:
+        return True
+    return state != "Z"
+
+
 def phase_b(recorder: Recorder, outcome: StepOutcome) -> None:
     """Kill a replica actor, observe unattended recovery.
 
-    Classification (D29): the replica/app cannot be found or killed,
-    or the status polls fail → HARNESS (the recovery could not be
-    observed); the polls were answered but the deployment did not
-    return to HEALTHY within the window → NEGATIVE FINDING
-    (recovered=False is a result about Ray, not a harness error).
+    Recovery is only declared when the deployment is HEALTHY with at
+    least one live replica reporting a PID DIFFERENT from the one
+    that was killed (D40). A replica still reporting the killed PID
+    is NOT a replacement: the ``kill -9`` either did not terminate the
+    containerised worker, or the controller's replica state is stale —
+    and the pre-kill state alone satisfies the old
+    ``status == HEALTHY and len(replicas) >= 1`` condition, so that
+    check could pass without Ray ever noticing the death.
+
+    Classification (D29):
+      * the replica/app cannot be found, the kill cannot be sent, or
+        the status polls fail → HARNESS (the recovery could not be
+        observed);
+      * the killed PID keeps being reported for the whole budget →
+        HARNESS: the kill did not land or the status is stale — we
+        did not manage to break anything, so nothing was learned
+        about recovery;
+      * no live replica and the deployment not HEALTHY when the
+        budget runs out → NEGATIVE FINDING: the observation was made
+        and Ray did not replace the killed replica.
+
+    Corroboration: the poll also records the deployment's
+    ``recent_dead_replicas`` and ``status_trigger`` (DeploymentDetails,
+    schema.py:1355-1399) — Ray's own account of which replicas died
+    and why the deployment is in its current state.
 
     Args:
         recorder: Records the raw states.
@@ -876,6 +930,34 @@ def phase_b(recorder: Recorder, outcome: StepOutcome) -> None:
                 print(f"kill -9 {pid} sent")
                 replica_killed = True
 
+                # Verify the kill landed before trusting anything the
+                # polls say afterwards (D40): the worker runs in a
+                # podman container with --pid=host, so the reported
+                # PID is a host PID — but whether the signal reached
+                # the process is exactly what the D40 run could not
+                # tell. A short grace lets the kernel reap it first.
+                time.sleep(2)
+                kill_landed = _pid_alive(pid) is False
+                print(f"kill -9 {pid}: "
+                      f"{'process gone' if kill_landed else 'process STILL ALIVE'}"
+                      f" 2s after the kill")
+                recorder.write(block(
+                    f"Kill verification for PID {pid}",
+                    "gone" if kill_landed
+                    else "STILL ALIVE 2s after kill -9",
+                ))
+                if not kill_landed:
+                    outcome.harness(
+                        f"the host-side kill -9 did not terminate "
+                        f"containerised replica PID {pid} (the process "
+                        "was still alive 2s after the kill) — the "
+                        "replica-kill observation could not be made, "
+                        "so nothing was learned about unattended "
+                        "recovery."
+                    )
+                    record("step6", phase="B", kill_landed=False)
+                    return
+
                 # Wait for recovery (D29: the old hard-coded 30 x 2s
                 # is now SPIKE_RECOVERY_TIMEOUT_S / SPIKE_READINESS_POLL_S).
                 timeout_s, interval_s = _recovery_settings()
@@ -885,6 +967,8 @@ def phase_b(recorder: Recorder, outcome: StepOutcome) -> None:
                 deadline = time.monotonic() + timeout_s
                 recovered = False
                 dep_after: dict = {}
+                same_pid_seen = False
+                dead_replicas_seen: list = []
                 while time.monotonic() < deadline:
                     time.sleep(interval_s)
                     apps_after = serve_status()
@@ -895,30 +979,100 @@ def phase_b(recorder: Recorder, outcome: StepOutcome) -> None:
                     # check applies to DeploymentStatus (schema.py).
                     status = dep_after.get("status", "unknown")
                     replicas = dep_after.get("replicas", [])
-                    print(f"  Status: {status}, Replicas: {len(replicas)}")
+                    trigger = dep_after.get("status_trigger")
+                    print(f"  Status: {status}, "
+                          f"trigger: {trigger}, "
+                          f"Replicas: {len(replicas)}")
                     for r in replicas:
                         print(f"    PID: {r.get('pid')}, state: {r.get('state')}")
+                    # Corroboration (DeploymentDetails.recent_dead_
+                    # replicas, schema.py:1395): Ray's own list of
+                    # recently-stopped replicas.
+                    dead_replicas_seen = dep_after.get("recent_dead_replicas", [])
+                    if dead_replicas_seen:
+                        print(f"    recent_dead_replicas: "
+                              f"{json.dumps(dead_replicas_seen)}")
 
-                    if status == _DEP_HEALTHY and len(replicas) >= 1:
-                        print("  Recovery confirmed")
+                    # D40: recovery means a REPLACEMENT — a live
+                    # replica whose PID is not the one that was
+                    # killed. A replica reporting the killed PID is
+                    # either stale controller state or a kill that
+                    # did not take; it cannot confirm recovery.
+                    new_pids = [
+                        r.get("pid") for r in replicas
+                        if r.get("pid") and r.get("pid") != pid
+                    ]
+                    same_pids = [
+                        r.get("pid") for r in replicas if r.get("pid") == pid
+                    ]
+                    if same_pids:
+                        same_pid_seen = True
+                        print(f"  (the killed PID {pid} is still "
+                              f"reported — not a replacement)")
+                    if status == _DEP_HEALTHY and new_pids:
+                        print(f"  Recovery confirmed — replacement "
+                              f"PID {new_pids[0]} (killed PID was {pid})")
                         wait_seconds = round(
                             timeout_s - (deadline - time.monotonic()), 1
                         )
                         record("step6", phase="B", recovered=True,
-                               wait_seconds=wait_seconds)
+                               wait_seconds=wait_seconds,
+                               killed_pid=pid, new_pid=new_pids[0],
+                               recent_dead_replicas=dead_replicas_seen)
                         recovered = True
                         break
                 if not recovered:
-                    # The polls WERE answered and the deployment did
-                    # not come back: a real result about Ray.
-                    print(f"  Did not recover in {timeout_s:.0f}s")
-                    record("step6", phase="B", recovered=False)
-                    outcome.finding(
-                        f"Phase B: the killed replica was NOT replaced "
-                        f"within {timeout_s:.0f}s (final deployment "
-                        f"status: {dep_after.get('status', 'unknown')}) "
-                        "— unattended recovery did not happen."
-                    )
+                    final_status = dep_after.get("status", "unknown")
+                    final_trigger = dep_after.get("status_trigger")
+                    final_pids = [
+                        r.get("pid") for r in dep_after.get("replicas", [])
+                    ]
+                    print(f"  Did not recover in {timeout_s:.0f}s "
+                          f"(killed PID {pid})")
+                    recorder.write(block(
+                        f"Phase B final state (killed PID {pid})",
+                        json.dumps(dep_after, indent=2, default=str),
+                    ))
+                    if same_pid_seen or pid in final_pids:
+                        # The polls answered, but every replica they
+                        # reported is the process we tried to kill:
+                        # the kill did not land or the status is
+                        # stale. We did not manage to break anything,
+                        # so this is a harness failure, not a finding
+                        # about Ray's recovery.
+                        record("step6", phase="B", recovered=False,
+                               same_pid_reported=True, killed_pid=pid,
+                               recent_dead_replicas=dead_replicas_seen)
+                        outcome.harness(
+                            f"Phase B: replica PID {pid} kept being "
+                            f"reported for the full {timeout_s:.0f}s "
+                            f"budget (final deployment status: "
+                            f"{final_status}, trigger: "
+                            f"{final_trigger}) — either the kill did "
+                            "not land on the containerised process or "
+                            "the reported status is stale. We did not "
+                            "manage to break anything, so nothing was "
+                            "learned about unattended recovery; this "
+                            "is a harness failure, not a finding about "
+                            "Ray."
+                        )
+                    else:
+                        # The polls were answered, the killed replica
+                        # is gone, and no replacement appeared: a
+                        # real result about Ray.
+                        record("step6", phase="B", recovered=False,
+                               killed_pid=pid,
+                               recent_dead_replicas=dead_replicas_seen)
+                        outcome.finding(
+                            f"Phase B: the killed replica was NOT "
+                            f"replaced within {timeout_s:.0f}s "
+                            f"(final deployment status: {final_status}, "
+                            f"trigger: {final_trigger}, live PIDs: "
+                            f"{final_pids or '<none>'}, "
+                            f"Ray-reported dead replicas: "
+                            f"{len(dead_replicas_seen)}) — unattended "
+                            "recovery did not happen."
+                        )
                 break
         if not replica_killed:
             print("No replica found")
