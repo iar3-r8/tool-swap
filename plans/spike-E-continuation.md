@@ -1238,6 +1238,59 @@ pretending:**
 **Verdict: none, and none should be claimed.** Step 7 contributes environment
 context to the write-up, not evidence for or against Ray.
 
+**9S. CORRECTION (D44): I graded steps 5 and 6 against my own reading, not the
+protocol as written. Both verdicts change.**
+
+The docs-manager, writing the results document, checked my verdicts against
+[`spike-E-ray-native-protocol.md`](spike-E-ray-native-protocol.md) §3 and flagged
+two. It is right on both, and I was wrong on both. The protocol text is frozen
+under Rule 5 precisely so verdicts cannot drift toward the outcome the author
+prefers — and mine drifted.
+
+**Step 5 is PARTIAL, not PASS.** The written criteria:
+> **Pass:** 20 alternations complete with no stuck states and latency ≈ cold
+> start.
+> **Partial:** works but with occasional stuck states or latency spikes.
+> **Record honestly; do not round to pass or fail.**
+
+Cold start is ~12s (measured, §9N/§9Q). **40% of alternations took 99-104s** —
+that is not "≈ cold start", it is the latency-spike case, and the criterion even
+anticipates the temptation: *do not round*. I rounded to pass because 20/20
+completed with zero errors. Completion without stuck states is **necessary** for
+a pass; it is not **sufficient**. **Revised: PARTIAL** — the mechanism works,
+reliability is excellent, the latency distribution is not.
+
+**Step 6 is FAIL as written, not PASS.** The written criteria:
+> **Pass:** the cluster returns to serving with no manual cleanup and no leaked
+> VRAM or orphaned containers.
+> **Fail:** manual intervention, leaked VRAM, or orphaned containers.
+
+Phase A recovery required `ray stop --force`, then `ray start --head` with the
+cluster's flags, then a **re-apply of the config** — three operator commands.
+That *is* manual intervention, which the criterion names as Fail. Separately,
+step 7 recorded **109 orphaned containers**, which the same sentence also names
+as Fail. My "gate CLEAN" came from the harness's exit code — and I wrote that
+classification myself; the protocol's bar is stricter than the one I built.
+
+What must not be lost in the correction: **replica-level recovery genuinely is
+automatic** (new pid, ~15s, unattended, §9P). The failure is specifically at the
+**head-node/cluster level**, plus the container litter. The honest statement is:
+*automatic recovery from replica death; operator-driven recovery from cluster
+death; containers accumulate without bound.*
+
+**Why this matters beyond bookkeeping.** Both of these errors ran in the same
+direction — toward Ray passing. The two retracted verdicts (§9L, §9M) ran the
+opposite way. So the pattern is not bias toward a conclusion; it is
+**insufficient discipline about grading against a frozen criterion**, in both
+directions. Rule 5 exists for exactly this, and the only reason these were caught
+is that a second mode read the protocol independently instead of trusting my
+summary. Worth keeping as a lesson about the method, not just this spike.
+
+**Also flagged and accepted:** the ledger never recorded the `podman ps -a`
+orphaned-container count that protocol step 6.3 requires. Step 7 captured it
+incidentally (109 stopped, 120 images). Gap in the record, now closed by
+reference.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
