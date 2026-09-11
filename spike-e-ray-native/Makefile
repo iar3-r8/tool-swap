@@ -3,7 +3,7 @@ SHELL := /bin/bash
 ENV  := bash -c 'set -a; . ./env.sh; set +a; exec "$$@"' _
 CAPTURE_ENV := $(ENV) python scripts/capture_env.py
 
-.PHONY: all env cluster-up fixtures step1 step2 step3 step3-container step4 step5 step6 step7 step8 clean preflight
+.PHONY: all env cluster-up fixtures step1 step2 step3 step3-container step4 step5 step6 step7 step8 step9 clean preflight
 
 all: env fixtures step1 step2 step3 step4 step5 step6 step7
 
@@ -60,6 +60,14 @@ step7: env
 # store and the GPU, like a fixtures/ script.
 step8: env
 	@$(ENV) python scripts/step8_podman_baseline.py
+
+# Step 9 — phase timing of the alternation cycle (D47). The same
+# step-5 setup (external scaler, container-key runtime_env)
+# instrumented with per-cycle phase boundaries and podman container
+# correlation: it finds WHERE Ray's ~95s slow mode goes. Own clean
+# cluster, like every other Ray step.
+step9: env
+	@$(ENV) bash scripts/lib/run_with_cluster_clean.sh env python scripts/step9_phase_timing.py
 
 preflight:
 	@bash scripts/lib/preflight.sh
