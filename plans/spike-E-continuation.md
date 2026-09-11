@@ -1559,6 +1559,72 @@ Step 9 already exposes the cycle count, so 20 instrumented cycles should catch
 timestamp — which will say whether the ~101s sits in scheduling, in the container
 launch, or in Ray noticing a replica that already started.
 
+> **⚠ Answered by §9X: 0/20 slow.** Sampling luck is ruled out; the drivers
+> differ in what they measure.
+
+**9X. STEP 9 AT 20 CYCLES (D50): 0/20 slow. The difference is the DRIVER — and
+step 9 does not measure what step 5 measures.**
+
+`SPIKE_STEP9_N=20 make step9` → exit 3 again. **All 20 cycles 6.4-10.7s.** Step 5
+at the *same* count gets 5-8 slow. Sampling luck is no longer credible: at ~31%
+incidence, 0/20 has probability ≈0.0002.
+
+**The drivers differ in one decisive way.** Step 5
+([`step5_alternate.py:242-246`](../spike-e-ray-native/scripts/step5_alternate.py:242)):
+```python
+scale_deployment(other_app, 0)                   # incumbent down
+scale_deployment(target, 1)                      # challenger up
+resp = post_introspect(target_url, timeout=120)  # POST IMMEDIATELY
+```
+Step 9: scale → scale → **poll `serve_status` every 0.5s until RUNNING** → *then*
+POST.
+
+**So step 5's request arrives while the replica is still starting; step 9's never
+does.** Step 5 measures *"a request arrives during a swap"*; step 9 measures
+*"wait until ready, then request"*. Different experiments — and the ~101s lives
+only in the first.
+
+**Hypothesis, explicitly labelled as my fifth attempt at this attribution:** the
+~101s is the **proxy-side handling of a request that arrives before its replica
+exists** — queueing, retry/backoff, or a routing timeout — not the replica
+lifecycle. What supports it:
+- the slow value's tight constancy (100.9-102.8s over five occurrences, §9W) is
+  **timeout-shaped, not work-shaped**;
+- every phase step 9 *can* see is fast and stable — replica materialisation
+  0.78-0.89s across **30** measured cycles;
+- `DEFAULT_UVICORN_KEEP_ALIVE_TIMEOUT_S = 90` plus ~10s of startup is in the
+  right neighbourhood, though the composition is **unverified**.
+
+**Why this matters more than the number itself.** Tool-swap's premise is
+**request-triggered** swapping: a request for B arrives, B is not resident, the
+router displaces A and serves B. **That is step 5's pattern, not step 9's.** If
+the ~101s is request-arrives-during-swap, it lands precisely on the use case
+tool-swap exists to serve — which would make it the most decision-relevant
+finding in the spike. If instead it is an artefact of step 5's probe (e.g. a
+client-side retry), it may not bear on the design at all. **Both readings are
+open.**
+
+**A harness defect found on the way:** step 9 printed
+`container first seen: <none>` on **all 20 cycles**. The podman correlation —
+built specifically to separate *"slow to start the container"* from *"slow to
+notice it"* — silently produced nothing, and the step still reported on its own
+terms. That is the **fourth** silent-or-unfalsifiable check in this harness
+(after step 1's exit 0, step 2's wrong-op comparison, step 6B's stale pid). It
+must be fixed before step 9 is trusted for attribution.
+
+**The discriminating experiment, and it is small:** run step 9's instrumentation
+with **step 5's request pattern** — POST immediately after the scale calls, from
+a background thread, while phase polling continues. Then:
+- slow mode appears → the ~101s is **request-path**, and the phase timestamps
+  will show whether the replica was ready long before the response returned;
+- slow mode still absent → the difference is **the polling itself**, i.e.
+  observation changes the outcome, which is its own finding.
+
+**Honest state until that runs:** Ray's swap costs **~8s when nothing is waiting
+on it**, and **~101s about a third of the time when a request is waiting** —
+cause unidentified, and **the two conditions have never been varied
+independently**.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
