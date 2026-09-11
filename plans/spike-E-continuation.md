@@ -1291,6 +1291,69 @@ orphaned-container count that protocol step 6.3 requires. Step 7 captured it
 incidentally (109 stopped, 120 images). Gap in the record, now closed by
 reference.
 
+**9T. STEP 8 (D45): the attribution is settled — the ~100s slow path is Ray's
+orchestration, not container startup.**
+
+`make step8` → **exit 0**, 20/20 cycles, 0 failures, every cycle VRAM-verified.
+This was the experiment [`ray-adoption-analysis.md`](ray-adoption-analysis.md)
+§12 named as the one cheap measurement that could move the decision. It moved
+it, and against Ray.
+
+**Plain podman, identical work, no Ray:**
+
+| | step 5 (Ray) | step 8 (plain podman) |
+|---|---|---|
+| min | 5.85s | **3.87s** |
+| median | 9.48s | **6.40s** |
+| **P90** | **103.2s** | **6.67s** |
+| max | 103.6s | **6.91s** |
+| distribution | **bimodal** — 40% at 99-104s | **tight** — all 20 within 3.9-6.9s |
+
+**~15× on P90, and the bimodality disappears entirely.** Podman's *slowest*
+cycle (6.91s) beats Ray's *median* (9.48s).
+
+**The work was genuinely done** — not a no-op being timed, which is the trap
+that made step 3's first run worthless. Every cycle cleared the 1024 MiB VRAM
+gate: torch **1 → 4519 MiB** (+4518), tf **1 → 38909 MiB** (+38908, TensorFlow
+claiming the pool exactly as in step 3). Each container returned its own
+baked-in `image_marker` and the right `weights_sha256` (`43d5b7a7…` /
+`83faf873…`), so the step-1/2 identity guarantees hold here too. Inside the
+container, `init_total_seconds` was **1.85-2.01s (torch)** and **3.77-3.97s
+(tf)** — so of podman's 4-7s, roughly half is the tool's own initialisation and
+the rest is container start.
+
+**Conclusion: the ~95s difference is Ray's.** Container lifecycle at this image
+size costs **~4-7s** warm. The remainder is Ray's scale-to-zero decision path —
+metric decay over `look_back_period_s` then `downscale_to_zero_delay_s`
+([`autoscaling_policy.py:124-130`](/usr/local/lib/python3.11/site-packages/ray/serve/autoscaling_policy.py:124))
+— plus its replica lifecycle. **This is the hard-con branch** the analysis
+specified *in advance*: our own router would inherit ~5s, not ~100s.
+
+**Limits, stated by the step itself rather than left to inference:**
+- `mode=start` measures the **run span only**: fresh container start, init,
+  identity, exit. It **excludes** Ray's scale RPCs, replica teardown, ingress
+  routing and the HTTP round trip. A fast step 8 does **not** by itself
+  exonerate Ray's *teardown* half; `mode=full` was not run.
+- Step 5's cycle includes displacing a live VRAM holder, which plain podman has
+  no equivalent of. So the comparison is **start-side like-for-like,
+  teardown-side incomplete**. But the gap is ~95s against a total podman cycle
+  under 7s, so no plausible teardown accounting closes it.
+- 20 samples, one run, one host, warm image store. A second run should confirm
+  before an ADR quotes the figure as settled.
+- **Ray's ~95s is configuration-dependent, not a floor.**
+  `downscale_to_zero_delay_s` is tunable and part of the rest is
+  `look_back_period_s`. The defensible claim is *"Ray's default displacement
+  path costs ~100s where the container costs ~5s"* — **not** *"Ray cannot go
+  faster"*. Whether it tunes down to ~10s without destabilising the autoscaler
+  is **untested**, and is the obvious follow-up if Ray stays in contention.
+
+**Bearing on the decision.** This resolves the largest uncertainty in the
+adoption analysis (§5.1) against Ray: the latency cost is Ray's, not inherited.
+It leaves the two strongest pro-Ray arguments **untouched** — the bus factor,
+and multi-node GPU support we would otherwise write ourselves. Neither is
+measured by any step in this spike, and the user has since named multi-node as a
+first-class concern (avoiding a future rewrite), which no step 1-8 addresses.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
