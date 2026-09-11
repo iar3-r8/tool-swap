@@ -1420,6 +1420,83 @@ pattern is consistent and worth stating: **the measurements have survived
 scrutiny; my explanations of them repeatedly have not.** Keeping those two
 things separable is what has made each correction cheap.
 
+**9V. STEP 9 (D48): the slow mode did NOT reproduce, and Ray's per-cycle
+overhead is ~1-3s, not ~95s. This undermines my own framing.**
+
+`make step9` → **exit 3**, and correctly so: the step refused to attribute a
+phase that never occurred. **All 10 cycles completed in 7.2-10.3s.** No cycle
+approached 30s, let alone 100s.
+
+**The phase breakdown, and it is not what I predicted:**
+
+| phase | all 10 cycles |
+|---|---|
+| scale-down RPC | 5-9 **ms** |
+| scale-up RPC | 5-9 **ms** |
+| decision lag (`target_num_replicas` → 1) | **5-6 ms** |
+| replica materialize (target → replica appears) | **0.78s**, strikingly stable |
+| **STARTING → RUNNING** | **6.1-9.2s** ← dominates every cycle |
+| serving (first HTTP) | 0.29s |
+
+**The replica logs put the dominant phase on the tool's own work**, not Ray's:
+```
+08:50:30,913 Started initializing replica.
+08:50:33,057 Finished initializing replica.   ← 2.1s (torch)
+08:51:55,410 Started initializing replica.
+08:51:58,889 Finished initializing replica.   ← 3.5s (tf)
+```
+and `runtime_env_setup-*.log` shows each container launch at **~1s**
+(`Pulling image` → `Starting worker in container` ≈ 0.9-1.1s).
+
+**So Ray's own orchestration cost here is ~0.8s of materialize plus ~20ms of
+RPCs.** Step 8's plain-podman P90 was 6.7s; step 9's Ray cycles ran 7.2-10.3s.
+**The overhead is ~1-3s, not 95s** — a completely different picture from §9T's,
+and the more favourable one for Ray.
+
+**What this does and does not do to §9T:**
+- §9T's *measurement* stands. Step 5 really did record P90 103.2s with 8 of 20
+  cycles at 99-104s. That is in the log and is not withdrawn.
+- §9T's *characterisation* is now **doubtful**. Under an equivalent config —
+  verified: step 9's config differs from step 5's only in application names —
+  the same operation cost 7-10s, ten times consecutively.
+- Therefore step 5's ~100s was **not the steady-state cost of the mechanism**.
+  **The mechanism is fast; something intermittently makes it very slow**, and
+  this run did not trigger it.
+
+**Candidates, none tested:**
+- **Environmental/transient.** Step 5 ran after hours of other steps with 79+
+  accumulated containers; step 9 ran against a fresher store. Step 8 was also
+  clean and fast.
+- **Host contention** at step 5's time (other tenants held GPUs 2-3 at ~38 GB
+  during several runs).
+- **A genuine intermittent stall** needing more cycles to hit — though at step
+  5's 40% incidence, 10 cycles should have produced ~4 slow ones, so the absence
+  is mild evidence against a 40% steady-state rate.
+- **A difference between the two drivers, not the configs.** Step 5 alternated
+  20 times in one process with its own probe pattern; the drivers deserve a diff,
+  not just the YAML.
+
+**Consequence for the decision, stated plainly.** The claim I put in front of
+the user — *"Ray costs ~100s per swap"* — is **not safe to rely on**. What is
+safe:
+- Ray's observed **best-case** overhead over plain podman is **~1-3s** per swap.
+- Step 5's slow mode is **real, unexplained, and not reproduced**.
+- **Latency is no longer a settled argument against Ray.** It is an open
+  question with one alarming observation and one clean one.
+
+**Fourth attribution error of mine in this spike** (§9L, §9M, §9S, §9U), and the
+second on this same latency number. The pattern is now unmistakable and belongs
+in the record for whoever reads this next: **every measurement I took held up;
+nearly every explanation I attached to one did not.** The measurements were cheap
+to trust because the harness recorded raw output. The explanations were expensive
+because I reached for them faster than the evidence allowed.
+
+**Required before the latency argument is used at all:** re-run **step 5
+unchanged** (20 cycles) and see whether the bimodality reproduces. If it does,
+run step 9 at 20+ cycles to catch a slow cycle *with* phase instrumentation. If
+it does not reproduce, step 5's P90 must be withdrawn as evidence about Ray and
+recorded as an artefact of that run's conditions.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
