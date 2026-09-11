@@ -1497,6 +1497,68 @@ run step 9 at 20+ cycles to catch a slow cycle *with* phase instrumentation. If
 it does not reproduce, step 5's P90 must be withdrawn as evidence about Ray and
 recorded as an artefact of that run's conditions.
 
+> **⚠ Answered immediately by §9W: it REPRODUCES.** §9V's "the mechanism is
+> fast" framing was too strong — step 9 got lucky.
+
+**9W. STEP 5 RE-RUN (D49): the bimodality REPRODUCES. Step 9 sampled luckily,
+and the slow value's constancy points at a timeout rather than contention.**
+
+`make step5`, unchanged, 20 cycles. The first 16:
+```
+ 1 torch   6.142      9 torch   8.448
+ 2 tf      9.473     10 tf    102.791  ← slow
+ 3 torch   8.351     11 torch   8.359
+ 4 tf    101.337 ←   12 tf    101.650  ← slow
+ 5 torch   8.366     13 torch   8.359
+ 6 tf      9.571     14 tf    101.559  ← slow
+ 7 torch 100.926 ←   15 torch   8.465
+ 8 tf      9.599     16 tf      9.571
+```
+
+**Three things this settles:**
+
+1. **The slow mode is real and reproducible.** 5 slow in 16 (~31%), consistent
+   with the original 8-in-20 (40%). §9T's measurement is **confirmed**, not an
+   artefact of a single run.
+2. **Step 9's clean result was sampling luck, not a configuration difference.**
+   At ~31-40% incidence, 10 cycles showing none has roughly a 2% probability —
+   unlikely, not extraordinary. The configs were already verified equivalent, so
+   **§9V's "the mechanism is fast" was too strong**: it is fast *most of the
+   time*.
+3. **The slow value is strikingly constant: 100.9, 101.3, 101.6, 101.6, 102.8**
+   — under 2s of spread across five occurrences. **Contention or I/O pressure
+   would scatter; a fixed timeout lands on the same number every time.** That is
+   the best clue in this whole investigation, and it reframes the question from
+   *"why is Ray slow?"* to *"what times out at ~100s and then succeeds?"*
+
+**Also suggestive, not concluded: 4 of the 5 slow cycles targeted `tf`.** The one
+slow `torch` cycle (#7) rules out "tf is always slow". Worth noting tf claims
+**38909 MiB** — effectively the entire pool — against torch's 4519 MiB (§9N,
+§9T), so a VRAM-availability interaction is plausible. **Unmeasured, and I am not
+attributing it**, having made four attribution errors on this number already.
+
+**No single ~100s constant in Serve's defaults.**
+[`constants.py`](/usr/local/lib/python3.11/site-packages/ray/serve/_private/constants.py)
+has `DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_S = 20`,
+`DEFAULT_HEALTH_CHECK_TIMEOUT_S = 30`,
+`DEFAULT_UVICORN_KEEP_ALIVE_TIMEOUT_S = 90` — nothing at 100. So if it is a
+timeout, it is either a composition of several or lives outside Serve (Ray core,
+the runtime_env plugin, or podman itself). **Open question, not a conclusion.**
+
+**Net effect on the decision.** The latency cost is back as a **measured,
+reproducible** fact: **~31-40% of swaps take ~101s; the rest take 6-10s.** But
+the cause is unknown, and the constancy suggests a **possibly fixable timeout
+rather than an inherent cost** — a materially different thing for a decision.
+Neither "Ray costs 100s" nor "Ray costs 8s" is honest. The honest summary is:
+**Ray costs ~8s except when it costs ~101s, roughly a third of the time, for
+reasons not yet identified.**
+
+**Cheapest next step, no new code required:** `SPIKE_STEP9_N=20 make step9`.
+Step 9 already exposes the cycle count, so 20 instrumented cycles should catch
+6-8 slow ones **with** per-phase timestamps and the container first-seen
+timestamp — which will say whether the ~101s sits in scheduling, in the container
+launch, or in Ray noticing a replica that already started.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
