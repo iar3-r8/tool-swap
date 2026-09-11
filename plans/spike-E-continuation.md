@@ -1354,6 +1354,72 @@ and multi-node GPU support we would otherwise write ourselves. Neither is
 measured by any step in this spike, and the user has since named multi-node as a
 first-class concern (avoiding a future rewrite), which no step 1-8 addresses.
 
+> **⚠ The mechanism named above is WRONG — see §9U.** The *conclusion* (the ~95s
+> is Ray's, not container lifecycle) stands. My explanation of *why* does not.
+
+**9U. CORRECTION (D46): §9T named the wrong mechanism, and the experiment I
+proposed would have measured nothing.**
+
+§9T's conclusion stands: step 8 shows the ~95s excess is **Ray's**, not
+container lifecycle. That measurement is sound.
+
+**But I named the wrong cause.** I wrote the ~95s was *"Ray's scale-to-zero
+decision path — metric decay over `look_back_period_s` then
+`downscale_to_zero_delay_s`"*. That cannot be right.
+[`step5_config.yaml:55`](../spike-e-ray-native/apps/step5_config.yaml:55) sets
+**`external_scaler_enabled: true` with no `autoscaling_config`**, and step 5's
+own summary says so outright:
+> With `external_scaler_enabled`, the `downscale_to_zero_delay_s` timer does not
+> exist. The incumbent is displaced by explicit scale-to-zero, not by the timer
+> expiring.
+
+Step 5 drove scaling with explicit `scale_deployment` calls; **the autoscaler
+was never in the loop**, so its delays cannot explain the ~95s. I carried the
+mechanism across from step 3 — where the ~80s downscale delay *was* real and
+measured (§9N) — and applied it to a step that had deliberately disabled it.
+
+**Consequence: the experiment I proposed to the user was worthless.** Tuning
+`downscale_to_zero_delay_s` would not move step 5's numbers at all, because
+step 5 never waited on it. Worse, a null result would have read as *"Ray's
+latency is irreducible"* — a wrong conclusion drawn from a measurement of
+nothing.
+
+**So the mechanism is genuinely unexplained.** Candidates, none measured:
+- Ray's replica lifecycle around an external scale request: actor creation,
+  per-replica `runtime_env` setup, GCS worker registration, health-check and
+  readiness gating before the proxy will route.
+- The `container` plugin re-preparing the runtime environment on every replica
+  start (each start is a fresh `podman run`, per
+  [`image_uri.py`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py)).
+- Something bimodal in the scale round trip — the ~12 fast / ~8 slow split is
+  not what a fixed cost produces.
+
+**An outside analysis, checked against our own data.** Two of its three
+hypotheses are already falsified by measurements we hold; the third survives and
+is now the leading candidate:
+- **vfs storage driver** — **falsified.** Step 7 measured `overlay` with
+  `Native Overlay Diff: true` (§9R), and step 8 started the same images in 4-7s
+  on the same rootless podman.
+- **slirp4netns rootless networking** — **falsified.** Ray's own command already
+  passes `--network=host`
+  ([`image_uri.py:83`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py:83)).
+- **Ray's internal actor creation / worker registration** — **not falsified**,
+  and strengthened by the autoscaler now being excluded.
+
+**The right experiment is diagnostic, not a tuning knob:** instrument a
+step-5-style alternation to timestamp the phases *inside* each cycle — scale
+request accepted, replica actor created, container started, replica RUNNING,
+first response served — and identify which phase holds the ~95s. It reuses the
+existing harness, and unlike the tuning idea it cannot produce a misleading null
+result.
+
+**Third attribution error of mine in this spike**, after the two retracted
+verdicts (§9L, §9M) and the two mis-graded steps (§9S). This one was caught
+because a third party's analysis prompted me to re-read our own config. The
+pattern is consistent and worth stating: **the measurements have survived
+scrutiny; my explanations of them repeatedly have not.** Keeping those two
+things separable is what has made each correction cheap.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
