@@ -256,17 +256,21 @@ def test_docker_directory_does_not_exist() -> None:
 
 
 def test_import_docker_not_a_namespace_package() -> None:
-    """``import docker`` must never resolve to a repo-root namespace package.
+    """``import docker`` must never resolve to the repository's own tree.
 
     Because ``pyproject.toml`` puts the repository root on ``sys.path``, a
     directory named ``docker/`` at the root shadows the Docker SDK with an
     implicit namespace package: the import *succeeds* and yields a module
-    with ``__file__ is None`` and ``__path__`` inside the repository. That
-    silent failure mode is the defect this test stands guard against.
+    with ``__file__ is None``. That silent failure mode is the defect this
+    test stands guard against.
 
     Acceptable outcomes: ``ModuleNotFoundError`` (SDK not installed yet —
     correct before M2a behaviour 2), or a real module with a ``__file__``
-    and a ``__version__`` (SDK installed).
+    and a ``__version__`` (SDK installed). The ``__path__`` guard forbids
+    only paths anchored in the repository's own source tree (the repo
+    root, ``src/``, or a ``docker/`` under either); a legitimate install —
+    including one inside a repository-local ``.venv`` — resolves into
+    ``site-packages`` and is accepted, wherever the environment places it.
 
     Note: intentionally NOT marked ``docker`` — it needs no daemon, and
     the marker would make pytest deselect it by default.
@@ -294,12 +298,23 @@ def test_import_docker_not_a_namespace_package() -> None:
             "import docker resolved to a module without __version__; "
             "this is the namespace-package symptom, not the Docker SDK"
         )
+        # The defect is resolution to the repository's own tree: a
+        # namespace package rooted at the repo root or src/, or a regular
+        # package living in a docker/ directory under either. A legitimate
+        # install (e.g. in the repository-local .venv) points at
+        # site-packages instead and must be accepted.
+        repo_anchored = {
+            ROOT.resolve(),
+            SRC_ROOT.resolve(),
+            (ROOT / "docker").resolve(),
+            (SRC_ROOT / "docker").resolve(),
+        }
         namespace_path = getattr(module, "__path__", None)
         if namespace_path is not None:
             for entry in namespace_path:
-                assert not str(entry).startswith(str(ROOT)), (
-                    f"import docker resolved with __path__ inside the "
-                    f"repository: {entry}"
+                assert Path(entry).resolve() not in repo_anchored, (
+                    "import docker resolved to a repository-anchored path "
+                    f"instead of the installed Docker SDK: {entry}"
                 )
     finally:
         for name in list(sys.modules):
