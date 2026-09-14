@@ -141,6 +141,12 @@ tool-swap/
 - **`tool_swap` and `tool_swap_runtime` are strictly separate.** The router never imports the runtime and vice versa.
 - **`backends/` is the only place BentoML imports may appear.** A second import-linter rule enforces the boundary.
 - **`NATIVE.md` is a specification document, not a package.** The native backend is not implemented in v1.
+- **`images/` must not be renamed back to a directory named `docker`.** The test
+  configuration puts the repository root on `sys.path` (`pythonpath = ["src", "."]`),
+  so a root-level `docker` directory would make `import docker` resolve to *that
+  directory* as an implicit namespace package instead of the Docker SDK — and the
+  import would *succeed*, yielding an empty module rather than raising. The
+  shadowing is pinned by `tests/unit/test_repo_layout.py`.
 
 ## License
 
