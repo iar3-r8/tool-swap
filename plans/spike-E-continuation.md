@@ -1693,6 +1693,79 @@ environment (assign sourced values only where the variable is unset), then
 re-run with eager. **Fifth silent-or-unfalsifiable harness defect** in this
 spike, and the second one that invalidated a run I had already reported on.
 
+**9Z. STEP 9 EAGER (D54): THE ~100s IS LOCATED. Ray waits ~93s before it even
+starts the container.**
+
+`SPIKE_STEP9_N=20 SPIKE_STEP9_PROBE=eager make step9` → **exit 0**, banner
+confirmed `Probe pattern: EAGER`. **8 slow / 12 fast — the bimodality
+reproduced under instrumentation**, at step 5's ~40% rate.
+
+**The attribution, unambiguous:**
+
+| phase | fast (12) | slow (8) |
+|---|---|---|
+| scale-down RPC | 8 ms | 8 ms |
+| scale-up RPC | 5 ms | 4 ms |
+| decision lag | 7 ms | 7 ms |
+| replica materialize | 0.87s | 0.87s |
+| **STARTING → RUNNING** | **8.9s** | **99.3s** |
+| **container first seen** | **~3.0s** | **~93.6s** |
+
+Every phase before the replica exists is identical between the groups, to the
+millisecond. The whole difference sits in one span — and the container
+timestamp, now that it works (D53), splits that span decisively.
+
+**The container does not appear until ~93.6s into a slow cycle**, against ~3.0s
+in a fast one. So this is **not** "the container was slow to start", and **not**
+"Ray was slow to notice a started container". It is:
+
+> **Ray waits ~90 seconds before issuing `podman run` at all.**
+
+**Verified independently against Ray's own log rather than taken from the
+harness's summary.** Cycle 2: t0 ≈ 10:05:43.9, `container_first_seen_s` = 93.578
+→ predicts 10:07:17.48. `runtime_env_setup` records
+`10:07:17.555 Pulling image tool_tf:spike`. **Agreement within 80 ms.** The
+replica's own init then starts 10:07:21.2 and finishes 3.3s later — the work is
+fast; the waiting precedes it.
+
+**What this rules out:** the scale RPCs (8 ms), the controller's target update
+(7 ms), actor creation (0.87s — *identical* in both groups), container startup
+(~1s, per step 8 and the fast cycles), and tool initialisation (2-3.5s, present
+in the replica log of every cycle including the slow ones). It is dead time
+inside Ray between deciding a replica is needed and launching the process.
+
+**And the eager/ready distinction is now explained.** `ready` polled to RUNNING
+before probing — 50 cycles, never slow. `eager` probes immediately — 8/20 slow.
+The difference is not observation overhead; it is that **a pending request is a
+precondition for the stall**. Ray takes ~90s to place a replica *when a request
+is already waiting on it*. That is exactly the condition tool-swap's design
+centres on.
+
+**Bearing on the decision — the most decision-relevant measurement in the
+spike.** Tool-swap is request-triggered by construction: a request arrives for a
+non-resident tool and the router must displace and start it. Step 5 and step
+9-eager both exercise that path, and ~40% of the time it costs ~100s against ~5s
+of real work. Plain podman does the same work in 3.9-6.9s with no bimodality
+(§9T). **That is ~15× on the one path the product exists to serve.**
+
+**Mechanism still unnamed, deliberately.** After five wrong attributions I will
+state only what is measured: the dead time is inside Ray, it *precedes* the
+container launch, it is ~90-95s with little spread, and it requires a pending
+request to manifest. Retry/backoff, a lock, a queue interaction, a health-check
+cycle — **unknown**. The controller and proxy logs for a slow cycle are the next
+place to look, and step 9 already names them as gaps G1-G2.
+
+**Two harness artefacts in this output**, neither load-bearing for the above:
+- `serving_s` is **negative** (-0.05 to -0.8s) in every cycle: in eager mode p7
+  (probe returned) can precede p6 (RUNNING observed at the next poll). The
+  subtraction is meaningless in this mode and should be suppressed rather than
+  printed as a phase.
+- `replica_materialize_s` is **0.000** where p4 was first seen on the same poll
+  as p3 — real, but poll-quantised at the low end.
+
+Neither entered the attribution; both should be fixed before this output is
+quoted elsewhere.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
