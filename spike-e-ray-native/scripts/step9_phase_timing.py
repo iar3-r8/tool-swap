@@ -58,17 +58,26 @@ replica itself took ~100s.
 
 Container correlation (scripts/lib/podman.py shape)
 ----------------------------------------------------
-For each cycle the poller also records when the newest container
-matching the challenger's image APPEARS in ``podman ps -a`` (with its
-CREATED field and observed status). That answers the question that is
-the point of the whole experiment: "Ray took ~95s to *start* the
-container" (container appears LATE, shortly before p4) versus "the
-container started promptly and Ray took ~95s to *notice*" (container
-appears early, but p4/p6 land ~95s later). Ray's image_uri plugin
-starts containers without --name, so per-cycle identity is by
-recency: the newest matching container is this cycle's (the
-incumbent's teardown removes its container, keeping the match set
-small).
+For each cycle the poller also records when a container matching the
+challenger's image APPEARS in ``podman ps -a`` (with its CREATED field
+and observed status). That answers the question that is the point of
+the whole experiment: "Ray took ~95s to *start* the container"
+(container appears LATE, shortly before p4) versus "the container
+started promptly and Ray took ~95s to *notice*" (container appears
+early, but p4/p6 land ~95s later).
+
+Ray's image_uri plugin starts containers without --name, so identity
+is by the container's own creation time, NOT by which matching
+container is newest (D53): the newest-match rule picked up containers
+from PREVIOUS runs (observed: "created 5 days ago", "Exited (1)"),
+which answered neither question and looked like it worked. A
+container is accepted only if its machine-readable ``Created`` field
+(``podman ps -a --format json``; int64 unix seconds — the sibling
+``CreatedAt`` is a human string like "5 days ago" and is used for
+display only) is at/after the cycle's start. If no matching container
+was created within the cycle, the cycle says so with the reason
+(newest stale match's age), never a bare <none> and never a stale
+match presented as real.
 
 The poll parses BOTH JSON shapes podman emits across versions: one
 object per line (podman 4.x) and a single, possibly pretty-printed,
@@ -226,6 +235,12 @@ MIN_SLOW_CYCLES = int(os.environ.get("SPIKE_STEP9_MIN_SLOW_CYCLES", "2"))
 # pattern; probe_sent_s/probe_returned_s are recorded alongside
 # p1-p7).
 PROBE_MODE = os.environ.get("SPIKE_STEP9_PROBE", "ready")
+# Container correlation (D53): a container is accepted as this
+# cycle's only if its `Created` (unix seconds) is at/after the cycle's
+# start minus this much. The slack absorbs a few seconds of clock
+# skew between t0 and podman's record; it is deliberately small so a
+# genuinely stale container (days old) can never qualify.
+CREATED_SLACK_S = 10.0
 
 # The serve_status / scale / probe / podman entry points. Module-level
 # names so a test can stub exactly these (the throwaway verification
@@ -416,52 +431,125 @@ def _container_images(containers: list[dict]) -> list[str]:
                    if c.get("Image")})
 
 
-def _newest_matching_container(
-    containers: list[dict], image: str
-) -> dict | None:
-    """The newest container of *image* (by CreatedAt, then StartedAt).
+def _container_created_unix(container: dict) -> int | None:
+    """The container's creation time in unix seconds, or None if absent.
 
-    The match is a substring on the Image field, which covers both the
-    config's short name (``tool_torch:spike``) and podman's
-    ``localhost/``-prefixed spelling (``localhost/tool_torch:spike`` —
-    how podman reports a locally-built, unqualified image).
-
-    Ray's image_uri plugin starts containers WITHOUT a --name, so the
-    only per-cycle identity is recency (see the module docstring).
+    ``podman ps -a --format json`` emits ``Created`` as an int64 of
+    unix seconds (UTC) in podman 3.4.4 (the DGX host) and 4.3.1 —
+    confirmed in both versions' ``cmd/podman/containers/ps.go``
+    ``jsonOut``, which adds ``Created: con.Created.Unix()`` alongside
+    the human ``CreatedAt`` string ("5 days ago"). Comparing that
+    string is how the D53 stale-match defect slipped through.
     """
-    matches = [c for c in containers if image in str(c.get("Image", ""))]
+    value = container.get("Created")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _newest_matching_container(
+    containers: list[dict], image: str, t0_wall: float
+) -> dict | None:
+    """The newest container of *image* created at/after *t0_wall*.
+
+    The image match is a substring, which covers both the config's
+    short name (``tool_torch:spike``) and podman's ``localhost/``-
+    prefixed spelling (``localhost/tool_torch:spike`` — how podman
+    reports a locally-built, unqualified image).
+
+    Ray's image_uri plugin starts containers WITHOUT a --name (and
+    the host accumulates orphaned containers from previous runs), so
+    recency alone is NOT identity (D53: the newest-match rule picked
+    up a container created 5 days earlier). A container is this
+    cycle's only if its ``Created`` unix timestamp is at/after the
+    cycle's start, within CREATED_SLACK_S to absorb a clock
+    adjustment between t0 and podman's record. Rows without a
+    parseable ``Created`` are ineligible: they cannot be proven to
+    belong to the cycle.
+    """
+    cutoff = t0_wall - CREATED_SLACK_S
+    matches = []
+    for c in containers:
+        if image not in str(c.get("Image", "")):
+            continue
+        created = _container_created_unix(c)
+        if created is None or created < cutoff:
+            continue
+        started = c.get("StartedAt")
+        matches.append((created,
+                        started if isinstance(started, int) else 0, c))
     if not matches:
         return None
-    return max(
-        matches,
-        key=lambda c: (str(c.get("CreatedAt", "")),
-                       str(c.get("StartedAt", ""))),
-    )
+    return max(matches, key=lambda t: (t[0], t[1]))[2]
 
 
 def _container_match_reason(
-    containers: list[dict], image: str
+    containers: list[dict], image: str, t0_wall: float
 ) -> str:
-    """Why no container of *image* matched — stated, not left as <none>.
+    """Why no container of *image* was correlated — stated, not <none>.
 
-    The §9V/§9X defect printed ``<none>`` on all 40 cycles and the step
-    reported on its own terms as though nothing was wrong. The reason
-    (no rows at all vs rows returned but none matching, with the
-    images actually seen) is what makes the absence diagnosable from
-    the report alone.
+    The §9V/§9X defect printed ``<none>`` on all 40 cycles and the
+    step reported on its own terms as though nothing was wrong; D53
+    showed a "match" can be just as misleading when it is a stale
+    container from a previous run. The reason (no rows at all, rows
+    but no image match, or image matched but every match predates the
+    cycle) is what makes the absence diagnosable from the report
+    alone.
     """
     if not containers:
         return (
             "no container row returned by `podman ps -a --format json` "
             "(or every row failed to parse as a container object)"
         )
-    seen = _container_images(containers)
-    sample = ", ".join(seen[:5]) + (f" (+{len(seen) - 5} more)"
-                                    if len(seen) > 5 else "")
-    return (
-        f"{len(containers)} container row(s) returned but none's Image "
-        f"contains {image!r}; images seen: {sample or '<none>'}"
+    image_matches = [
+        c for c in containers if image in str(c.get("Image", ""))
+    ]
+    if not image_matches:
+        seen = _container_images(containers)
+        sample = ", ".join(seen[:5]) + (f" (+{len(seen) - 5} more)"
+                                        if len(seen) > 5 else "")
+        return (
+            f"{len(containers)} container row(s) returned but none's "
+            f"Image contains {image!r}; images seen: {sample or '<none>'}"
+        )
+    # The image matched, but no matching container can be proven to
+    # belong to this cycle: present that as a STALE match, with its age
+    # and (where relevant) missing `Created` fields, not as the cycle's
+    # container (the D53 defect).
+    missing_created = [
+        c for c in image_matches
+        if _container_created_unix(c) is None
+    ]
+    dated = [
+        _container_created_unix(c) for c in image_matches
+        if _container_created_unix(c) is not None
+    ]
+    if not dated:
+        return (
+            f"{len(image_matches)} container(s) match image {image!r} "
+            "but none carries a machine-readable `Created` field, so "
+            "none can be proven to belong to this cycle — not "
+            "correlated (no stale match is presented as real)"
+        )
+    newest = max(image_matches, key=lambda c: _container_created_unix(c)
+                 or 0)
+    newest_created = max(dated)
+    note = (
+        f"{len(image_matches)} container(s) match image {image!r} but "
+        f"all were created before this cycle started (newest: "
+        f"'{newest.get('CreatedAt', '')}', "
+        f"{t0_wall - newest_created:.0f}s before cycle start)"
     )
+    if missing_created:
+        verb = "carries" if len(missing_created) == 1 else "carry"
+        pronoun = "it" if len(missing_created) == 1 else "they"
+        note += (
+            f" — {len(missing_created)} of them {verb} no "
+            f"machine-readable `Created` field, so {pronoun} cannot be "
+            "proven to belong to this cycle either"
+        )
+    return note + " — Ray created no new container for this cycle, so " \
+        "its own container cannot be identified"
 
 
 def _dep_of(status: dict, app: str, dep: str) -> dict:
@@ -636,7 +724,9 @@ def run_cycle(
         try:
             last_snapshot = podman_fn()
             cycle.podman_snapshots_ok += 1
-            newest = _newest_matching_container(last_snapshot, image)
+            newest = _newest_matching_container(
+                last_snapshot, image, cycle.t0_wall
+            )
             if newest is not None:
                 if cycle.container_first_seen is None:
                     cycle.container_first_seen = \
@@ -720,7 +810,7 @@ def run_cycle(
             )
         else:
             cycle.container_match_note = _container_match_reason(
-                last_snapshot, image
+                last_snapshot, image, cycle.t0_wall
             )
         print(f"      cycle {cycle.iteration} container first seen: "
               f"<none> — {cycle.container_match_note}")

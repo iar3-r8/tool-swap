@@ -17,12 +17,34 @@
 # clobber a caller's own SCRIPT_DIR local (see fixtures/build_images.sh).
 SPIKE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Allow operator override via .env; fall back to .env.example
+# Precedence, highest first: the caller's environment, then .env, then
+# .env.example, then the `:=` defaults below (D52).
+#
+# `set -a; source file; set +a` assigns UNCONDITIONALLY, so a value in the
+# file clobbers whatever the caller exported — the bug that turned
+# `SPIKE_STEP9_PROBE=eager make step9` into a `ready`-mode run. We instead
+# load the file into an ISOLATED environment (`env -i`) and copy only the
+# names the file defines into the current shell, skipping any name that is
+# already set. `.env` still wins over `.env.example` (we source exactly one
+# of them, `.env` if it exists), and every default below still applies when
+# neither the caller nor the file set the name.
 if [[ -f "${SPIKE_ROOT}/.env" ]]; then
-  set -a; source "${SPIKE_ROOT}/.env"; set +a
+  _spike_env_file="${SPIKE_ROOT}/.env"
 else
-  set -a; source "${SPIKE_ROOT}/.env.example"; set +a
+  _spike_env_file="${SPIKE_ROOT}/.env.example"
 fi
+_env_exports="$(env -i bash -c \
+  'set -a; source "$1" 2>/dev/null; env' _ "${_spike_env_file}")"
+while IFS= read -r _env_line; do
+  _env_name="${_env_line%%=*}"
+  # Skip empty lines and anything not a NAME=VALUE pair; never overwrite a
+  # name the caller already set (the whole point of D52).
+  if [[ -n "${_env_name}" && -z "${!_env_name+x}" ]]; then
+    printf -v "${_env_name}" '%s' "${_env_line#*=}"
+    export "${_env_name}"
+  fi
+done <<< "${_env_exports}"
+unset _spike_env_file _env_exports _env_line _env_name
 
 # Provide defaults for variables that .env.example may not set
 : "${RAY_BASE_TAG:=docker.io/rayproject/ray:2.57.0-py311-gpu}"
