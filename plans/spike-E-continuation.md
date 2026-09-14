@@ -1625,6 +1625,74 @@ on it**, and **~101s about a third of the time when a request is waiting** —
 cause unidentified, and **the two conditions have never been varied
 independently**.
 
+**9Y. HARNESS DEFECT (D52): `env.sh` silently overrides command-line variables.
+The eager run never happened — and no `SPIKE_*` knob documented in
+`.env.example` has ever been settable from the command line.**
+
+`SPIKE_STEP9_N=20 SPIKE_STEP9_PROBE=eager make step9` produced a run whose own
+banner reads **`Probe pattern: READY (default)`**. The discriminating experiment
+did not execute; this was a **third** `ready`-mode run.
+
+**Cause**, at [`env.sh:21-26`](../spike-e-ray-native/env.sh:21):
+```bash
+if [[ -f "${SPIKE_ROOT}/.env" ]]; then
+  set -a; source "${SPIKE_ROOT}/.env"; set +a
+else
+  set -a; source "${SPIKE_ROOT}/.env.example"; set +a
+fi
+```
+`set -a; source` **assigns unconditionally**, so a value in the file overwrites
+whatever the caller exported. D51 added `SPIKE_STEP9_PROBE=ready` to
+`.env.example` — and thereby made it unreachable. The `: "${VAR:=default}"`
+idiom a few lines below *does* respect the environment, but it covers only a
+handful of variables, none of them `SPIKE_STEP9_*`.
+
+**Broader than one knob.** The rule turns out to be: **a knob is overridable
+only if `.env.example` does NOT define it** — exactly backwards from what any
+reader would assume. Consequences for earlier runs:
+- `SPIKE_STEP5_MAX_ERRORS=2 make step5` (§9Q) — the override almost certainly
+  never applied. **Harmless in outcome**, since that run recorded 0 errors and
+  the tolerance was never consulted, but the ledger must not imply it was
+  exercised.
+- `SPIKE_STEP9_N=20` (§9X) — this *did* work, because `.env.example` does not
+  define `SPIKE_STEP9_N`. The run really was 20 cycles.
+
+**My error, not the subtask's.** I specified the knob as an environment variable
+and told the user to pass it on the command line without checking how
+[`env.sh`](../spike-e-ray-native/env.sh) loads configuration — in a harness
+whose wrapper scripts I had already read for other reasons. The subtask built
+what I asked and documented it in `.env.example`, which is precisely what made
+it unusable.
+
+**What did work, and it matters:** the D51 container-correlation fix is
+confirmed. Every cycle now reports a real timestamp — `container first seen:
+0.477`, `0.280`, `0.277` … — where 40/40 previously said `<none>`. The
+`localhost/`-prefix diagnosis was correct.
+
+**But the fix exposed a second problem in the same feature:** the matched
+containers are described as `created 5 days ago` with `Exited (1)` status on
+early cycles. The recency heuristic is matching **stale containers from previous
+runs**, not the cycle's own. So the correlation now returns *something* rather
+than nothing — which is an improvement in honesty but not yet a usable
+measurement. **It must not be used for attribution until it identifies the
+cycle's own container**, and Ray's `--name`-less launches
+([`image_uri.py`](/usr/local/lib/python3.11/site-packages/ray/_private/runtime_env/image_uri.py))
+mean that needs a better key than recency — probably the container's own
+creation time compared against the cycle's start.
+
+**Also confirmed, a third time:** 20 more `ready`-mode cycles, all 6.3-12.6s,
+with phases stable across now **50** measured cycles (scale RPCs 5-21ms,
+decision lag 5-15ms, materialize 0.77-0.97s, STARTING→RUNNING 5.0-11.6s). The
+step also now names its own limitation in the finding text — *"ready mode …
+does NOT reproduce step 5's request pattern; run with
+`SPIKE_STEP9_PROBE=eager`"* — which is exactly the instruction that could not be
+followed.
+
+**Fix required before the eager run:** make `env.sh` respect the caller's
+environment (assign sourced values only where the variable is unset), then
+re-run with eager. **Fifth silent-or-unfalsifiable harness defect** in this
+spike, and the second one that invalidated a run I had already reported on.
+
 ### Part C — host measurements
 
 No pytest. Each runs on the host, writes verbatim output to `results/raw/` and
