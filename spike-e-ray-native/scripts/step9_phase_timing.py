@@ -33,6 +33,29 @@ they sum to the total):
     starting_to_running   = p6 - p5
     serving               = p7 - p6
 
+Probe pattern (D51)
+-------------------
+Step 9's first two runs (§9V, §9X) got 0/20 slow cycles where step 5
+reproduces ~1/3 slow: the drivers differ, not the configs. Step 5
+POSTs immediately after the scale calls — the request arrives while
+the replica is still starting. Step 9's original pattern polled until
+RUNNING first, so its requests never did. ``SPIKE_STEP9_PROBE``
+selects:
+
+  ready  (default) poll until RUNNING, then POST. It does NOT
+         reproduce step 5's pattern; the default is kept so §9V/§9X
+         remain comparable.
+  eager           POST immediately after the scale calls, from a
+         background thread while the main loop keeps polling the
+         phases — step 5's pattern exactly. ``probe_sent_s`` and
+         ``probe_returned_s`` are recorded alongside p1-p7 (p7 is the
+         probe's return in both modes).
+
+If eager reproduces the slow mode, the slow-cycle detail section says
+whether the replica was RUNNING long before the probe returned (the
+excess is in the request path — tool-swap's actual use case) or the
+replica itself took ~100s.
+
 Container correlation (scripts/lib/podman.py shape)
 ----------------------------------------------------
 For each cycle the poller also records when the newest container
@@ -46,6 +69,15 @@ starts containers without --name, so per-cycle identity is by
 recency: the newest matching container is this cycle's (the
 incumbent's teardown removes its container, keeping the match set
 small).
+
+The poll parses BOTH JSON shapes podman emits across versions: one
+object per line (podman 4.x) and a single, possibly pretty-printed,
+JSON array (podman 3.x — the DGX host's 3.4.4). The original
+NDJSON-only parse dropped every line of the 3.x array silently and
+matched no container for any cycle (the §9V/§9X ``<none>``). A cycle
+that ends without a match now reports WHY (no rows vs
+rows-but-none-matched, with a sample of the images seen), and a
+podman that never succeeds is a harness failure for that cycle.
 
 Gaps this CANNOT see into (stated prominently in the report)
 ------------------------------------------------------------
@@ -126,6 +158,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -174,12 +207,25 @@ CYCLE_BUDGET_S = float(os.environ.get("SPIKE_STEP9_CYCLE_BUDGET_S", "180"))
 # Fast/slow split for the grouped report (between step 5's fast mode
 # ~6-10s and its slow mode ~99-104s).
 FAST_SLOW_SPLIT_S = float(os.environ.get("SPIKE_STEP9_FAST_SLOW_SPLIT_S", "30"))
+# Introspect threshold for the slow-cycle reading (D51): the probe
+# returned this far AFTER the replica was RUNNING. Fast-cycle poll
+# lag plus handling is ~1s; step 5's slow mode is ~90s behind, so 5s
+# cleanly separates "the probe tracked the replica" from "the
+# request path ate the excess".
+READY_LAG_THRESHOLD_S = 5.0
 # Introspect timeout per cycle (a slow cycle must still be able to
 # answer; step 5 used 120).
 PROBE_TIMEOUT_S = float(os.environ.get("SPIKE_STEP9_PROBE_TIMEOUT_S", "120"))
 # A slow group is only a slow group when at least this many cycles
 # fall above the split (fewer is noise, not a mode).
 MIN_SLOW_CYCLES = int(os.environ.get("SPIKE_STEP9_MIN_SLOW_CYCLES", "2"))
+# Probe pattern (D51): "ready" (default — poll until RUNNING, then
+# POST; step 9's original pattern, kept so §9V/§9X stay comparable)
+# or "eager" (POST immediately after the scale calls, from a
+# background thread, exactly step 5's request-arrives-during-swap
+# pattern; probe_sent_s/probe_returned_s are recorded alongside
+# p1-p7).
+PROBE_MODE = os.environ.get("SPIKE_STEP9_PROBE", "ready")
 
 # The serve_status / scale / probe / podman entry points. Module-level
 # names so a test can stub exactly these (the throwaway verification
@@ -192,26 +238,55 @@ probe_fn: Callable[..., dict] = post_introspect
 def _podman_ps_all_json() -> list[dict]:
     """`podman ps -a --format json` as a list of container dicts.
 
-    One line per container (podman 4.x) — the same shape the toolkit
-    parses in scripts/lib/podman.py, which is not used directly so a
-    test can stub the call site.
+    Both podman output shapes are parsed: one JSON object per line
+    (podman 4.x) and a single JSON array — pretty-printed across many
+    lines (podman 3.x, the DGX host's 3.4.4). The per-line-only parse
+    was the §9V/§9X defect: every line of a 3.x array is a fragment
+    (``[``, ``{``, ``"Id": ...``, ...), none is valid standalone JSON,
+    so every line was dropped and the snapshot silently became empty.
+    Non-JSON noise (warnings, re-exec lines) is skipped per line; a
+    podman failure still RAISES — the caller turns a persisting
+    failure into a loud, per-cycle reason (it must not be swallowed:
+    swallowing is how the previous defect went unnoticed for 40
+    cycles).
     """
     result = subprocess.run(
         ["podman", "ps", "-a", "--format", "json"],
         capture_output=True, text=True, timeout=10,
     )
+    raw = result.stdout.strip()
+    if not raw:
+        if result.returncode == 0:
+            return []  # no containers at all
+        raise RuntimeError(
+            f"podman ps exited {result.returncode} with no stdout: "
+            f"{(result.stderr or '').strip()[:300]}"
+        )
+    # Shape 1: the whole output is one JSON value (podman 3.x array).
+    # Pretty-printed across lines, so the per-line parse below would
+    # see only fragments.
+    if raw[0] in "[{":
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [c for c in parsed if isinstance(c, dict)]
+    # Shape 2: one JSON object per line (podman 4.x).
     containers: list[dict] = []
-    for line in result.stdout.strip().split("\n"):
+    for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
         try:
-            containers.append(json.loads(line))
+            value = json.loads(line)
         except json.JSONDecodeError:
             # A non-JSON line (a warning) must not break the poller;
             # the container snapshot is correlation evidence, and a
             # partial snapshot is still evidence.
             continue
+        if isinstance(value, dict):
+            containers.append(value)
     return containers
 
 
@@ -253,10 +328,26 @@ class Cycle:
         self.p7: float | None = None  # first successful introspect
         self.total: float | None = None
         self.error: str | None = None
+        # Probe pattern (D51): when the POST left for the proxy and
+        # when it returned (eager mode: sent right after the scale
+        # calls, while the replica is still starting; ready mode: sent
+        # at p6, so probe_sent_s ~= p6). p7 equals probe_returned_s on
+        # success in both modes; the pair is recorded so the slow-
+        # cycle detail can compare probe return against p6 directly.
+        self.probe_sent: float | None = None
+        self.probe_returned: float | None = None
         # Container correlation (challenger's image).
         self.container_first_seen: float | None = None
         self.container_created: str | None = None
         self.container_status: str | None = None
+        # Why the correlation matched nothing (None when a container
+        # WAS matched) — printed per cycle, never a bare <none>.
+        self.container_match_note: str | None = None
+        # Polls on which the podman snapshot succeeded / raised — a
+        # cycle with every snapshot failed gets a reason, not a <none>.
+        self.podman_snapshots_ok: int = 0
+        self.podman_snapshots_failed: int = 0
+        self.podman_last_error: str | None = None
         # Replica log / runtime_env setup harvest (filled post-cycle).
         self.replica_log_tail: str | None = None
         self.runtime_env_lines: str | None = None
@@ -301,21 +392,39 @@ class Cycle:
             value = getattr(self, name)
             if value is not None:
                 out[name + "_s"] = round(value, 3)
+        for name in ("probe_sent", "probe_returned"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name + "_s"] = round(value, 3)
+        out["probe_mode"] = PROBE_MODE
         if self.container_first_seen is not None:
             out["container_first_seen_s"] = \
                 round(self.container_first_seen, 3)
             out["container_created"] = self.container_created
             out["container_status"] = self.container_status
+        if self.container_match_note is not None:
+            out["container_match_note"] = self.container_match_note
         out.update(self.phases())
         if self.error:
             out["error"] = self.error
         return out
 
 
+def _container_images(containers: list[dict]) -> list[str]:
+    """The distinct Image values of a snapshot (for the match reason)."""
+    return sorted({str(c.get("Image", "")) for c in containers
+                   if c.get("Image")})
+
+
 def _newest_matching_container(
     containers: list[dict], image: str
 ) -> dict | None:
     """The newest container of *image* (by CreatedAt, then StartedAt).
+
+    The match is a substring on the Image field, which covers both the
+    config's short name (``tool_torch:spike``) and podman's
+    ``localhost/``-prefixed spelling (``localhost/tool_torch:spike`` —
+    how podman reports a locally-built, unqualified image).
 
     Ray's image_uri plugin starts containers WITHOUT a --name, so the
     only per-cycle identity is recency (see the module docstring).
@@ -330,6 +439,31 @@ def _newest_matching_container(
     )
 
 
+def _container_match_reason(
+    containers: list[dict], image: str
+) -> str:
+    """Why no container of *image* matched — stated, not left as <none>.
+
+    The §9V/§9X defect printed ``<none>`` on all 40 cycles and the step
+    reported on its own terms as though nothing was wrong. The reason
+    (no rows at all vs rows returned but none matching, with the
+    images actually seen) is what makes the absence diagnosable from
+    the report alone.
+    """
+    if not containers:
+        return (
+            "no container row returned by `podman ps -a --format json` "
+            "(or every row failed to parse as a container object)"
+        )
+    seen = _container_images(containers)
+    sample = ", ".join(seen[:5]) + (f" (+{len(seen) - 5} more)"
+                                    if len(seen) > 5 else "")
+    return (
+        f"{len(containers)} container row(s) returned but none's Image "
+        f"contains {image!r}; images seen: {sample or '<none>'}"
+    )
+
+
 def _dep_of(status: dict, app: str, dep: str) -> dict:
     """One deployment's details from a serve_status() payload (or {})."""
     apps = status.get("applications") or {}
@@ -338,6 +472,55 @@ def _dep_of(status: dict, app: str, dep: str) -> dict:
         return {}
     dep_obj = (app_obj.get("deployments") or {}).get(dep) or {}
     return dep_obj if isinstance(dep_obj, dict) else {}
+
+
+def _fold_eager_probe(
+    cycle: Cycle,
+    outcome: StepOutcome,
+    result: dict[str, Any],
+    t_cycle_start: float,
+    label: str,
+) -> None:
+    """Fold the finished eager probe into the cycle's boundaries.
+
+    The probe thread records the POST's own start/end (monotonic);
+    this converts them to cycle offsets and applies the same
+    error/identity handling the ready-mode inline probe has, so both
+    modes are judged by one standard.
+
+    Args:
+        cycle: The cycle to record the probe result into.
+        outcome: Collects harness failures and findings.
+        result: The thread's result dict: ``sent_at`` /
+            ``returned_at`` (monotonic seconds) plus ``resp`` (the
+            payload) or ``error`` (the raised exception).
+        t_cycle_start: time.monotonic() at t0.
+        label: The cycle label, for messages.
+    """
+    sent_at = result.get("sent_at")
+    if sent_at is not None:
+        cycle.probe_sent = sent_at - t_cycle_start
+    returned_at = result.get("returned_at")
+    if returned_at is not None:
+        cycle.probe_returned = returned_at - t_cycle_start
+    if "error" in result:
+        cycle.error = f"first introspect failed: {result['error']}"
+        outcome.harness(f"{label}: {cycle.error}")
+        return
+    if cycle.probe_returned is not None:
+        # p7 is "first successful introspect" in both modes; in eager
+        # mode it can PRECEDE p6 (the replica was observed RUNNING a
+        # poll later than the response actually arrived).
+        cycle.p7 = cycle.probe_returned
+        resp = result.get("resp") or {}
+        marker = str(resp.get("image_marker", ""))
+        if not marker.startswith(EXPECTED_MARKER[cycle.direction]):
+            outcome.finding(
+                f"Cycle {cycle.iteration}: probe answered with "
+                f"the wrong identity — image_marker={marker!r}, "
+                f"expected prefix "
+                f"{EXPECTED_MARKER[cycle.direction]!r}."
+            )
 
 
 def run_cycle(
@@ -356,6 +539,13 @@ def run_cycle(
         recorder: Records the raw per-cycle evidence.
         t_cycle_start: time.monotonic() at t0, so the caller keeps the
             clock (and a test can drive it).
+
+    Probe pattern (D51): in ``ready`` mode (default) the POST is sent
+    inline at p6, as before; in ``eager`` mode it is launched in a
+    background thread immediately after the scale calls (step 5's
+    pattern — the request reaches the proxy while the replica is
+    still being created) and folded in as ``probe_sent_s`` /
+    ``probe_returned_s`` when the thread finishes.
     """
     cycle.t0_wall = time.time()
     target = APPS[cycle.direction]
@@ -381,9 +571,36 @@ def run_cycle(
         outcome.harness(f"{label}: {cycle.error}")
         return
 
+    # D51, eager mode: the POST goes out IMMEDIATELY after the two
+    # scale calls — step 5's exact pattern — from a background thread,
+    # so the main loop keeps taking p3..p6 without blocking on the
+    # (potentially ~100s) response. The thread records the POST's own
+    # start/end (monotonic); only the main thread ever writes
+    # cycle.* fields, so the in-flight probe cannot perturb the phase
+    # polling (no shared HTTP, no shared counters, no locks).
+    probe_thread: threading.Thread | None = None
+    probe_result: dict[str, Any] = {}
+    if PROBE_MODE == "eager":
+        def _eager_probe() -> None:
+            probe_result["sent_at"] = time.monotonic()
+            try:
+                probe_result["resp"] = probe_fn(
+                    target["url"], timeout=PROBE_TIMEOUT_S
+                )
+            except Exception as e:
+                probe_result["error"] = e
+            finally:
+                probe_result["returned_at"] = time.monotonic()
+
+        probe_thread = threading.Thread(
+            target=_eager_probe, daemon=True
+        )
+        probe_thread.start()
+
     # Poll for p3..p7 within the per-cycle budget. Each boundary is
     # taken at the first poll at which its condition holds, so a
     # boundary is located to within POLL_S/2 (stated in the report).
+    last_snapshot: list[dict] = []
     deadline = t_cycle_start + CYCLE_BUDGET_S
     while time.monotonic() < deadline:
         try:
@@ -413,8 +630,13 @@ def run_cycle(
         # Container correlation: the newest matching container and,
         # on its first appearance, its CREATED and status at that
         # moment (the status is then tracked to its latest reading).
+        # A failed snapshot is COUNTED, not swallowed: a cycle that
+        # never matches must state why (the §9V/§9X defect was 40
+        # cycles of bare <none>, reported as though nothing was wrong).
         try:
-            newest = _newest_matching_container(podman_fn(), image)
+            last_snapshot = podman_fn()
+            cycle.podman_snapshots_ok += 1
+            newest = _newest_matching_container(last_snapshot, image)
             if newest is not None:
                 if cycle.container_first_seen is None:
                     cycle.container_first_seen = \
@@ -422,39 +644,86 @@ def run_cycle(
                     cycle.container_created = \
                         str(newest.get("CreatedAt", ""))
                 cycle.container_status = str(newest.get("Status", ""))
-        except Exception:
+        except Exception as e:
             # A failed podman snapshot must not break the cycle: it
-            # only loses the container correlation for this poll.
-            pass
+            # only loses the container correlation for this poll —
+            # but the failure is recorded so a persisting one is loud.
+            cycle.podman_snapshots_failed += 1
+            cycle.podman_last_error = str(e)[:300]
         if cycle.p6 is not None:
-            # p6 (RUNNING) is the last state boundary; only the probe
-            # (p7) remains — send it now (it also validates the
-            # answer's identity, as step 5 did).
-            try:
-                resp = probe_fn(target["url"], timeout=PROBE_TIMEOUT_S)
-                cycle.p7 = time.monotonic() - t_cycle_start
-                marker = str(resp.get("image_marker", ""))
-                if not marker.startswith(EXPECTED_MARKER[cycle.direction]):
-                    outcome.finding(
-                        f"Cycle {cycle.iteration}: probe answered with "
-                        f"the wrong identity — image_marker={marker!r}, "
-                        f"expected prefix "
-                        f"{EXPECTED_MARKER[cycle.direction]!r}."
-                    )
-            except Exception as e:
-                cycle.error = f"first introspect failed: {e}"
-                outcome.harness(f"{label}: {cycle.error}")
+            if PROBE_MODE == "eager":
+                # p6 (RUNNING) is the last state boundary; the in-
+                # flight probe (sent right after the scale calls)
+                # remains. Wait for it — its return is p7. A slow
+                # response blocks the main loop here, which is
+                # exactly what step 5's inline POST measured.
+                probe_thread.join()
+                _fold_eager_probe(
+                    cycle, outcome, probe_result, t_cycle_start, label
+                )
+            else:
+                # ready mode (default): the probe is sent only now,
+                # after RUNNING — it also validates the answer's
+                # identity, as step 5 did. This pattern does NOT
+                # reproduce step 5 (the request never arrives during
+                # the swap); it is the default so §9V/§9X stay
+                # comparable.
+                try:
+                    cycle.probe_sent = time.monotonic() - t_cycle_start
+                    resp = probe_fn(target["url"], timeout=PROBE_TIMEOUT_S)
+                    cycle.p7 = time.monotonic() - t_cycle_start
+                    cycle.probe_returned = cycle.p7
+                    marker = str(resp.get("image_marker", ""))
+                    if not marker.startswith(EXPECTED_MARKER[cycle.direction]):
+                        outcome.finding(
+                            f"Cycle {cycle.iteration}: probe answered "
+                            f"with the wrong identity — "
+                            f"image_marker={marker!r}, expected prefix "
+                            f"{EXPECTED_MARKER[cycle.direction]!r}."
+                        )
+                except Exception as e:
+                    cycle.error = f"first introspect failed: {e}"
+                    outcome.harness(f"{label}: {cycle.error}")
             break
         time.sleep(POLL_S)
     else:
-        # Budget exhausted without RUNNING: the phases cannot be
-        # resolved — harness failure for this cycle (D29).
+        # Budget exhausted without RUNNING. In eager mode the in-
+        # flight probe is still evidence — the proxy may answer even
+        # though the replica never reported RUNNING (which would
+        # itself be informative), so fold it in first.
+        if PROBE_MODE == "eager" and probe_thread is not None:
+            probe_thread.join()
+            _fold_eager_probe(
+                cycle, outcome, probe_result, t_cycle_start, label
+            )
+        # The phases cannot be resolved — harness failure for this
+        # cycle (D29).
         cycle.error = (
             f"replica never reached RUNNING within "
             f"{CYCLE_BUDGET_S:.0f}s (unresolved: "
             f"{', '.join(cycle.missing())})"
         )
         outcome.harness(f"{label}: {cycle.error}")
+
+    # A cycle that never matched a container now states WHY (no rows
+    # vs rows-but-none-matched, with the images seen) — never a bare
+    # <none> (the §9V/§9X defect).
+    if cycle.container_first_seen is None \
+            and cycle.container_match_note is None:
+        if cycle.podman_snapshots_ok == 0:
+            cycle.container_match_note = (
+                "no podman snapshot succeeded on this cycle "
+                f"({cycle.podman_snapshots_failed} poll(s) failed"
+                + (f": {cycle.podman_last_error}"
+                   if cycle.podman_last_error else "")
+                + ") — the correlation could not be made"
+            )
+        else:
+            cycle.container_match_note = _container_match_reason(
+                last_snapshot, image
+            )
+        print(f"      cycle {cycle.iteration} container first seen: "
+              f"<none> — {cycle.container_match_note}")
 
     if cycle.p7 is not None:
         cycle.total = cycle.p7
@@ -574,27 +843,102 @@ def _fmt(v: float | None) -> str:
 
 
 def _print_cycle_table(cycles: list[Cycle]) -> None:
-    """The per-cycle table: every boundary as an offset from t0."""
+    """The per-cycle table: every boundary as an offset from t0.
+
+    In eager mode the probe's own send/return are extra boundaries
+    (probe_sent_s / probe_returned_s): probe_sent_s sits just after
+    p2 while the replica is still starting, and probe_returned_s is
+    p7 — so the table shows whether the response lagged the replica.
+    """
     print("")
     print("=== Per-cycle boundaries (s offset from cycle start) ===")
+    probe_cols = (" "
+                  f"{'probe sent':>10} {'probe ret':>10}"
+                  if PROBE_MODE == "eager" else "")
     print(
         f"{'cyc':>3} {'dir':>5} | {'p1 rpc':>8} {'p2 rpc':>8} "
         f"{'p3 tgt=1':>9} {'p4 appear':>10} {'p5 START':>9} "
-        f"{'p6 RUN':>7} {'p7 http':>8} {'total':>8} | container first seen"
+        f"{'p6 RUN':>7} {'p7 http':>8} {'total':>8}{probe_cols} | "
+        "container first seen"
     )
     for c in cycles:
+        probe_vals = (
+            f" {_fmt(c.probe_sent)} {_fmt(c.probe_returned)}"
+            if PROBE_MODE == "eager" else ""
+        )
         print(
             f"{c.iteration:>3} {c.direction:>5} | {_fmt(c.p1)} {_fmt(c.p2)} "
             f"{_fmt(c.p3)} {_fmt(c.p4)} {_fmt(c.p5)} {_fmt(c.p6)} "
-            f"{_fmt(c.p7)} {_fmt(c.total)} | "
+            f"{_fmt(c.p7)} {_fmt(c.total)}{probe_vals} | "
             f"{_fmt(c.container_first_seen)}"
             + (f" (created {c.container_created})"
                if c.container_created else "")
         )
         if c.p4_state:
             print(f"      replica state at first appearance: {c.p4_state}")
+        if c.container_match_note:
+            # Never a bare <none>: the absence of a container match is
+            # reported with its reason (the §9V/§9X defect).
+            print(f"      container: {c.container_match_note}")
         if c.error:
             print(f"      ! {c.error}")
+
+
+def _print_slow_cycle_detail(cycles: list[Cycle]) -> None:
+    """Per slow cycle: replica-RUNNING time vs probe-return time.
+
+    This is the answer the experiment exists to make legible (D51):
+    for a slow cycle, was the replica RUNNING long before the probe
+    returned (the excess is in the request path, AFTER the replica
+    was ready — tool-swap's actual use case), or did the replica
+    itself take ~100s (the excess is in the replica lifecycle /
+    phase the attribution section names)?
+
+    Args:
+        cycles: All cycles; only the slow (total >= split) ones are
+            detailed.
+    """
+    slow = [
+        c for c in cycles
+        if c.total is not None and c.total >= FAST_SLOW_SPLIT_S
+    ]
+    if not slow:
+        return
+    print("")
+    print("=== SLOW-CYCLE DETAIL (replica readiness vs probe return) ===")
+    for c in slow:
+        if c.p6 is None or c.probe_returned is None:
+            print(f"  Cycle {c.iteration}: not resolvable "
+                  f"(p6={_fmt(c.p6)}, probe_returned="
+                  f"{_fmt(c.probe_returned)}).")
+            continue
+        lag = c.probe_returned - c.p6
+        print(f"  Cycle {c.iteration} ({c.direction}): total "
+              f"{c.total:.1f}s — replica RUNNING at p6={c.p6:.1f}s, "
+              f"probe returned at {c.probe_returned:.1f}s "
+              f"(lag {lag:.1f}s).")
+        if lag >= READY_LAG_THRESHOLD_S:
+            print(f"      -> The replica was RUNNING at ~{c.p6:.0f}s and "
+                  f"the probe returned at ~{c.probe_returned:.0f}s: the "
+                  f"~{lag:.0f}s excess is IN THE REQUEST PATH, AFTER "
+                  f"the replica was ready — a request arrived during "
+                  f"the swap and the response tracked something "
+                  f"other than the replica lifecycle. (In eager mode "
+                  f"probe_sent_s={_fmt(c.probe_sent)}: the POST left "
+                  f"for the proxy while the replica was still "
+                  f"starting.)")
+        else:
+            print(f"      -> The probe tracked the replica (returned "
+                  f"{lag:.1f}s after RUNNING, within poll/handler "
+                  f"noise): the excess is in the replica lifecycle / "
+                  f"an earlier phase — see the attribution section "
+                  f"for which one.")
+        record("step9", kind="slow-cycle-detail",
+               iteration=c.iteration, p6_s=round(c.p6, 3),
+               probe_returned_s=round(c.probe_returned, 3),
+               ready_lag_s=round(lag, 3),
+               probe_sent_s=(round(c.probe_sent, 3)
+                             if c.probe_sent is not None else None))
 
 
 def _print_grouped_summary(cycles: list[Cycle]) -> None:
@@ -731,6 +1075,17 @@ def run(recorder: Recorder) -> int:
     print("apps), instrumented with per-cycle phase boundaries at")
     print(f"{POLL_S}s polling. The autoscaler is NOT in the loop (D46) —")
     print("this step finds where the ~95s goes; it does not assume.")
+    if PROBE_MODE == "eager":
+        print("Probe pattern: EAGER — the POST goes out immediately")
+        print("after the scale calls (step 5's request-arrives-during-")
+        print("swap pattern, probe_sent_s/probe_returned_s recorded)")
+        print("— this mode REPRODUCES step 5's pattern.")
+    else:
+        print("Probe pattern: READY (default) — the POST is sent only")
+        print("after the replica reports RUNNING. NOTE: this does NOT")
+        print("reproduce step 5's pattern (the request never arrives")
+        print("during the swap); it is the default so the §9V/§9X")
+        print("runs stay comparable.")
 
     # Deploy the step 9 config (a deploy failure = harness, D29).
     deploy_ok = False
@@ -795,6 +1150,7 @@ def run(recorder: Recorder) -> int:
     _print_gaps_and_blind_spots()
     _print_cycle_table(cycles)
     _print_grouped_summary(cycles)
+    _print_slow_cycle_detail(cycles)
     completed = [c for c in cycles if c.total is not None]
 
     # ── Verdict (D29) ──────────────────────────────────────────
@@ -823,13 +1179,34 @@ def run(recorder: Recorder) -> int:
                   "not established this run. Attribution: "
                   f"{attribution or 'n/a (no fast/slow contrast)'}")
         else:
-            outcome.finding(
-                f"No cycle reached {FAST_SLOW_SPLIT_S:.0f}s this run "
-                f"(max total {max(c.total for c in completed):.1f}s) — "
-                "the step 5 slow mode did not reproduce, so no phase "
-                "carries an attribution; re-run before concluding the "
-                "~95s is gone."
-            )
+            if PROBE_MODE == "eager":
+                # The slow mode did not appear EVEN WITH step 5's
+                # request pattern: the difference is then the
+                # observation itself (phase polling perturbs the
+                # cycle) — which is itself the finding, and is said
+                # so instead of implying the ~95s is gone.
+                outcome.finding(
+                    f"No cycle reached {FAST_SLOW_SPLIT_S:.0f}s this "
+                    f"run (max total "
+                    f"{max(c.total for c in completed):.1f}s) EVEN IN "
+                    "EAGER mode — the probe pattern is now identical "
+                    "to step 5's, so the remaining difference is the "
+                    "phase POLLING itself: observation changes the "
+                    "outcome. That is a finding, not a harness "
+                    "failure; re-run with ready mode to confirm the "
+                    "contrast before drawing conclusions."
+                )
+            else:
+                outcome.finding(
+                    f"No cycle reached {FAST_SLOW_SPLIT_S:.0f}s this "
+                    f"run (max total "
+                    f"{max(c.total for c in completed):.1f}s) — "
+                    "the step 5 slow mode did not reproduce in ready "
+                    "mode (the default, which does NOT reproduce "
+                    "step 5's request pattern); run with "
+                    "SPIKE_STEP9_PROBE=eager before concluding the "
+                    "~95s is gone."
+                )
     _print_summary(outcome)
     return outcome.exit_code
 
