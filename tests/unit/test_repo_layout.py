@@ -7,6 +7,7 @@ that special files (``NATIVE.md``) are present.
 Tests are isolated — they discover the repo root from their own file location.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -64,8 +65,8 @@ TEST_DIRS: list[str] = [
 # Data — other directories
 # ---------------------------------------------------------------------------
 OTHER_DIRS: list[str] = [
-    "docker",
-    "docker/base",
+    "images",
+    "images/base",
     "templates/cpu",
     "templates/cuda",
     "templates/tensorflow",
@@ -220,4 +221,111 @@ def test_no_native_package_directory() -> None:
     path = SRC_ROOT / "tool_swap_runtime/backends/native"
     assert not path.exists(), (
         "native/ should not exist as a package directory in backends/"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M2a behaviour 1 — docker/ → images/ rename
+# ---------------------------------------------------------------------------
+
+# A ``docker/`` path reference in our own docs: a path separator directly
+# after ``docker``, not preceded by a word character or a dot (so that
+# ``docker run``, ``docker compose``, ``docker-compose`` and
+# ``.docker/config.json`` do not match).
+_STALE_DOCKER_PATH_RE = re.compile(r"(?<![\w.])docker/")
+
+_DOC_FILES: list[str] = [
+    "README.md",
+    "plan/08_REPO_LAYOUT.md",
+    "plan/07_CLI_AND_OPS.md",
+]
+
+
+def test_docker_directory_does_not_exist() -> None:
+    """There must be no ``docker/`` directory at the repository root.
+
+    A directory that was copied instead of moved would still shadow
+    ``import docker`` as an implicit namespace package, so its absence is
+    part of the layout contract (M2a behaviour 1).
+    """
+    path = ROOT / "docker"
+    assert not path.exists(), (
+        "docker/ must not exist at the repository root; it was renamed to "
+        "images/ in M2a behaviour 1"
+    )
+
+
+def test_import_docker_not_a_namespace_package() -> None:
+    """``import docker`` must never resolve to a repo-root namespace package.
+
+    Because ``pyproject.toml`` puts the repository root on ``sys.path``, a
+    directory named ``docker/`` at the root shadows the Docker SDK with an
+    implicit namespace package: the import *succeeds* and yields a module
+    with ``__file__ is None`` and ``__path__`` inside the repository. That
+    silent failure mode is the defect this test stands guard against.
+
+    Acceptable outcomes: ``ModuleNotFoundError`` (SDK not installed yet —
+    correct before M2a behaviour 2), or a real module with a ``__file__``
+    and a ``__version__`` (SDK installed).
+
+    Note: intentionally NOT marked ``docker`` — it needs no daemon, and
+    the marker would make pytest deselect it by default.
+    """
+    import sys
+
+    # Purge stale ``docker`` entries so a namespace package imported by
+    # another test cannot make this test pass spuriously.
+    saved: dict[str, object] = {}
+    for name in [
+        m for m in sys.modules if m == "docker" or m.startswith("docker.")
+    ]:
+        saved[name] = sys.modules.pop(name)
+    try:
+        try:
+            import docker  # noqa: F401
+        except ModuleNotFoundError:
+            return  # SDK not installed: expected outcome before M2a behaviour 2
+        module = sys.modules["docker"]
+        assert module.__file__ is not None, (
+            "import docker resolved to a namespace package (no __file__); "
+            "the repository root must not contain a docker/ directory"
+        )
+        assert hasattr(module, "__version__"), (
+            "import docker resolved to a module without __version__; "
+            "this is the namespace-package symptom, not the Docker SDK"
+        )
+        namespace_path = getattr(module, "__path__", None)
+        if namespace_path is not None:
+            for entry in namespace_path:
+                assert not str(entry).startswith(str(ROOT)), (
+                    f"import docker resolved with __path__ inside the "
+                    f"repository: {entry}"
+                )
+    finally:
+        for name in list(sys.modules):
+            if name == "docker" or name.startswith("docker."):
+                del sys.modules[name]
+        sys.modules.update(saved)
+
+
+def test_docs_have_no_stale_docker_dir_reference() -> None:
+    """README.md and the layout/ops plan docs must not reference our ``docker/``.
+
+    The repository's own ``docker/`` directory was renamed to ``images/``;
+    ``README.md``, ``plan/08_REPO_LAYOUT.md`` and ``plan/07_CLI_AND_OPS.md``
+    must not still point at the old path (e.g. ``docker/base``,
+    ``docker/router.Dockerfile``). Legitimate mentions of Docker — the
+    product name, ``docker run``, ``docker compose``, the SDK, or
+    ``.docker/config.json``-style dot-prefixed paths — must not match.
+    """
+    stale: list[str] = []
+    for rel in _DOC_FILES:
+        path = ROOT / rel
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for lineno, line in enumerate(lines, 1):
+            if _STALE_DOCKER_PATH_RE.search(line):
+                stale.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not stale, (
+        "Stale references to the repository's own docker/ directory:\n"
+        + "\n".join(stale)
     )
