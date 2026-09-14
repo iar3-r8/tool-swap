@@ -53,11 +53,45 @@ ray stop --force >> "${RAY_LOG}" 2>&1 || true
 sleep 2
 
 # ── Start head node ────────────────────────────────────────────
-echo "Starting head node (dashboard port ${RAY_DASH})..."
+# D31: the old hard-coded --num-gpus=0 is gone. In Ray 2.57 an
+# explicit 0 is NOT "auto-detect": auto-detection runs only when the
+# value is None, so --num-gpus=0 registered a raylet with zero GPUs,
+# permanently. Steps 3-6 deploy num_gpus: 1 actors and can never be
+# scheduled on a zero-GPU raylet, so the step 3 gate would exit 2
+# without ever testing GPU swap.
+#
+# We pin exactly 1 GPU (SPIKE_RAY_NUM_GPUS, default 1) for EVERY step
+# instead of auto-detecting all of the host's:
+#   - The host is shared; auto-detect would register all 8, and with
+#     several idle GPUs Ray may place tool_torch and tool_tf on
+#     DIFFERENT GPUs. The per-GPU VRAM checks would then pass on each
+#     tool's own GPU and the decisive gate would exit 0 without ever
+#     observing contention — a false pass that wrongly credits Ray.
+#   - A 1-GPU cluster makes contention structural: the second tool
+#     has nowhere else to go, so the gate tests exactly what Rule 2
+#     asks. Steps 1/2 are unaffected: num_gpus: 0 deployments request
+#     zero GPU units and are schedulable on any node regardless of
+#     the node's registered GPU count.
+# If the single GPU is unavailable (busy, MIG-partitioned), set
+# SPIKE_RAY_NUM_GPUS=0 deliberately and re-run only the steps that do
+# not need GPUs — never silently.
+RAY_NUM_GPUS="${SPIKE_RAY_NUM_GPUS:-1}"
+case "${RAY_NUM_GPUS}" in
+    ''|*[!0-9]*)
+        echo "ERROR: SPIKE_RAY_NUM_GPUS='${SPIKE_RAY_NUM_GPUS}' is not a" >&2
+        echo "       non-negative integer." >&2
+        exit 1
+        ;;
+esac
+echo "Starting head node (dashboard port ${RAY_DASH}, ${RAY_NUM_GPUS} GPU(s))..."
+# D20: Ray passes no --user for `image_uri` workers, so session sockets
+# must be world-writable; umask 0 here mirrors start_cluster.sh (full
+# rationale and the trusted-host trade-off are documented there).
+umask 0
 ray start --head \
     --dashboard-port="${RAY_DASH}" \
     --num-cpus="$(nproc 2>/dev/null || echo 2)" \
-    --num-gpus=0 \
+    --num-gpus="${RAY_NUM_GPUS}" \
     --disable-usage-stats \
     >> "${RAY_LOG}" 2>&1
 START_RC=$?

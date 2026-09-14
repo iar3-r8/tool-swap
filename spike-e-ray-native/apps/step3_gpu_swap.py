@@ -35,8 +35,9 @@ class ToolTorch(Tool):
         )
         super().__init__(weights_path=weights_path, vram_mb=4096)
 
-    async def __call__(self, request_data: dict) -> dict:
-        return await self.handle(request_data)
+    # No __call__ override: these deployments serve as ingresses, so the
+    # HTTP entrypoint comes from Tool.__call__, which handles both the
+    # Starlette-request and parsed-dict shapes.
 
 
 @serve.deployment(
@@ -57,10 +58,12 @@ class ToolTf(Tool):
         )
         super().__init__(weights_path=weights_path, vram_mb=4096)
 
-    async def __call__(self, request_data: dict) -> dict:
-        return await self.handle(request_data)
+    # No __call__ override: ingress entrypoint inherited from Tool.__call__.
 
 
 # ── Applications ───────────────────────────────────────────────
-application_torch = serve.Application(ToolTorch.bind())
-application_tf = serve.Application(ToolTf.bind())
+# .bind() already returns an Application; wrapping it again in
+# serve.Application() would fail (its __init__ takes one bound
+# deployment). Same double-wrap fixed in step2_builder.py.
+application_torch = ToolTorch.bind()
+application_tf = ToolTf.bind()

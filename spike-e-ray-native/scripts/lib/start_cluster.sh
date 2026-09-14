@@ -38,11 +38,74 @@ fi
 # We want ray running in the background so step scripts can
 # connect to it; the cluster-up target should only wait for
 # readiness and then return.
-echo "Starting Ray head node (dashboard port ${RAY_DASHBOARD_PORT})..."
+#
+# WHY umask 0 (D20):
+# Ray builds the `podman run` prefix for `runtime_env: {image_uri: ...}`
+# workers in image_uri.py (installed Ray 2.57.0,
+# ray/_private/runtime_env/image_uri.py, lines 76-96). It passes
+# `--userns=keep-id` but NO `--user` flag, and
+# ImageURIPlugin.modify_context (same file, ~line 174) hardcodes
+# `run_options=[]`, so `--user` cannot be injected through the
+# `image_uri` key. The worker therefore runs as the image's own
+# `USER ray` (uid 1000, mapped to a subuid via keep-id), NOT as the
+# host uid.
+#
+# Ray creates its unix sockets under /tmp/ray/session_*/sockets/ with
+# the default umask 0022 (permissions 0755, owned by the host uid)
+# and never chmods them. Connecting to a unix socket requires WRITE
+# permission, which 0755 grants only to the owner — so the container
+# worker gets EACCES and dies before it registers (raylet reports
+# "worker ... dead, probably crashed during start"; no per-worker
+# .err file is ever produced).
+#
+# Fix: run `ray start` under `umask 0` so every file the session
+# creates — in particular the raylet/gcs/plasma sockets — is 0777
+# and a worker running under a different uid can connect().
+#
+# SECURITY TRADE-OFF: while the cluster runs, ANY local user on this
+# host can connect to the raylet socket and submit tasks to the
+# cluster. This is accepted because the host is used by trusted users
+# only. Do NOT deploy this pattern on a shared or untrusted host.
+#
+# The umask is set in the script shell, so the backgrounded
+# `ray start` (and the daemons it forks) inherit it; no later
+# commands in this script create files, and other scripts do not
+# source this file, so nothing unrelated inherits the permissive
+# umask.
+# D31: the old hard-coded --num-gpus=0 is gone. In Ray 2.57 an explicit
+# 0 is NOT "auto-detect": auto-detection runs only when the value is
+# None, so --num-gpus=0 registered a raylet with zero GPUs,
+# permanently. Steps 3-6 deploy num_gpus: 1 actors and can never be
+# scheduled on a zero-GPU raylet, so the step 3 gate would exit 2
+# without ever testing GPU swap.
+#
+# We pin exactly 1 GPU (SPIKE_RAY_NUM_GPUS, default 1) for EVERY step
+# instead of auto-detecting all of the host's: with several idle GPUs
+# Ray may place tool_torch and tool_tf on DIFFERENT GPUs, and the
+# per-GPU VRAM checks would then pass without ever observing
+# contention — a false pass of the decisive gate. A 1-GPU cluster
+# makes contention structural. Steps 1/2 are unaffected: their
+# num_gpus: 0 deployments request zero GPU units and are schedulable
+# on a node regardless of its registered GPU count.
+#
+# If the single GPU is unavailable (busy, MIG-partitioned), set
+# SPIKE_RAY_NUM_GPUS=0 deliberately and re-run only the steps that do
+# not need GPUs — never silently. The resolved count is printed above
+# so the recorded log shows what the cluster actually had.
+RAY_NUM_GPUS="${SPIKE_RAY_NUM_GPUS:-1}"
+case "${RAY_NUM_GPUS}" in
+    ''|*[!0-9]*)
+        echo "ERROR: SPIKE_RAY_NUM_GPUS='${SPIKE_RAY_NUM_GPUS}' is not a" >&2
+        echo "       non-negative integer." >&2
+        exit 1
+        ;;
+esac
+echo "Starting Ray head node (dashboard port ${RAY_DASHBOARD_PORT}, ${RAY_NUM_GPUS} GPU(s))..."
+umask 0
 ray start --head \
     --dashboard-port="${RAY_DASHBOARD_PORT}" \
     --num-cpus="$(nproc 2>/dev/null || echo 2)" \
-    --num-gpus=0 \
+    --num-gpus="${RAY_NUM_GPUS}" \
     --no-redirect-output \
     --disable-usage-stats \
     &

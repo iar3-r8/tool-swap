@@ -1,33 +1,72 @@
 # Step 5 — Preemption via replica counts.
 #
 # MECHANISM A: External scaling API
-#   - external_scaler_enabled: true on each deployment
+#   - external_scaler_enabled: true on each application
 #   - NO autoscaling_config (mutual exclusion per Ray docs)
 #   - Scaled externally via POST /api/.../scale
 #   - Alpha feature
 #
 # deployment-level keys (num_replicas, ray_actor_options, etc.)
 # MUST be inside the deployments list.
+#
+# D34: the replicas must actually hold a GPU. The legacy `container`
+# runtime_env key (step3_gpu_swap_container.py) is used, NOT `image_uri`,
+# because `image_uri` hardcodes an empty run_options
+# (ray/_private/runtime_env/image_uri.py:174) and therefore cannot pass
+# the nvidia-container-runtime that injects the device nodes and driver
+# libraries on this host (ledger 9L). Through image_uri the same replicas
+# allocated zero VRAM while Ray reported the GPU reserved (step 3's
+# first two runs).
+#
+# D32: the container runtime_env MUST be repeated inside each
+# deployment's ray_actor_options below, exactly as for step 3. When a
+# config sets ray_actor_options it REPLACES the @serve.deployment
+# decorator's ray_actor_options wholesale (Ray performs no merge,
+# ray/serve/_private/application_state.py:1827-1833). Do not "tidy" it
+# away.
+#
+# D26: image names are written literally — no env-var placeholders
+# (serve_api._assert_no_unexpanded_placeholders rejects the
+# dollar-brace sequence anywhere in the rendered config, comments
+# included).
+#
+# `container` mutual exclusivity: it permits only `config` and
+# `env_vars` alongside it (ray/runtime_env/runtime_env.py:397-404).
+# Serve itself injects env_vars (deployment context vars,
+# ray/serve/_private/deployment_state.py:130-148), so the key set is
+# exactly {container, env_vars} and passes validation.
 
 applications:
   - name: step5_torch
-    import_path: step5_config:application_torch
+    import_path: step3_gpu_swap_container:application_torch
+    route_prefix: /tool_torch
     deployments:
       - name: ToolTorch
         num_replicas: 1
         ray_actor_options:
           num_gpus: 1
           runtime_env:
-            image_uri: "${SPIKE_IMAGE_TORCH_URI:tool_torch:spike}"
+            container:
+              image: "tool_torch:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
     external_scaler_enabled: true
 
   - name: step5_tf
-    import_path: step5_config:application_tf
+    import_path: step3_gpu_swap_container:application_tf
+    route_prefix: /tool_tf
     deployments:
       - name: ToolTf
         num_replicas: 1
         ray_actor_options:
           num_gpus: 1
           runtime_env:
-            image_uri: "${SPIKE_IMAGE_TF_URI:tool_tf:spike}"
+            container:
+              image: "tool_tf:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
     external_scaler_enabled: true

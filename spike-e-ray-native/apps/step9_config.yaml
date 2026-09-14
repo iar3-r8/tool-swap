@@ -1,0 +1,54 @@
+# Step 9 — Phase timing of the alternation cycle (D47).
+#
+# A COPY of apps/step5_config.yaml with the application names renamed
+# (step9_torch / step9_tf). Step 5's files are NOT modified — step 5's
+# result is recorded (ledger §9Q) and step 9 reuses its exact setup:
+# external_scaler_enabled: true, num_replicas: 1, no autoscaling_config,
+# the container-key runtime_env from D37, the same two apps.
+#
+# The renaming keeps step 9's deployments, replica logs
+# (replica_step9_*_ToolTorch_*.log) and containers distinguishable from
+# a leftover step 5 cluster if one is running on the same host.
+#
+# Deployment-level keys (num_replicas, ray_actor_options, etc.) MUST be
+# inside the deployments list (D32): the config's ray_actor_options
+# replaces the @serve.deployment decorator's wholesale.
+#
+# `container` mutual exclusivity: it permits only `config` and
+# `env_vars` alongside it; Serve injects env_vars itself, so the key
+# set is exactly {container, env_vars}.
+
+applications:
+  - name: step9_torch
+    import_path: step3_gpu_swap_container:application_torch
+    route_prefix: /tool_torch
+    deployments:
+      - name: ToolTorch
+        num_replicas: 1
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            container:
+              image: "tool_torch:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+    external_scaler_enabled: true
+
+  - name: step9_tf
+    import_path: step3_gpu_swap_container:application_tf
+    route_prefix: /tool_tf
+    deployments:
+      - name: ToolTf
+        num_replicas: 1
+        ray_actor_options:
+          num_gpus: 1
+          runtime_env:
+            container:
+              image: "tool_tf:spike"
+              run_options:
+                - "--runtime=/usr/bin/nvidia-container-runtime"
+                - "--env=NVIDIA_VISIBLE_DEVICES=0"
+                - "--env=NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+    external_scaler_enabled: true
