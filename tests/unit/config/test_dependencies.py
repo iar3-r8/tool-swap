@@ -1,6 +1,7 @@
-"""Tests for M1 behaviour 1 — dependencies are declared and importable.
+"""Tests for declared dependencies: M1 behaviour 1 and M2a behaviour 2.
 
-See ``plans/m1-configuration.md`` §1, behaviour 1.
+See ``plans/m1-configuration.md`` §1, behaviour 1, and
+``plans/m2a-container-backend-seam.md``, behaviour 2.
 
 Verified behaviours:
 
@@ -21,6 +22,18 @@ Verified behaviours:
   ``ModuleNotFoundError`` at import (the direct import tests above are
   the assertion for that — a shim would make them pass even when the
   library is genuinely missing).
+
+M2a behaviour 2 adds:
+
+- ``docker>=7.0`` is in ``[project] dependencies`` with an explicit
+  floor, and is re-declared in the ``dev`` extra (the self-sufficiency
+  rule above applies to it too).
+- ``types-docker`` is in the ``dev`` extra only — never a runtime
+  dependency.
+- ``src/tool_swap_runtime/pyproject.toml`` declares neither ``docker``
+  nor ``types-docker``.
+- The Docker SDK imports and exposes a non-empty ``__version__``
+  (re-proves behaviour 1's rename; importing contacts no daemon).
 
 Tests are isolated — they discover the repo root from their own file
 location and use only stdlib (``tomllib``) to parse the manifests.
@@ -49,6 +62,17 @@ IMPORT_NAMES = {
     "pyyaml": "yaml",
     "python-dotenv": "dotenv",
     "jsonschema": "jsonschema",
+}
+
+# M2a behaviour 2: the Docker SDK and its typing stubs.
+M2A_RUNTIME_DEPS = ["docker"]
+
+# Dev-only typing stubs for the Docker SDK (mypy strict).
+M2A_DEV_ONLY_STUBS = ["types-docker"]
+
+# Same distribution-name -> import-name convention as IMPORT_NAMES.
+M2A_IMPORT_NAMES = {
+    "docker": "docker",
 }
 
 # A requirement line starts with its project name:
@@ -94,6 +118,34 @@ def _declared_names(project_table: dict, section: str) -> set[str]:
             section, []
         )
     return {_requirement_name(req) for req in requirements}
+
+
+def _requirements_named(project_table: dict, section: str, name: str) -> list[str]:
+    """Return the raw requirements in *section* whose normalised name matches.
+
+    Unlike :func:`_declared_names` this keeps the full PEP 508 string so
+    a version floor can be asserted on it.
+    """
+    if section == "dependencies":
+        requirements = project_table.get("dependencies", [])
+    else:
+        requirements = project_table.get("optional-dependencies", {}).get(section, [])
+    return [req for req in requirements if _requirement_name(req) == name]
+
+
+def _requirement_specifier(requirement: str) -> str:
+    """Return the specifier part of a PEP 508 requirement, whitespace-stripped.
+
+    Unpinned requirements yield ``""``; a trailing environment marker is
+    dropped.
+    """
+    match = _REQ_NAME_RE.match(requirement.strip())
+    if match is None:
+        raise ValueError(f"Not a valid PEP 508 requirement: {requirement!r}")
+    spec = requirement.strip()[match.end() :].strip()
+    if ";" in spec:
+        spec = spec.split(";", 1)[0].strip()
+    return re.sub(r"\s+", "", spec)
 
 
 # ---------------------------------------------------------------------------
@@ -258,4 +310,120 @@ def test_no_import_error_shims_in_src() -> None:
     assert not offenders, (
         "Optional-degradation shims found (M1 behaviour 1 forbids "
         "catching ImportError for its dependencies):\n" + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. M2a behaviour 2 — the Docker SDK and its stubs are declared
+# ---------------------------------------------------------------------------
+
+
+def test_root_pyproject_declares_docker_with_version_floor() -> None:
+    """``[project] dependencies`` declares ``docker`` with a ``>=7.0`` floor.
+
+    M2a behaviour 2 requires the floor, not a bare name: an unpinned
+    ``docker`` would let a pre-7.0 SDK through, which is weaker than the
+    plan requires.
+    """
+    # Arrange:
+    table = _load_pyproject(ROOT_PYPROJECT)
+    requirements = _requirements_named(table["project"], "dependencies", "docker")
+    # Act / Assert:
+    assert requirements, (
+        "docker is not declared in [project] dependencies of "
+        f"{ROOT_PYPROJECT.name}; declared: "
+        f"{sorted(_declared_names(table['project'], 'dependencies'))}"
+    )
+    specs = [_requirement_specifier(req) for req in requirements]
+    assert any(">=7.0" in spec.split(",") for spec in specs), (
+        f"docker is declared without a >=7.0 floor: {requirements}; "
+        "M2a behaviour 2 requires docker>=7.0"
+    )
+
+
+def test_root_pyproject_declares_docker_in_dev_extra() -> None:
+    """The ``dev`` extra re-declares ``docker`` (self-sufficiency rule).
+
+    The M1 tests pin the same rule for their four runtime dependencies:
+    a bare dev install must work, so runtime dependencies are duplicated
+    into the ``dev`` extra (the ``typer`` precedent set in M0).
+    """
+    # Arrange:
+    table = _load_pyproject(ROOT_PYPROJECT)
+    requirements = _requirements_named(table["project"], "dev", "docker")
+    # Act / Assert:
+    assert requirements, (
+        "docker is missing from the 'dev' extra; the dev extra must be "
+        "self-sufficient (typer precedent from M0); declared: "
+        f"{sorted(_declared_names(table['project'], 'dev'))}"
+    )
+
+
+def test_root_pyproject_declares_types_docker_in_dev_extra_only() -> None:
+    """``types-docker`` is in the ``dev`` extra and not a runtime dependency.
+
+    The stubs exist for mypy strict; shipping them at runtime would be
+    wrong, so they must not appear in ``[project] dependencies``.
+    """
+    # Arrange:
+    table = _load_pyproject(ROOT_PYPROJECT)
+    declared_dev = _declared_names(table["project"], "dev")
+    declared_runtime = _declared_names(table["project"], "dependencies")
+    # Act / Assert:
+    assert "types-docker" in declared_dev, (
+        "types-docker is missing from the 'dev' extra; mypy strict cannot "
+        f"type the docker SDK without it. declared: {sorted(declared_dev)}"
+    )
+    assert "types-docker" not in declared_runtime, (
+        "types-docker must not be a runtime dependency, only a dev one."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. M2a behaviour 2 — the runtime distribution stays SDK-free
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dep", M2A_RUNTIME_DEPS + M2A_DEV_ONLY_STUBS)
+def test_runtime_pyproject_declares_no_m2a_dependencies(dep: str) -> None:
+    """tool-swap-runtime declares neither the Docker SDK nor its stubs.
+
+    The runtime distribution runs inside the container it manages and
+    must never depend on the container SDK; this is the same boundary
+    the M1 tests guard and it is load-bearing for the import-linter
+    contracts.
+    """
+    # Arrange:
+    table = _load_pyproject(RUNTIME_PYPROJECT)
+    declared = _declared_names(table["project"], "dependencies")
+    for extra in table["project"].get("optional-dependencies", {}):
+        declared |= _declared_names(table["project"], extra)
+    # Act / Assert:
+    assert _requirement_name(dep) not in declared, (
+        f"{dep} must not appear in tool-swap-runtime; declared: {sorted(declared)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. M2a behaviour 2 — the SDK imports with a usable __version__
+# ---------------------------------------------------------------------------
+
+
+def test_docker_sdk_imports_with_version() -> None:
+    """The Docker SDK imports and exposes a non-empty ``__version__``.
+
+    Importing the SDK contacts no daemon, so this test is deliberately
+    not marked ``docker``. It also re-proves M2a behaviour 1: a ``docker/``
+    directory at the repository root would shadow the SDK with an implicit
+    namespace package that has no ``__version__``.
+    """
+    # Arrange: nothing — the venv is the fixture (pip install -e ".[dev]").
+    # Act:
+    module = importlib.import_module(M2A_IMPORT_NAMES["docker"])
+    version = getattr(module, "__version__", None)
+    # Assert:
+    assert isinstance(version, str) and version.strip(), (
+        "docker.__version__ is missing or empty; if the module also lacks "
+        "__file__ this is a namespace-package shadow (M2a behaviour 1 "
+        "regression), not the Docker SDK"
     )
