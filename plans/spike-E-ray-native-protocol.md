@@ -1,6 +1,6 @@
 # Spike E — Ray-native tool-swap: protocol and pre-agreed decision rule
 
-> **Status:** specified, not run.
+> **Status:** specified; **run 2026-08-25 → 2026-09 (Spike E, host runs recorded in [`spike-E-continuation.md`](spike-E-continuation.md) §9a–§9Z)**, and the §5 decision rule consumed as written. Steps 8 and 9 were added to the harness after this protocol was frozen — they are diagnostic extensions of the step-5 question, graded against the same exit-code discipline (D29), not amendments to §3 or §5.
 > **Supersedes:** retired Spike D ([`plan/15_RAY_SERVE_EVALUATION.md`](../plan/15_RAY_SERVE_EVALUATION.md) §8). Spike D was retired because its decisive step tested soft unload, which [ADR-0004](../plan/adr/0004-hard-stop-only-in-v1.md) removed. **This spike tests something different and still live:** whether a Ray-native architecture can replace the router, given that the mount objection has been answered by S3 payloads (**D18**) and the app builder.
 > **Why it exists:** nine written objections to Ray have been raised and all nine have fallen ([`case-for-ray-native.md`](case-for-ray-native.md) §4). A tenth written argument has no better prior than the first nine. **This is the point where argument stops and measurement starts.**
 

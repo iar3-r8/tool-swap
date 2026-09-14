@@ -268,24 +268,24 @@ A request for tool B **displaces** an idle incumbent A immediately, subject only
 
 **The regression this prevents** is a tool that quietly marks itself broken whenever the DGX is busy and stays broken until a human notices.
 
-### D29 — Ray Serve is not the router; Ray inside a tool image is fine
+### D29 — Ray Serve is not the router for tool-swap's v1 single-host model-switching workload; Ray inside a tool image is fine
 
-> **Settled on maintainability grounds, with triggers.** Re-based 2026-08-13 after the requirement was restated as *"prioritise making the tool robust and easy to maintain"* and after [ADR-0004](adr/0004-hard-stop-only-in-v1.md) removed the one open question that could have reversed it.
+> **Settled on measured evidence, with triggers — the scope qualifier travels with the decision.** Re-based a third time, 2026-09-14, onto [Spike E](../spike-e-ray-native/README.md) (nine steps run on a GPU host). The 2026-08-13 maintainability re-basing stands as history inside the ADR; the spike demoted two of its three grounds (experimental-API status and version lockstep became costs, not refusals) rather than confirming them.
 
-**Full analysis:** [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) (**v3**). **Decision:** [ADR-0003](adr/0003-ray-serve-not-adopted.md).
+**Decision:** [ADR-0003](adr/0003-ray-serve-not-adopted.md) (re-based 2026-09-14). **Analysis of record:** [`plans/ray-adoption-analysis.md`](../plans/ray-adoption-analysis.md) (revision 3), which supersedes [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) v3 as the place to read the argument; the evidence of record is the run ledger [`plans/spike-E-continuation.md`](../plans/spike-E-continuation.md).
 
-**Three capability concessions stand permanently and are not re-argued:** `image_uri` gives each tool its own image (**D2 satisfiable on Ray**); `@serve.multiplexed` is off-the-shelf bounded LRU residency; and application-level autoscaling policies are a designed home for a scheduler. **None of these is the basis of the decision.**
+**The capability case ran against us, and it is recorded as such:** Ray **can** containerise each tool and host a scheduler policy — the spike measured real GPU displacement, 20/20 request-driven alternations with zero errors, and unattended replica recovery. The three capability concessions therefore stand and are not re-argued.
 
-**The basis is what we would have to keep running.** Adopting Ray means depending at once on `image_uri` (*experimental*, and its predecessor already deprecated), custom autoscaling policies (*experimental*), the external scaling API (*alpha*), a config mechanism driven at a cadence its docs warn against, and a per-deployment `image_uri` question **the documentation contradicts itself on**. Plus two facts that are not features: **every image locked to the cluster's exact Ray and Python patch version** — so a Ray bump is a coordinated rebuild of the whole zoo, where **D14**'s BentoML pin is upgraded per image — and *"if you aren't using KubeRay, when the Ray cluster fails, Ray Serve cannot recover"*, against guardrail 8's requirement that restart be cheap and stateless.
+**The basis is one measured failure on our core path:** with a request arriving *during* the swap — tool-swap's actual trigger — ~40% of cycles took ~100 s, located as dead time inside Ray *before* it issues `podman run`, against 3.9–6.9 s for plain podman. **The mechanism is deliberately unnamed** (five prior attributions were wrong), and that is stated on the face of the ADR, which names where to look next. It is **not** a verdict on Ray in general: where Ray *is* the right tool is in the analysis §0′.
 
-**What [ADR-0004](adr/0004-hard-stop-only-in-v1.md) changed:** the hinge was *can `reconfigure()` release VRAM, giving Ray an `IDLE_SOFT` equivalent*. **We no longer build `IDLE_SOFT`**, so **D9** and **D26** leave the scorecard and **Spike D is retired** rather than rescoped.
+**What [ADR-0004](adr/0004-hard-stop-only-in-v1.md) changed:** it removed the `reconfigure()`-releases-VRAM hinge, so **D9** and **D26** left the scorecard and **Spike D is retired** rather than rescoped.
 
 **Three roles, kept separate:**
-- **Router — refused**, on the grounds above.
+- **Router — refused for this workload**, on the measured ground above.
 - **In-container runtime (option C of D14) — refused on cost, reversible** behind the `RuntimeBackend` seam. Note `@serve.batch` is a **fixed-window** dispatcher, not adaptive like BentoML's — which mildly favours **D14**.
 - **Inside a tool's own image — permitted, and always was.** **We are not rejecting Ray; we decline to make it the boundary between tools.**
 
-**Revisit when** `image_uri` leaves experimental status **and** the version lockstep is relaxed (both, not either); when we adopt Kubernetes for other reasons, since KubeRay answers the recovery objection; when the zoo becomes homogeneous enough that **D2** stops being load-bearing; or when a second host is added. Full triggers in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §11.
+**Revisit when** the ~93 s pre-container stall is named and proves configurable, defective-and-fixed, or version-specific (the strongest and cheapest trigger); `image_uri` gains user-supplied `run_options`; the workload shape changes from model-switching to scaling; the zoo becomes homogeneous enough that **D2** stops being load-bearing; or a second host is budgeted — in which case the answer is Kubernetes-native serving, not Ray. Full ordered triggers in [ADR-0003](adr/0003-ray-serve-not-adopted.md) "Revisit when"; the pre-spike triggers in [`15_RAY_SERVE_EVALUATION.md`](15_RAY_SERVE_EVALUATION.md) §11 are withdrawn as recorded there.
 
 ---
 
@@ -363,7 +363,7 @@ For anyone returning to this document with an older copy, or wondering why a que
 | Model versioning / A-B? | **D23** — by tool name; aliases only at a real trigger |
 | GPU sharing beyond whole devices? | **D7** — whole devices only |
 | How do we detect that VRAM was really freed? | **Moot in v1** ([ADR-0004](adr/0004-hard-stop-only-in-v1.md)) — the container stops and the OS reclaims. `nvidia-smi` remains an ad-hoc diagnostic |
-| Are we reimplementing Ray Serve? | **D29** / [ADR-0003](adr/0003-ray-serve-not-adopted.md) — partly and knowingly. **Settled on maintainability**, not capability: three experimental-or-alpha APIs, a Ray/Python patch lockstep across every image, and a cluster that cannot recover without KubeRay. Spike D is **retired** |
+| Are we reimplementing Ray Serve? | **D29** / [ADR-0003](adr/0003-ray-serve-not-adopted.md) — partly and knowingly. **Spiked, measured, and settled on one measured failure on our core path** (the ~93 s pre-container stall on request-triggered swaps), with the scope qualifier: v1, single-host, model-switching. The capability case ran against us — Ray passed most of the protocol. Spike D is **retired**; entry point [`spike-e-ray-native/README.md`](../spike-e-ray-native/README.md) |
 | Is the plan itself too complex? | **[`16_COMPLEXITY_AUDIT.md`](16_COMPLEXITY_AUDIT.md)** — audited decision by decision. One elective feature removed (soft unload), two trims recommended, three things named as never-trim |
 
 ---

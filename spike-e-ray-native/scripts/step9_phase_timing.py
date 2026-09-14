@@ -379,6 +379,10 @@ class Cycle:
             "decision_lag_s": span(self.p2, self.p3),
             "replica_materialize_s": span(self.p3, self.p4),
             "starting_to_running_s": span(self.p5, self.p6),
+            # In eager mode p7 (probe return) can precede p6 (RUNNING
+            # observed at the next poll), so serving_s is undefined
+            # there and prints negative. Read it as "unresolvable in
+            # this mode", not a fast serving time (ledger §9Z).
             "serving_s": span(self.p6, self.p7),
         }
 

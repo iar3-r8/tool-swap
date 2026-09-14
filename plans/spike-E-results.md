@@ -5,7 +5,7 @@
 > Scope documented: **the whole branch** `feature/spike-e-continuation` (HEAD `7382e8e`; ledger and this file modified, uncommitted) — all seven steps.
 > Operator: Zoo (TDD pipeline) + user · Dates: 2026-08-14 (attempt, no data) → continuation runs 2026-08-25 → 2026-09 · This rewrite: 2026-09-10 (verdicts corrected per §9S/D44 the same day).
 >
-> This file is the single living results document the protocol designates (§4). The 2026-09-10 rewrite replaces the pre-run skeleton that previously occupied this file (every section of which read *pending host run*). The skeleton's two standing records — the scope amendment and the 2026-08-14 null result — are preserved verbatim in §10. Verbatim host logs live in gitignored `spike-e-ray-native/results/raw/`; the excerpts quoted here are as recorded in the ledger (Rule 0.3).
+> This file is the single living results document the protocol designates (§4). The 2026-09-10 rewrite replaces the pre-run skeleton that previously occupied this file (every section of which read *pending host run*). The skeleton's two standing records — the scope amendment and the 2026-08-14 null result — are preserved verbatim in §10. Verbatim host logs live in gitignored `spike-e-ray-native/results/raw/`; the excerpts quoted here are as recorded in the ledger (Rule 0.3). **Frozen at steps 1–7:** the later steps 8 (plain-podman baseline, D45) and 9 (phase timing, D47/D54) are recorded only in the ledger and are not reflected in this document's verdicts or decision section.
 
 ---
 
@@ -306,7 +306,9 @@ Also in the output: the podman store now holds **109 stopped containers** and 12
 
 Three things the step explicitly did **not** do, and says so instead of pretending: the **vfs-vs-overlay A/B** (requires temporarily switching the storage driver on a shared host — should be done on a disposable machine); the **`/tmp/ray` permission check** (described but never exercised — though D22 hit the *same class* of uid failure for real, so the concern is genuine and this version of it stays unverified); and a **real `--privileged` experiment**.
 
-**A correction to the manager's own framing, recorded rather than dropped:** step 7 was described to the user as a "plain podman baseline" to compare against Ray's latency. It is not, and **no such baseline exists in this spike**. How much of step 5's 103 s P90 is Ray's orchestration versus the cost of starting a 14–19 GB container is **not attributed**, and cannot be, from this data.
+**A correction to the manager's own framing, recorded rather than dropped:** step 7 was described to the user as a "plain podman baseline" to compare against Ray's latency. It is not, and **no such baseline exists in this spike**. How much of step 5's 103 s P90 is Ray's orchestration versus the cost of starting a 14–19 GB container is **not attributed, and cannot be, from this data.**
+
+> **Superseded 2026-09-14:** *true as of this 2026-09-10 rewrite.* **Step 8 (D45, ledger §9T) is that plain-podman baseline**, run afterwards: the ~95 s excess is attributed to Ray, not to container lifecycle (~15× on P90, with the comparison's limits stated in the ledger). The attribution lives in the ledger and the analysis, not in this document, which remains frozen at steps 1–7.
 
 ---
 
