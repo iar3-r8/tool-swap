@@ -6,8 +6,37 @@ Implementation plan for the backend seam of milestone M2, intake
 - **Branch:** `feature/m2a-container-backend-seam` (already created; a *feature* branch is
   correct — this is new capability, not a correction to shipped behaviour).
 - **Test command:** `make test` (runs `.venv/bin/python -m pytest`).
-- **Baseline on the branch tip:** 1112 passed, 2 skipped.
+- **Baseline when this plan was written:** 1112 passed, 2 skipped.
 - **Ledger:** 28 numbered behaviours, one red/green cycle each.
+
+---
+
+## 0. Delivery status — M2a lands in two pull requests
+
+**Behaviours 1–2 are done and land as a small prerequisite pull request**, on the branch
+named above. They contain no `src/` code at all: they unblock the SDK import, declare and
+install the dependency, and discharge §3's blocking documentation pre-condition. Suite at
+that branch tip: **1121 passed, 2 skipped**; `make lint` clean, mypy strict over 33 files.
+
+| Behaviour | Red | Green |
+|---|---|---|
+| 1 — `docker/` → `images/` rename | `f701861` | `a962a4e` |
+| 1 — guard corrected (see note) | `ecf3442` | — |
+| 2 — `docker>=7.0` + `types-docker` | `961d48d` | `515d9c6` |
+| §3 reference captured from source | — | `b80b74a` |
+| Documentation | — | `19f9267` |
+
+**Note on `ecf3442`.** Behaviour 1's guard test asserted that no `__path__` entry of the
+imported `docker` module started with the repository root. That was over-broad: `.venv/`
+lives *inside* the repository, so once behaviour 2 installed the SDK, its legitimate
+`site-packages/docker` path tripped the assertion. It now compares resolved paths against
+the four repository-anchored locations an errant import could resolve to, and was verified
+to still fail against a decoy root `docker/` package carrying its own `__version__` — the
+one shape where the `__file__` and `__version__` checks both pass and only the path guard
+catches the wrong module. **Narrowed, not weakened.**
+
+**Behaviours 3–28 continue on a fresh branch** as the seam proper. The ledger in §5 is
+unchanged and remains the loop state for that work.
 
 ---
 
@@ -24,8 +53,10 @@ plus both implementations behind it:
 - The label/name helpers those two share.
 - The `docker/` → `images/` rename that currently makes `import docker` resolve to the wrong
   thing (behaviour 1 — a hard blocker, see §2).
-- The `docker>=7.0` dependency, its type stubs, and the import-linter contract that keeps
-  `docker_backend.py` the only module importing the SDK.
+- The `docker>=7.0` dependency and its type stubs (behaviour 2), and — separately, as
+  **behaviour 27** — the import-linter contract that keeps `docker_backend.py` the only
+  module importing the SDK. Those are two different cycles: behaviour 2 declares the
+  dependency, and no contract exists until behaviour 27.
 
 ### Explicitly out of scope
 
