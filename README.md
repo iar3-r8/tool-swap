@@ -122,7 +122,7 @@ tool-swap/
 │           ├── __init__.py
 │           └── NATIVE.md       # Native backend specification (spec only, no code)
 │
-├── docker/                     # Dockerfiles (router base images)
+├── images/                     # Dockerfiles (router base images)
 │   └── base/                   # CPU and CUDA base images
 ├── templates/                  # Tool templates (cpu, cuda, tensorflow, function)
 ├── models/                     # Model zoo (gitignored, examples included)

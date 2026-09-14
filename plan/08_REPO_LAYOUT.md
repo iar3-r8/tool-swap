@@ -105,7 +105,7 @@ tool-swap/
 │           ├── bentoml_backend.py     # v1: builds the service, batched API, mounts our routes
 │           └── NATIVE.md              # the native backend: SPECIFICATION ONLY, no code in v1
 │
-├── docker/
+├── images/
 │   ├── router.Dockerfile
 │   └── base/
 │       ├── cpu-py312.Dockerfile
