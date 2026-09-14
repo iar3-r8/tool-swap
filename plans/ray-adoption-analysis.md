@@ -28,6 +28,79 @@
 
 ---
 
+## 0′. WHEN RAY *IS* THE RIGHT CHOICE — read before §11 (D55)
+
+The requester asked, fairly: *"In what actual case would Ray be useful (if we
+forget that weird 100s timer). Why would anyone use ray based on what you are
+mentioning, ray should never be used."*
+
+**If this document implies Ray should never be used, the document is wrong.**
+Ray is widely and successfully deployed. That reading is a defect in this
+document's framing — it prices Ray *for one workload* and never states the
+scope — not a finding. Correcting it here, before the recommendation, so the
+recommendation is read with the right scope.
+
+### 0′.1 What Ray did well in our own spike — measured, not borrowed **[M]**
+
+| step | result | what it establishes |
+|---|---|---|
+| 1 | **PASS** (§9h) | two GPU deployments in one cluster, correct isolation |
+| 2 | **PASS** (§9i) | per-tool container images via the `container` runtime_env |
+| 3 | **PASS** (§9N) | **real GPU displacement** — VRAM released and reclaimed, torch 4519 MiB ↔ tf 38909 MiB |
+| 4 | **PASS** (§9O) | payload and weights read from inside the container |
+| 5 | **PASS on reliability** (§9Q) | 20/20 alternations, **zero errors** |
+| 6 | **PASS** (§9P) | automatic replica-level recovery, new pid, unattended |
+
+That is a great deal of hard machinery working on a first serious attempt, on a
+GPU host, in containers, under a contrived hostile workload. **Our objection is
+latency on one specific path — not competence, and not architecture in general.**
+
+### 0′.2 Where Ray is the right tool, and it is a large space
+
+1. **Distributed training and tuning.** Ray Train/Tune are a mainstream answer
+   for multi-node hyperparameter search and data-parallel training. **We never
+   evaluated this and have no criticism of it.**
+2. **Serving a model too large for one host.** Tensor/pipeline-parallel
+   inference across GPUs on different machines. Writing that yourself is
+   genuinely hard; Ray hands it to you.
+3. **Heterogeneous pipelines.** preprocess → embed → rerank → generate as
+   separate deployments, independently scaled, with object-store hand-off
+   (payloads >100 KiB travel through plasma rather than by value, §9-era note).
+   Composing that by hand is real work.
+4. **Load-driven autoscaling of a stable model set.** Replicas of the *same*
+   deployment scaling with traffic — the case Serve's autoscaler was designed
+   for. **Our workload is the opposite shape.**
+5. **Batch inference over large datasets.** Ray Data across a cluster.
+6. **Teams already on Ray.** If training already runs on it, serving on it
+   removes an entire platform boundary. That is a sound reason by itself, and it
+   is not available to us.
+
+### 0′.3 Why it fits *us* badly is specific, not general
+
+Our workload is ~20 tools, **one replica each**, **mutually exclusive on the
+GPU**, swapped **on request arrival**. That is **model-switching, not scaling**.
+
+The mismatch is in Ray's own words
+([`architecture.md:77`](../plan/third-party-docs/ray-serve/architecture.md)):
+a request waits for *a replica of its own deployment* — **there is no path by
+which a queued request for tool B causes tool A to release a GPU.** So we must
+drive scaling externally, which means **reimplementing the eviction policy on
+top of the framework we adopted for its policy**. The ~93 s stall (§5.1.1) is
+then the cost of using the *replica-placement* path as a *swap* mechanism, which
+is not what it is for.
+
+### 0′.4 The honest one-line summary
+
+> **Ray is a distributed-compute framework that we would be using as a GPU
+> model-switcher. It is excellent at the former, and our evidence says it is a
+> poor fit for the latter.**
+
+Nothing in this document is advice against Ray generally. **§11 recommends
+against Ray *for tool-swap's v1 workload on a single host*, and that is the only
+claim the evidence supports.**
+
+---
+
 ## 0. Evidence classes, defined once
 
 Used throughout as a tag on every load-bearing claim.
