@@ -172,8 +172,9 @@ class ContainerBackend(Protocol):
     """The ONLY component that touches a container runtime.
 
     Declares the seam every lifecycle component is written against;
-    no implementation lives here — ``FakeBackend`` and ``DockerBackend``
-    are later milestones with their own modules.
+    no implementation lives here — ``FakeBackend`` (behaviours 10–13)
+    and ``DockerBackend`` (behaviours 14–27) are later branches of the
+    same milestone, each with its own module.
 
     Deliberate decisions, each pinned by the behaviour-8 tests:
 
@@ -188,7 +189,7 @@ class ContainerBackend(Protocol):
     - **``inspect`` returns ``ContainerStatus``**, never a raw SDK
       dict — the seam exists to contain SDK vocabulary, not leak it.
     - **``stop`` and ``logs`` take keyword-only arguments**:
-      ``stop(handle, timeout_s=30)`` reads unambiguously where a
+      ``stop(handle, timeout_s)`` reads unambiguously where a
       positional timeout invites confusion with a retry count.
 
     Not-found contract (plan §4.3), relied on by M2b's liveness sweep:

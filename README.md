@@ -6,6 +6,9 @@ A tool swapping router for managing AI agent tool contexts.
 
 See the full architecture overview in [plan/01_ARCHITECTURE.md](plan/01_ARCHITECTURE.md).
 The complete implementation plan is at [plan/README.md](plan/README.md).
+The container backend seam — the data types, the `ContainerBackend`
+protocol and the error taxonomy the lifecycle will be built on — is
+documented in [docs/backend-seam.md](docs/backend-seam.md).
 
 ## Distributions
 
@@ -131,7 +134,7 @@ tool-swap/
 │   ├── runtime/contract/       # Runtime contract tests
 │   ├── integration/            # Docker-based integration tests
 │   └── e2e/                    # End-to-end quickstart test
-├── docs/                       # User documentation (configuration guide, generated reference)
+├── docs/                       # User documentation (configuration guide, reference, backend seam)
 ├── deploy/                     # Deployment artifacts (systemd, prometheus, grafana)
 └── plan/                       # Implementation plans and architecture docs
 ```

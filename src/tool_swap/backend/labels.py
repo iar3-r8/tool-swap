@@ -118,7 +118,7 @@ def container_name(container_prefix: str, tool: str) -> str:
     of Docker's legal name charset, so every name this function
     accepts is one Docker accepts; it is deliberately *not* claimed
     to be Docker's own rule, which this repository has not verified
-    (plan behaviour 7, amendment 3).  No length limit is applied.
+    (plan behaviour 7's red-step rework).  No length limit is applied.
 
     Args:
         container_prefix: Resolved prefix, passed by the caller.
@@ -154,8 +154,9 @@ def label_selector(namespace: str) -> dict[str, str]:
     """The label map that selects our containers.
 
     A neutral one-entry map, not a docker filter: translating it
-    into a backend's own filter form is behaviour 14's job, pinned
-    against saved documentation (plan behaviour 7).  The key is the
+    into a backend's own filter form is behaviours 14–26's job,
+    pinned against the saved docker-py reference (plan behaviour 7).
+    The key is the
     managed-by key ``managed_labels`` emits for the same namespace,
     built by the same helper, so the two cannot drift apart.
 
