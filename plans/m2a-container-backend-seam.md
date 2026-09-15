@@ -48,7 +48,7 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 
 | Behaviour | Module | Red | Green |
 |---|---|---|---|
-| 3 — `parse_mount` | `backend/base.py` | — | — |
+| 3 — `MountSpec` + mount-parsing ownership boundary | `backend/base.py` | — | — |
 | 4 — `ContainerSpec` | `backend/base.py` | — | — |
 | 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | — | — |
 | 6 — `managed_labels` | `backend/labels.py` | — | — |
@@ -58,6 +58,14 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 
 Preparatory commit on this branch, outside the red/green cycle: `b1dd93c`, attaching the dev
 container to the `llm-network` bridge. It touches no `src/` or `tests/` file.
+
+**Behaviours 3, 4, 6 and 7 were amended after this table was first written**, when the
+shipped M1 code was re-read against them. Behaviour 3 was specifying a second mount-string
+parser next to M1's ([§4.2](#42-ownership-boundary--who-parses-a-mount-who-holds-a-mountspec)),
+and behaviours 4, 6 and 7 were re-stating built-in defaults that
+[`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:20) already owns. **No behaviour
+changed module** — the table above still holds — and all seven stay on this branch. The
+amended texts are in §5.
 
 **Behaviours 10–13** (`FakeBackend`) and **14–27** (`DockerBackend`, the import-linter
 contract) are the next two branches. Behaviour 28's documentation is split to match: each
@@ -182,28 +190,36 @@ The specific facts to pin:
 ```python
 @dataclass(frozen=True, slots=True)
 class MountSpec:
-    source: str
-    target: str
+    """One already-resolved bind mount. Holds no parsing (§4.2)."""
+    source: str                                 # resolved host path, as a string
+    target: str                                 # absolute container path
     read_only: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class ContainerSpec:
-    """Everything needed to start one tool container. Backend-agnostic."""
+    """Everything needed to start one tool container. Backend-agnostic.
+
+    Fully resolved input: `gpu_runtime` and `container_port` are supplied by
+    the resolver, never defaulted here (behaviour 4). They are keyword-only
+    and required, so a caller cannot silently omit them — a dataclass cannot
+    place a non-default field after a defaulted one, and `kw_only` is how the
+    required-ness is kept without reordering the readable field list.
+    """
     tool: str                                   # logical tool name (label value)
     name: str                                   # final container name, prefix applied
     image: str
+    gpu_runtime: str = field(kw_only=True)      # resolved; NO literal default
+    container_port: int = field(kw_only=True)   # resolved; NO literal default
     command: tuple[str, ...] | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
     network: str | None = None
     mounts: tuple[MountSpec, ...] = ()
     devices: tuple[int, ...] = ()               # GPU indices; () is CPU-only
-    gpu_runtime: str = "nvidia"
-    shm_size: str | None = None                 # "1g"
+    shm_size: str | None = None                 # e.g. "1g", resolved from config
     cpus: float | None = None
-    memory: str | None = None                   # "16g"
-    container_port: int = 8000
+    memory: str | None = None                   # e.g. "16g"
     published_port: int | None = None           # expose_host_port; None publishes nothing
 
 
@@ -256,13 +272,65 @@ Design notes, each with its reason:
   `READY` are readiness concepts owned by M2b's probe; the backend only knows whether a
   process exists.
 - **`ContainerSpec` carries no policy** — no TTL, no group, no eviction. It is fully resolved
-  input, consistent with `BackendConfig` and `DefaultsConfig` in
-  [`src/tool_swap/config/schema.py`](../src/tool_swap/config/schema.py:95) (`network`,
-  `container_prefix`, `label_namespace`, `gpu_runtime`, `shm_size`, `cpus`, `memory`,
-  `devices`, `env`, `mounts`, `expose_host_port`). Building a spec *from* config is M2b/M3's
-  wiring, not M2a's.
+  input, consistent with the two config blocks that feed it. **They are two blocks, not one,
+  and an earlier draft of this note conflated them.**
+  [`BackendConfig`](../src/tool_swap/config/schema.py:95) holds exactly `type`, `network`,
+  `container_prefix`, `label_namespace`, `gpu_runtime`, `orphans`, `port_range` and
+  `registry_prefix` — router-wide runtime knobs. The per-tool fields (`shm_size`, `cpus`,
+  `memory`, `devices`, `env`, `mounts`, `container_port`, `expose_host_port`) are
+  [`DefaultsConfig`](../src/tool_swap/config/schema.py:150)/tool-level, not backend-level.
+  A `ContainerSpec` is therefore assembled from **both**, which is one more reason the
+  config → spec builder is a named behaviour with an owner (§6 item 7) rather than an
+  incidental constructor call.
+- **No field default in `ContainerSpec` re-states a configured default.**
+  [`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:20) declares itself the single
+  named source of truth for every built-in default, and it already carries
+  `gpu_runtime="nvidia"` ([`defaults.py`](../src/tool_swap/config/defaults.py:74)),
+  `container_port=8000` ([`defaults.py`](../src/tool_swap/config/defaults.py:54)) and
+  `shm_size="1g"` ([`defaults.py`](../src/tool_swap/config/defaults.py:35)). The §4.1 code
+  block above shows `gpu_runtime: str = "nvidia"` and `container_port: int = 8000` for
+  readability; **behaviour 4 does not ship those literals.** See behaviour 4 for the
+  resolution: the spec's own defaults are structural only (`None`, `()`, empty mapping), and
+  every configured value arrives from the resolver. A second copy of a default is a value
+  that can drift without any test noticing, since both copies would be self-consistent.
 
-### 4.2 Error taxonomy — `src/tool_swap/backend/errors.py`
+### 4.2 Ownership boundary — who parses a mount, who holds a `MountSpec`
+
+Stated once, explicitly, so a later reader cannot reintroduce the duplication that behaviour 3
+was amended to remove. The rule is three sentences:
+
+1. **`tool_swap.config` parses the authored mount string, and owns every judgement about it.**
+   [`parse_mount`](../src/tool_swap/config/validate.py:2488) is the repository's only
+   mount-string parser. It splits on `":"`, expands a leading `~`, resolves the host
+   **lexically** against the config file's directory, keeps the mode **as authored**, and
+   returns `None` for an unparseable entry. Mode legality (`TSWAP-C541`), container-path
+   absoluteness (`TSWAP-C542`) and host-path existence (`TSWAP-C543`) are its rules, and
+   unparseability is `TSWAP-C540`. That contract is pinned in depth by
+   [`tests/unit/config/test_validate_mounts.py`](../tests/unit/config/test_validate_mounts.py),
+   1331 lines of it, and by `config show`'s renderer
+   ([`config_show.py`](../src/tool_swap/cli/config_show.py:610), which imports the parser
+   rather than re-deriving it).
+2. **`tool_swap.backend` holds `MountSpec`, and knows nothing about strings.** `MountSpec`
+   carries an already-resolved `source`, an already-checked `target` and a normalised
+   `read_only` bool. No module under `src/tool_swap/backend/` may split a mount string;
+   behaviour 3's guard test enforces it.
+3. **The conversion happens exactly once, in the config → spec builder** — `ParsedMount` in,
+   `MountSpec` out, with `read_only` derived from `ParsedMount.mode`. That builder is **not
+   M2a's**: it is §6 item 7, owned by M2b or M3, and it is where the `mode → read_only`
+   mapping (and the decision about a mode that is neither `ro` nor `rw`, reachable only if
+   validation was bypassed) must be specified. **M2a deliberately ships no converter**, so
+   there is no place for a second normalisation to hide.
+
+Why the boundary falls here rather than at an adapter in `backend/base.py`: `.importlinter`
+contract 3 ("The config layer is a leaf", [`.importlinter`](../.importlinter:18)) forbids
+`tool_swap.config` from importing `tool_swap.backend` but **not** the reverse, so a
+`backend → config` import is structurally legal today. It is still avoided: `validate.py` is
+3551 lines carrying the whole rule engine, and importing `ParsedMount` from it would pull that
+engine into the backend's import graph for one five-field dataclass. Deferring the conversion
+to the builder that needs both sides costs nothing on this branch — nothing in behaviours 3–9
+consumes a `ParsedMount` — and keeps `backend/` importable with the config layer untouched.
+
+### 4.3 Error taxonomy — `src/tool_swap/backend/errors.py`
 
 Every member carries a human `message` and an actionable `remedy`, so
 [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md:444) §11's "error string surfaced in
@@ -284,7 +352,7 @@ This is the contract test 3 of
 [`plans/m2-docker-testing-recommendation.md`](m2-docker-testing-recommendation.md:102) exists
 to confirm against a real daemon later.
 
-### 4.3 `FakeBackend` scriptable failures
+### 4.4 `FakeBackend` scriptable failures
 
 ```python
 class FailureMode(StrEnum):
@@ -304,7 +372,7 @@ drives it concurrently.
 "Never ready" is **not** a `FakeBackend` mode — readiness is the probe's concern, and the
 probe is M2b's.
 
-### 4.4 `DockerBackend` client injection
+### 4.5 `DockerBackend` client injection
 
 ```python
 class DockerBackend:
@@ -357,27 +425,75 @@ files, and how it is verified with no Docker daemon.
   test asserts `docker.__version__` is a non-empty string — which also re-proves behaviour 1.
   Importing the SDK contacts no daemon.
 
-### 3. `parse_mount` — pure mount-string parser
+### 3. `MountSpec` dataclass, and the mount-parsing ownership boundary
 
-- **Inputs:** `"host:container"`, `"host:container:ro"`, `"host:container:rw"`, as authored in
-  `defaults.mounts` / `tools.<name>.mounts`.
-- **Outputs:** a `MountSpec`; two-part form defaults to `read_only=True`
+**Amended.** This behaviour originally specified a `parse_mount(string) -> MountSpec` in
+`backend/base.py`. **M1 already shipped a `parse_mount`**, at
+[`src/tool_swap/config/validate.py`](../src/tool_swap/config/validate.py:2488), returning a
+[`ParsedMount`](../src/tool_swap/config/validate.py:2435). The two contracts disagreed on the
+signature, on malformed input (`None` feeding `TSWAP-C540` vs `ValueError`), on the mode
+(kept **as authored** so `TSWAP-C541` can reject `"RO"` vs normalised to a `read_only` bool)
+and on the host path (leading `~` expanded then resolved lexically against the config file's
+directory vs untouched). Shipping the original text would have put a second, subtly different
+mount parser in the repository; the mode divergence is the dangerous one, because two parsers
+disagreeing about whether `"RO"` is valid is how an author's intended `ro` becomes a
+read-write mount. **This behaviour therefore delivers no parser.** It delivers the dataclass
+the branch actually needs, plus the executable guard that keeps the duplication from coming
+back. See §4.2 for the boundary itself.
+
+- **Inputs:** keyword construction of `MountSpec` — `source`, `target`, `read_only`.
+- **Outputs:** the frozen, slotted `MountSpec` of §4.1, with `read_only` defaulting to `True`
   ([`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md:432) §10: "read-only by default").
-- **Edge cases:** an absolute Windows-style path containing `:`; a trailing `:`; an empty
-  string; an unknown mode.
-- **Error behaviour:** raises `ValueError` naming the offending string and the accepted forms.
+  `source` and `target` are **already-resolved** strings: `MountSpec` performs no expansion,
+  no resolution and no parsing. It is needed on this branch because `ContainerSpec.mounts` is
+  a `tuple[MountSpec, ...]` (behaviour 4) and behaviour 15 consumes them on a later branch.
+- **Edge cases:** the default is the read-only one, so a `MountSpec` constructed with
+  `source`/`target` only is read-only — a caller must ask for read-write explicitly; two
+  instances with equal fields are equal and hash equal; instances are hashable (M2b keys by
+  spec fields).
+- **Error behaviour:** assignment raises `FrozenInstanceError`. `MountSpec` validates
+  nothing else — mode legality is `TSWAP-C541`'s, container-path absoluteness is
+  `TSWAP-C542`'s, and host-path existence is `TSWAP-C543`'s. A second layer of the same
+  judgement here is exactly the duplication this amendment removes.
 - **Files:** `src/tool_swap/backend/base.py`.
-- **Verified:** table-driven unit test. Pure function.
+- **Verified:** construction / default / immutability / equality test — pure data, no daemon.
+  **Plus the boundary guard**, which is the load-bearing half of this behaviour: a test
+  asserting that no module under `src/tool_swap/backend/` defines a callable named
+  `parse_mount` and that none contains mount-string splitting, so the repository's only
+  mount-string parser stays config's. It is a source/AST-level test over the package
+  directory, so it also fails for a module a later branch adds. Pure; no daemon.
 
 ### 4. `ContainerSpec` dataclass
 
-- **Inputs:** keyword construction.
-- **Outputs:** a frozen, slotted instance; documented defaults (`devices=()`,
-  `gpu_runtime="nvidia"`, `container_port=8000`, `published_port=None`).
-- **Edge cases:** mutable defaults must not be shared between instances.
-- **Error behaviour:** assignment raises `FrozenInstanceError`.
+**Amended: no configured default is re-stated here.** `gpu_runtime`, `container_port` and
+`shm_size` all already have built-in defaults in
+[`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:20) — `"nvidia"`, `8000`, `"1g"` —
+and that constant declares itself the single named source of truth for them. A `ContainerSpec`
+is **fully resolved input**: every configured value arrives from the resolver, so the spec's
+own field defaults are **structural only**.
+
+- **Inputs:** keyword construction. `tool`, `name`, `image`, `gpu_runtime` and
+  `container_port` are required; every other field defaults.
+- **Outputs:** a frozen, slotted instance whose defaults are structural —
+  `command=None`, `env={}`, `labels={}`, `network=None`, `mounts=()`, `devices=()`,
+  `shm_size=None`, `cpus=None`, `memory=None`, `published_port=None`. **`gpu_runtime` and
+  `container_port` carry no default at all**: they are keyword-only required fields, so
+  omitting either is a `TypeError` at construction rather than a silent `"nvidia"` / `8000`.
+  (Keyword-only is a mechanical necessity, not a style choice — a dataclass cannot place a
+  non-default field after a defaulted one, and the alternative was reordering the field list
+  around it.)
+- **Edge cases:** mutable defaults must not be shared between instances; `mounts` is a tuple
+  of `MountSpec` (behaviour 3), never of strings; `gpu_runtime`/`container_port` cannot be
+  passed positionally.
+- **Error behaviour:** assignment raises `FrozenInstanceError`; omitting `gpu_runtime` or
+  `container_port` raises `TypeError`.
 - **Files:** `src/tool_swap/backend/base.py`.
-- **Verified:** construction + immutability test. Pure data.
+- **Verified:** construction + immutability test, **plus a no-duplicate-default test**: for
+  each of `gpu_runtime`, `container_port` and `shm_size`, the test asserts the
+  `ContainerSpec` field has no default equal to the corresponding `BUILT_IN_DEFAULTS` value —
+  so a literal copied back in later fails a test rather than drifting silently. The test
+  reads `BUILT_IN_DEFAULTS` (a `tool_swap.config` import from a **test**, which no
+  `.importlinter` contract governs) rather than restating the values. Pure data.
 
 ### 5. `ContainerHandle`, `ContainerState`, `ContainerStatus`
 
@@ -392,31 +508,64 @@ files, and how it is verified with no Docker daemon.
 
 ### 6. `managed_labels` — the label set
 
-- **Inputs:** `namespace` (default `"com.tool-swap"` from
-  [`BackendConfig.label_namespace`](../src/tool_swap/config/schema.py:117)), tool name,
-  optional group, optional config hash.
+**Amended on two points.** First, `namespace` is a **required argument with no default** —
+`"com.tool-swap"` is already
+[`BUILT_IN_DEFAULTS["label_namespace"]`](../src/tool_swap/config/defaults.py:73) and
+[`BackendConfig.label_namespace`](../src/tool_swap/config/schema.py:117), and a third copy in
+`labels.py` could drift from both while every copy stayed self-consistent. The caller passes
+the resolved namespace; defaulting is config's job. Second, the original text omitted
+`runtime-version`, which the naming table of
+[`plan/08_REPO_LAYOUT.md`](../plan/08_REPO_LAYOUT.md:186) lists in the namespace
+(`model`, `group`, `managed-by`, `runtime-version`, `config-hash`).
+
+- **Inputs:** `namespace` (**required**, no default), tool name, optional group, optional
+  config hash, optional runtime version.
 - **Outputs:** an exact dict — `{ns}.model`, `{ns}.managed-by`, `{ns}.group`,
-  `{ns}.config-hash`, per the naming table of
-  [`plan/08_REPO_LAYOUT.md`](../plan/08_REPO_LAYOUT.md:185).
-- **Edge cases:** a custom namespace; omitted group / config hash omit their keys rather than
-  emitting empty values (an empty label value is a silent reconciliation mismatch).
-- **Error behaviour:** empty namespace or empty tool name raises `ValueError`.
+  `{ns}.config-hash`, `{ns}.runtime-version`, per the naming table of
+  [`plan/08_REPO_LAYOUT.md`](../plan/08_REPO_LAYOUT.md:186).
+- **Edge cases:** a custom namespace; omitted group / config hash / runtime version omit
+  their keys rather than emitting empty values (an empty label value is a silent
+  reconciliation mismatch). **No `config-hash` value is computed here** — nothing in the
+  repository computes one yet (searched: no `config_hash`, `sha256` or `hashlib` under
+  `src/tool_swap/`), so this behaviour stamps a hash it is given and the hash function is a
+  later milestone's.
+- **Error behaviour:** empty namespace or empty tool name raises `ValueError`. There is no
+  default namespace to fall back on, so an omitted one is a `TypeError` from Python itself.
 - **Files:** `src/tool_swap/backend/labels.py`.
-- **Verified:** exact-dict snapshot test. Pure function.
+- **Verified:** exact-dict snapshot test, plus a test asserting `labels.py` contains no
+  `"com.tool-swap"` literal. Pure function.
 
 ### 7. `container_name` and `label_selector`
 
-- **Inputs:** `container_prefix` (default `"ms-"`,
-  [`BackendConfig.container_prefix`](../src/tool_swap/config/schema.py:110)) + tool name;
-  and `namespace` for the selector.
-- **Outputs:** `"ms-cxr_to_embedding"`; a selector value matching `managed_labels`' managed-by
-  key so `list_managed` and `managed_labels` cannot drift.
-- **Edge cases:** a tool name with characters illegal in a container name; a very long name;
-  an empty prefix.
-- **Error behaviour:** an unusable name raises `ValueError` naming the tool and the rule.
+**Amended on two points.** First, `container_prefix` is a **required argument with no
+default**, for the same reason as behaviour 6's namespace:
+[`BUILT_IN_DEFAULTS["container_prefix"]`](../src/tool_swap/config/defaults.py:72) and
+[`BackendConfig.container_prefix`](../src/tool_swap/config/schema.py:110) already hold
+`"ms-"`. Second, the original edge case had the hazard on the wrong side. **A tool name with
+characters illegal in a container name is effectively unreachable**:
+[`TSWAP-C210`](../src/tool_swap/config/validate.py:310) already pins every tool name to
+`^[a-z0-9][a-z0-9_-]*$`, a strict subset of Docker's legal name charset, and
+[`TSWAP-C211`](../src/tool_swap/config/validate.py:700) rejects duplicates. **The
+unvalidated input is `container_prefix`** — no config rule checks it, so an authored
+`container_prefix: "_x"` or `"My Prefix"` reaches this function unjudged and is the only way
+the concatenation can produce an illegal name.
+
+- **Inputs:** `container_prefix` (**required**, no default) + tool name; and `namespace`
+  (**required**, no default) for the selector.
+- **Outputs:** `"ms-cxr_to_embedding"` for prefix `"ms-"` and tool `cxr_to_embedding`; a
+  selector value matching `managed_labels`' managed-by key so `list_managed` and
+  `managed_labels` cannot drift.
+- **Edge cases:** an empty prefix is **legal** and yields the bare tool name; a prefix with
+  characters illegal in a container name, or one starting with a character Docker forbids
+  first, is the real failure path; a concatenation exceeding Docker's name length limit. A
+  tool name that breaks `^[a-z0-9][a-z0-9_-]*$` is still rejected defensively — this function
+  must not assume its caller ran validation — but the test notes it is `TSWAP-C210`'s
+  primary responsibility, not a second gate.
+- **Error behaviour:** an unusable name raises `ValueError` naming the **prefix**, the tool
+  and the rule, so the message points at the unvalidated input rather than the validated one.
 - **Files:** `src/tool_swap/backend/labels.py`.
 - **Verified:** table test; a test asserting the selector key is exactly the key behaviour 6
-  emits. Pure functions.
+  emits; a test asserting `labels.py` contains no `"ms-"` literal. Pure functions.
 
 ### 8. `ContainerBackend` protocol declared
 
@@ -432,7 +581,7 @@ files, and how it is verified with no Docker daemon.
 ### 9. Error taxonomy
 
 - **Inputs:** construction with a message and a remedy.
-- **Outputs:** the seven classes of §4.2, all deriving from `BackendError`, which derives from
+- **Outputs:** the seven classes of §4.3, all deriving from `BackendError`, which derives from
   `Exception`; `str(exc)` includes both message and remedy.
 - **Edge cases:** an error constructed with no remedy must still render usefully.
 - **Error behaviour:** n/a — these are the errors.
@@ -468,7 +617,7 @@ files, and how it is verified with no Docker daemon.
 - **Inputs:** `DIE_AFTER_START` in the script; and `fake.vanish(handle)` on a running one.
 - **Outputs:** after a scripted death, `is_running` is `False` and `inspect` is `EXITED` with
   a non-zero exit code; after `vanish`, `inspect` is `GONE` and `is_running` is `False`
-  **without raising** — the contract of §4.2.
+  **without raising** — the contract of §4.3.
 - **Edge cases:** `stop` on a vanished container is a no-op, not an error; `vanish` on an
   unknown handle raises `ContainerNotFoundError`; a vanished container disappears from
   `list_managed`.
@@ -512,7 +661,9 @@ files, and how it is verified with no Docker daemon.
 - **Edge cases:** no mounts omits the key entirely; the same target declared twice keeps both
   entries in order (de-duplication is config-validation's job, not the driver's); a read-write
   mount is distinguishable from a read-only one.
-- **Error behaviour:** none here — malformed strings failed at behaviour 3.
+- **Error behaviour:** none here — a malformed mount string never reaches this point. It
+  failed at [`TSWAP-C540`](../src/tool_swap/config/validate.py:2726) during config
+  validation, and `build_run_kwargs` sees only `MountSpec` values (§4.2).
 - **Files:** `src/tool_swap/backend/docker_backend.py`.
 - **Verified:** snapshot. Pure.
 
@@ -558,7 +709,7 @@ files, and how it is verified with no Docker daemon.
 ### 19. `map_sdk_error` — SDK exception → taxonomy
 
 - **Inputs:** synthesised instances of each SDK exception class named in the saved reference.
-- **Outputs:** the corresponding taxonomy member of §4.2, carrying a remedy that names the
+- **Outputs:** the corresponding taxonomy member of §4.3, carrying a remedy that names the
   actionable thing (the image ref, the conflicting name, the NVIDIA toolkit).
 - **Edge cases:** an unrecognised exception maps to `BackendError` preserving the original
   text, never swallowed; the original exception is chained as `__cause__`; a GPU-related API
@@ -706,8 +857,26 @@ Stated so M2b is additive, not a refactor of M2a:
    Reconciliation adopts by label, and there is no port state to reconcile (**D21**).
 6. **The error taxonomy with remedies.** `FAILED` carries a reason, and the reason is the
    taxonomy member's message — M2b formats it, it does not invent it.
-7. **A `ContainerSpec` builder from resolved config.** M2a defines the dataclass; the
+7. **A `ContainerSpec` builder from resolved config.** M2a defines the dataclasses; the
    config → spec function has no owner yet and should be M2b's or M3's first behaviour.
+   **Behaviour 3's amendment makes this builder load-bearing, not merely convenient.** It is
+   the single place the `ParsedMount → MountSpec` conversion happens (§4.2), so its own
+   behaviour list must specify:
+   - `source = str(parsed.resolved_host)` and `target = parsed.container` — taking the
+     **resolved** host, since `MountSpec` performs no resolution;
+   - `read_only = parsed.mode == "ro"`, with the two-part defaulted form
+     (`mode_defaulted=True`, `mode="ro"`) yielding `read_only=True`;
+   - what happens for a mode that is neither `ro` nor `rw`. It can only arrive if config
+     validation was bypassed, since [`TSWAP-C541`](../src/tool_swap/config/validate.py:2736)
+     rejects it — `"RO"` included, case-sensitively. **Raise, or fail safe to read-only, is
+     an open decision for that milestone**, deliberately not settled here: the safe default
+     and the loud default disagree, and the choice belongs with the code that has a caller.
+
+   It must also assemble from **both** config blocks — `BackendConfig` for `network`,
+   `container_prefix`, `label_namespace`, `gpu_runtime`; `DefaultsConfig`/tool-level for
+   `shm_size`, `cpus`, `memory`, `devices`, `env`, `mounts`, `container_port`,
+   `expose_host_port` — and it must supply the values behaviours 4, 6 and 7 deliberately no
+   longer default (`gpu_runtime`, `container_port`, `label_namespace`, `container_prefix`).
 
 M2a deliberately provides **no** state machine, no readiness notion and no policy. The backend
 knows whether a process exists; everything above that is M2b's.
@@ -734,3 +903,21 @@ knows whether a process exists; everything above that is M2b's.
    admits other values, but issue #3 says docker SDK, so M2a implements `DockerBackend` only.
 7. **The three deferred daemon tests need their own issue**, including the DinD harness, the
    `TSWAP_TEST_DOCKER_HOST` fixture and the loud-skip summary hook. Not filed by this task.
+8. **Behaviour 3 no longer delivers a `parse_mount`, and issue #3 was not amended.** The
+   issue's Definition of Done was read as implying a backend-side mount parser; M1 had
+   already shipped one in the config layer
+   ([`validate.py`](../src/tool_swap/config/validate.py:2488)), so behaviour 3 was rewritten
+   to deliver `MountSpec` plus the boundary guard instead (§4.2). **If issue #3 explicitly
+   requires a `backend`-side parser, this amendment contradicts it and the issue wins** — but
+   then the shipped `parse_mount` and its 1331 lines of tests
+   ([`test_validate_mounts.py`](../tests/unit/config/test_validate_mounts.py)) must be
+   reconciled in the same breath, because two parsers is the one outcome that must not ship.
+9. **`config-hash` has no producer anywhere in the repository.** Behaviour 6 stamps a hash it
+   is given; nothing computes one (searched `src/tool_swap/` for `config_hash`, `sha256` and
+   `hashlib`: no matches). Which inputs the hash covers — and therefore what "stale image"
+   means — is an unowned decision, and behaviour 6 deliberately does not settle it.
+10. **`container_prefix` is validated by no config rule.** Tool names are pinned by
+    [`TSWAP-C210`](../src/tool_swap/config/validate.py:310), but an authored
+    `backend.container_prefix` reaches behaviour 7 unjudged, which is why that behaviour's
+    `ValueError` names the prefix. **A `TSWAP-C5xx` rule for `container_prefix` would be the
+    better fix and belongs to the config layer, not to M2a.** Not filed by this task.
