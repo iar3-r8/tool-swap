@@ -48,7 +48,7 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 
 | Behaviour | Module | Red | Green |
 |---|---|---|---|
-| 3 — `MountSpec` + mount-parsing ownership boundary | `backend/base.py` | — | — |
+| 3 — `MountSpec` + mount-parsing ownership boundary | `backend/base.py` | `98c9ec5` | `471944c` |
 | 4 — `ContainerSpec` | `backend/base.py` | — | — |
 | 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | — | — |
 | 6 — `managed_labels` | `backend/labels.py` | — | — |
@@ -56,8 +56,21 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 | 8 — `ContainerBackend` protocol | `backend/base.py` | — | — |
 | 9 — error taxonomy | `backend/errors.py` | — | — |
 
-Preparatory commit on this branch, outside the red/green cycle: `b1dd93c`, attaching the dev
-container to the `llm-network` bridge. It touches no `src/` or `tests/` file.
+Preparatory commits on this branch, outside the red/green cycle and touching no `src/` or
+`tests/` file: `b1dd93c`, attaching the dev container to the `llm-network` bridge, and
+`c09605a`, replacing that with `--add-host=host.docker.internal:host-gateway`.
+
+**Behaviour 3's red step was rejected once before it was committed**, on two mechanical
+grounds rather than any disagreement about the contract. The first attempt imported
+`MountSpec` at module scope, so the missing `base.py` aborted *collection* and none of the
+1128 tests ran — an aborted collection is evidence that nothing was expressed as a test, not
+evidence of a red. It now imports inside each test through a gate, so all 14 fail
+individually with their assertions present and reachable. The second: the boundary guard
+wrote decoy `parse_mount` modules into the real `src/tool_swap/backend/`, yet excluded
+`_guard_decoy_*` files from its own walk and asserted against the string it had just
+written — all of the risk of a stray mount parser in the package, none of the verification.
+Non-vacuity is now proven with in-memory decoys covering reach, precision and name
+detection, and nothing is written under `src/`.
 
 **Behaviours 3, 4, 6 and 7 were amended after this table was first written**, when the
 shipped M1 code was re-read against them. Behaviour 3 was specifying a second mount-string
