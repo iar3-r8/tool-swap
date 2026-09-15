@@ -49,7 +49,7 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 | Behaviour | Module | Red | Green |
 |---|---|---|---|
 | 3 — `MountSpec` + mount-parsing ownership boundary | `backend/base.py` | `98c9ec5` | `471944c` |
-| 4 — `ContainerSpec` | `backend/base.py` | — | — |
+| 4 — `ContainerSpec` | `backend/base.py` | `3a18073` | `d8a270d` |
 | 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | — | — |
 | 6 — `managed_labels` | `backend/labels.py` | — | — |
 | 7 — `container_name` / `label_selector` | `backend/labels.py` | — | — |
