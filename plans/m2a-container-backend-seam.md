@@ -35,8 +35,38 @@ to still fail against a decoy root `docker/` package carrying its own `__version
 one shape where the `__file__` and `__version__` checks both pass and only the path guard
 catches the wrong module. **Narrowed, not weakened.**
 
-**Behaviours 3–28 continue on a fresh branch** as the seam proper. The ledger in §5 is
+**Behaviours 3–28 continue on fresh branches** as the seam proper. The ledger in §5 is
 unchanged and remains the loop state for that work.
+
+### 0.1 Second split — behaviours 3–9 land as the types-and-helpers pull request
+
+Twenty-six behaviours in one pull request is not reviewable, so the remainder is cut again at
+the types boundary. **Branch `feature/m2a-backend-seam-types` carries behaviours 3–9 only**:
+the pure data types, the label helpers, the protocol declaration and the error taxonomy.
+No backend *implementation* is in this slice — `FakeBackend` and `DockerBackend` both stay
+out, so every behaviour here is a pure function, a dataclass or a declaration.
+
+| Behaviour | Module | Red | Green |
+|---|---|---|---|
+| 3 — `parse_mount` | `backend/base.py` | — | — |
+| 4 — `ContainerSpec` | `backend/base.py` | — | — |
+| 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | — | — |
+| 6 — `managed_labels` | `backend/labels.py` | — | — |
+| 7 — `container_name` / `label_selector` | `backend/labels.py` | — | — |
+| 8 — `ContainerBackend` protocol | `backend/base.py` | — | — |
+| 9 — error taxonomy | `backend/errors.py` | — | — |
+
+Preparatory commit on this branch, outside the red/green cycle: `b1dd93c`, attaching the dev
+container to the `llm-network` bridge. It touches no `src/` or `tests/` file.
+
+**Behaviours 10–13** (`FakeBackend`) and **14–27** (`DockerBackend`, the import-linter
+contract) are the next two branches. Behaviour 28's documentation is split to match: each
+branch documents what it delivered.
+
+**§3's blocking pre-condition is now discharged.** `plan/third-party-docs/docker/` holds the
+docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-requests.md`,
+`container-logs.md`, `container-stop-wait.md`, `containers-list-filters.md` and
+`container-attrs-reload.md`. Behaviours 14–26 are unblocked, on their own branch.
 
 ---
 
