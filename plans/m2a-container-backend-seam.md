@@ -51,7 +51,7 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 | 3 — `MountSpec` + mount-parsing ownership boundary | `backend/base.py` | `98c9ec5` | `471944c` |
 | 4 — `ContainerSpec` | `backend/base.py` | `3a18073` | `d8a270d` |
 | 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | `582fa4b` | `51a6ee2` |
-| 6 — `managed_labels` | `backend/labels.py` | — | — |
+| 6 — `managed_labels` | `backend/labels.py` | `pending` | — |
 | 7 — `container_name` / `label_selector` | `backend/labels.py` | — | — |
 | 8 — `ContainerBackend` protocol | `backend/base.py` | — | — |
 | 9 — error taxonomy | `backend/errors.py` | — | — |
@@ -544,6 +544,21 @@ the resolved namespace; defaulting is config's job. Second, the original text om
   later milestone's.
 - **Error behaviour:** empty namespace or empty tool name raises `ValueError`. There is no
   default namespace to fall back on, so an omitted one is a `TypeError` from Python itself.
+- **`managed-by` value — decided during behaviour 6, was unpinned.** The naming table of
+  [`plan/08_REPO_LAYOUT.md`](../plan/08_REPO_LAYOUT.md:186) names the *key* but never its
+  value, and this behaviour cannot ship without one. **The value is `"tool-swap"`**,
+  confirmed by the user when the qna-tester flagged the gap. It must be a constant, because
+  behaviour 7's `label_selector` receives only the namespace and still has to match it; it
+  matches the repository, distribution and `registry_prefix` names; and keeping it distinct
+  from the namespace means containers labelled under an older namespace are still
+  recognised as ours. That last point is why the value is effectively permanent: line 192
+  of the same file notes reconciliation, `tswap ps`, `prune` and staleness detection all
+  depend on these labels, so changing it would orphan every running container at once.
+- **Signature, pinned by behaviour 6's red step** so behaviour 7 and the green step cannot
+  drift from it: `managed_labels(namespace, tool, *, group=None, config_hash=None,
+  runtime_version=None) -> dict[str, str]`. The two required arguments are
+  positional-or-keyword; the three optional ones are keyword-only, deliberately — they are
+  interchangeable strings, so positional passing could silently swap a group for a hash.
 - **Files:** `src/tool_swap/backend/labels.py`.
 - **Verified:** exact-dict snapshot test, plus a test asserting `labels.py` contains no
   `"com.tool-swap"` literal. Pure function.
