@@ -591,9 +591,41 @@ the concatenation can produce an illegal name.
   primary responsibility, not a second gate.
 - **Error behaviour:** an unusable name raises `ValueError` naming the **prefix**, the tool
   and the rule, so the message points at the unvalidated input rather than the validated one.
+- **"Unusable" means failing `TSWAP-C210`, not failing Docker's own rule — decided during
+  behaviour 7's red step, which was reworked once because of it.** The first red attempt
+  asserted Docker's container-name charset and a name-length limit **from memory**:
+  `plan/third-party-docs/` contains no document stating either, and the oxylabs MCP server
+  was unavailable in that session. The qna-tester flagged it, and the contradiction proved
+  the point — the tests rejected a leading underscore while Docker in fact permits one, so
+  the assertion encoded an invented rule behind a docstring claiming Docker's authority.
+  The length test was worse: a ladder asserting only that *some* limit exists below 4096,
+  which any invented number satisfies, so it could not distinguish a right answer from a
+  wrong one.
+
+  **The rule is therefore [`_NAME_PATTERN`](../src/tool_swap/config/validate.py:310),
+  `[a-z0-9][a-z0-9_-]*`, applied to the whole concatenated name**, confirmed by the user.
+  §7 of this plan already calls that pattern "a strict subset of Docker's legal name
+  charset", so being stricter than Docker is safe whatever Docker's exact rule turns out to
+  be — a name we accept is one Docker accepts — and the rule is verifiable from our own
+  source rather than from anyone's recollection. It also judges the prefix by the same rule
+  as the tool name, which is coherent, since the concatenation is what becomes the
+  container name. Consequences: `"My-"` is **illegal** (uppercase), and `"_x"`, `"-x"`,
+  `".x"`, `"My Prefix"` stay illegal without needing any claim about Docker.
+  **No length assertion exists anywhere**, and one must not be added without saved
+  documentation to cite.
 - **Files:** `src/tool_swap/backend/labels.py`.
+- **Signatures, pinned by the red step:** `container_name(container_prefix: str, tool: str)
+  -> str` and `label_selector(namespace: str) -> dict[str, str]`, the latter returning
+  exactly one entry. **The selector's return shape is a neutral one-entry label map, not a
+  docker filter.** docker-py's filter form is unverified here and is behaviours 14–26's to
+  pin against `plan/third-party-docs/docker/containers-list-filters.md`; inventing it on
+  this branch is the same mistake the naming rework corrected.
 - **Verified:** table test; a test asserting the selector key is exactly the key behaviour 6
-  emits; a test asserting `labels.py` contains no `"ms-"` literal. Pure functions.
+  emits, **derived from a `managed_labels(...)` call rather than restating the string**, so
+  the two cannot drift in lockstep; a test asserting `labels.py` contains no `"ms-"`
+  literal, comparing by **exact value equality** against the value read live from
+  `BUILT_IN_DEFAULTS` — substring matching would false-positive on so short a value — with
+  in-memory decoys proving the detector's reach and precision. Pure functions.
 
 ### 8. `ContainerBackend` protocol declared
 
