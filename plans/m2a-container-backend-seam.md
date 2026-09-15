@@ -96,6 +96,108 @@ docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-req
 
 ---
 
+## 0.2 Pull request description for this branch, ready to paste
+
+**Blocked on credentials, not on work.** The branch is complete and green but could not be
+pushed: `GITHUB_TOKEN` is set-but-empty in this dev container, the only credential helper is
+VS Code's interactive one, terminal prompts are disabled, there is no `gh` CLI, and no GitHub
+MCP server is exposed this session. The text below is the reviewed description, so whoever
+has credentials can push `feature/m2a-backend-seam-types` and open the pull request without
+reconstructing it.
+
+---
+
+**Title:** M2a part 2 — the backend seam's types, label helpers, protocol and error taxonomy
+
+Closes nothing on its own; part of [#3](https://github.com/iar3-r8/tool-swap/issues/3).
+Follows `#9` (M2a part 1, which unblocked the `import docker` resolution and declared the
+dependency).
+
+### What this is
+
+The second slice of M2a's container backend seam: **behaviours 3–9 of
+[`plans/m2a-container-backend-seam.md`](plans/m2a-container-backend-seam.md)**, which is
+everything the seam declares before anything implements it. `FakeBackend` (behaviours 10–13)
+and `DockerBackend` (14–27) follow on their own branches. 28 behaviours in one pull request
+would not be reviewable, hence the split recorded in §0.1.
+
+**Nothing here talks to a container runtime.** Every behaviour is a dataclass, a pure
+function, or a declaration, so the whole slice is verifiable with no Docker daemon — which is
+the property that let it ship as tested code rather than as code awaiting an environment.
+
+### Why it is safe to review quickly
+
+Read `docs/backend-seam.md` first; it has a diagram of the seam and explains each type. Then
+the two source modules are about 300 lines between them. The remaining ~4,600 lines are
+tests, and the commit history alternates strictly: every behaviour has a `test(...)` commit
+proving the tests fail for the right reason, then a `feat(...)` commit making them pass.
+
+| # | Behaviour | Red | Green |
+|---|---|---|---|
+| 3 | `MountSpec` + the mount-parsing ownership boundary | `98c9ec5` | `471944c` |
+| 4 | `ContainerSpec` | `3a18073` | `d8a270d` |
+| 5 | `ContainerHandle` / `ContainerState` / `ContainerStatus` | `582fa4b` | `51a6ee2` |
+| 6 | `managed_labels` | `14cc4ef` | `a995d2a` |
+| 7 | `container_name` / `label_selector` | `6820911` | `cdd6cf7` |
+| 8 | `ContainerBackend` protocol | `9e5fe26` | `0401898` |
+| 9 | The error taxonomy | `08962ab` | `7a2880b` |
+
+Suite: **1339 passed, 2 skipped**, from 1121 at the merge base. `make lint` clean, mypy
+strict over 36 source files.
+
+### The decisions worth a reviewer's attention
+
+Four things here are deliberate and would each look like an omission otherwise:
+
+- **No configured default is re-stated.** `gpu_runtime`, `container_port`, `shm_size`,
+  `label_namespace` and `container_prefix` all live in `BUILT_IN_DEFAULTS`. `ContainerSpec`
+  requires the first two rather than defaulting them, and `labels.py` contains no namespace
+  or prefix literal at all — guard tests read the forbidden values live from that constant,
+  so they cannot go stale. A second copy of a default drifts silently, because both copies
+  stay internally self-consistent while disagreeing with each other.
+- **`build()` is absent from the protocol**, deferred to M5, though
+  `plan/01_ARCHITECTURE.md` §12 lists it. Issue #3's Definition of Done agrees with the
+  six-method set; a test pins the exact member set so the deferral is enforced.
+- **`ContainerState` has four members and is not the tool state machine.**
+  `STARTING`/`LOADING`/`READY` are readiness concepts belonging to M2b's health probe.
+- **`label_selector` returns a neutral label map, not a docker filter.** docker-py's filter
+  shape is unverified in this repository and belongs to behaviours 14–26, which must pin it
+  against `plan/third-party-docs/docker/`.
+
+### Two red steps were rejected and reworked
+
+Worth knowing, because both corrections are visible in the diff:
+
+1. **Behaviour 3's first attempt aborted pytest collection.** A module-scope import of a
+   not-yet-existing class meant none of the 1128 tests ran, so the output proved nothing. Its
+   boundary guard also wrote decoy modules into `src/` while excluding them from its own
+   walk — all of the risk, none of the verification. Both fixed.
+2. **Behaviour 7's first attempt asserted Docker's naming rules from memory.** It rejected a
+   leading underscore that Docker in fact permits, and pinned a name-length limit with a
+   ladder that any invented number would satisfy. Nothing in `plan/third-party-docs/` states
+   either fact. Container naming now enforces our own `TSWAP-C210`
+   (`[a-z0-9][a-z0-9_-]*`), which the plan already describes as a strict subset of Docker's
+   charset — stricter is safe whatever Docker's rule turns out to be, and it is verifiable
+   from our own source. No length limit is implemented.
+
+### One decision that needed the user
+
+`managed-by`'s **value** was pinned by neither the plan nor
+`plan/08_REPO_LAYOUT.md`'s naming table, which name only the key. It is now `"tool-swap"`,
+confirmed before the red step was committed. It must be a constant, since `label_selector`
+receives only the namespace and must still match it, and keeping it distinct from the
+namespace means containers labelled under an older namespace stay recognisable as ours.
+
+### Follow-ups this branch does not do
+
+- `FakeBackend`, `DockerBackend`, `build_run_kwargs`, `map_sdk_error`, the import-linter
+  contract: behaviours 10–27.
+- The `LifecycleManager` state machine, readiness probing, reconciliation: M2b.
+- **`__pycache__` is not in `.gitignore`** — noticed while staging, left alone rather than
+  fixed mid-cycle. Unrelated to this change and worth its own commit.
+
+---
+
 ## 1. Scope
 
 M2a delivers **the seam only** — the interface the rest of the lifecycle will be built on,
