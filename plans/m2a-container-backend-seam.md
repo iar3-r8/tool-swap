@@ -224,6 +224,7 @@ class ContainerSpec:
     place a non-default field after a defaulted one, and `kw_only` is how the
     required-ness is kept without reordering the readable field list.
     """
+    # As shipped: no field below re-states a BUILT_IN_DEFAULTS value.
     tool: str                                   # logical tool name (label value)
     name: str                                   # final container name, prefix applied
     image: str
@@ -305,12 +306,19 @@ Design notes, each with its reason:
   named source of truth for every built-in default, and it already carries
   `gpu_runtime="nvidia"` ([`defaults.py`](../src/tool_swap/config/defaults.py:74)),
   `container_port=8000` ([`defaults.py`](../src/tool_swap/config/defaults.py:54)) and
-  `shm_size="1g"` ([`defaults.py`](../src/tool_swap/config/defaults.py:35)). The §4.1 code
-  block above shows `gpu_runtime: str = "nvidia"` and `container_port: int = 8000` for
-  readability; **behaviour 4 does not ship those literals.** See behaviour 4 for the
-  resolution: the spec's own defaults are structural only (`None`, `()`, empty mapping), and
-  every configured value arrives from the resolver. A second copy of a default is a value
-  that can drift without any test noticing, since both copies would be self-consistent.
+  `shm_size="1g"` ([`defaults.py`](../src/tool_swap/config/defaults.py:35)). **Behaviour 4
+  ships none of those literals**: the spec's own defaults are structural only (`None`, `()`,
+  empty mapping), and every configured value arrives from the resolver. A second copy of a
+  default is a value that can drift without any test noticing, since both copies would be
+  self-consistent.
+
+  **Corrected during behaviour 28.** This paragraph used to say that the §4.1 code block
+  "shows `gpu_runtime: str = "nvidia"` and `container_port: int = 8000` for readability".
+  It does not, and had not since the listing was written with `field(kw_only=True)` — the
+  docs-manager caught the plan describing its own code block inaccurately while documenting
+  the shipped result. Worth noting as more than a typo: a stale sentence claiming a literal
+  default exists is exactly the kind of second copy behaviour 4 was amended to prevent, and
+  it would have sent a later implementer looking for a default that the tests forbid.
 
 ### 4.2 Ownership boundary — who parses a mount, who holds a `MountSpec`
 
