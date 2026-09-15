@@ -199,7 +199,7 @@ Consequence: `docker compose up` gives you a working router, and `tswap` is a fr
 # docker-compose.yml (sketch)
 services:
   router:
-    build: { context: ., dockerfile: docker/router.Dockerfile }
+    build: { context: ., dockerfile: images/router.Dockerfile }
     ports: ["${TSWAP_PORT:-8600}:8600"]
     volumes:
       - ./tools.yaml:/app/tools.yaml:ro

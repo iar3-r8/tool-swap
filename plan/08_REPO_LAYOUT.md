@@ -105,7 +105,7 @@ tool-swap/
 │           ├── bentoml_backend.py     # v1: builds the service, batched API, mounts our routes
 │           └── NATIVE.md              # the native backend: SPECIFICATION ONLY, no code in v1
 │
-├── docker/
+├── images/                       # must not be named `docker` — see the §1 note below
 │   ├── router.Dockerfile
 │   └── base/
 │       ├── cpu-py312.Dockerfile
@@ -167,6 +167,7 @@ tool-swap/
 - **`preflight/` may not import the router's `lifecycle/` or `scheduler/`.** It drives containers through the same `ContainerBackend` protocol but must remain usable with **no router, no `tools.yaml` entry and no GPU** (guardrail 12). If preflight ever needs the scheduler, it has stopped being the thing an author can run on a laptop.
 - **`scheduler/policy.py` is pure.** No imports of httpx, docker, or the clock. This is where the product's core logic lives and it must stay trivially testable.
 - **`backend/docker_backend.py` is the only Docker-aware file.** Everything else goes through the protocol.
+- **`images/` must not be renamed back to a directory named `docker`.** The test configuration puts the repository root on `sys.path` (`pythonpath = ["src", "."]` in `pyproject.toml`), so a root-level `docker` directory makes `import docker` resolve to *that directory* as an implicit namespace package instead of the Docker SDK. The failure is silent: the import succeeds and yields an empty module, so nothing raises until code touches a real SDK attribute. The name collision with the SDK's top-level module is exactly why the directory carries a different name, and the shadowing is pinned by [`tests/unit/test_repo_layout.py`](../tests/unit/test_repo_layout.py:258).
 - **The tree mirrors the plan documents**, so a reader can move between plan and code without a map.
 - **`tests/` mirrors `src/`**, one test module per source module.
 
@@ -198,6 +199,8 @@ Labels are load-bearing: reconciliation, `tswap ps`, `prune` and staleness detec
 
 - Router: `fastapi`, `uvicorn[standard]`, `pydantic>=2`, `httpx`, `docker` (or the compose/CLI shell-out), `typer`, `rich`, `pyyaml`, `python-dotenv`, `prometheus-client`.
 - Runtime: **`bentoml==X.Y.Z` (pinned, and with no extras) plus its transitive set** — which already provides starlette, uvicorn, pydantic and click (**D14**, [`05_RUNTIME_AND_BATCHING.md`](05_RUNTIME_AND_BATCHING.md) §1.1). **Nothing else of our own choosing**: a direct dependency we add still needs written justification, but BentoML's own tree is accepted wholesale.
+
+**The Docker SDK is a router-only dependency.** `docker>=7.0` is declared in the router's `[project] dependencies` and re-declared in the `dev` extra (which must stay self-sufficient — the `typer` precedent, asserted by the suite); `types-docker` is in the `dev` extra **only**, since type stubs must not ship at runtime. The runtime distribution declares **neither**: a tool runs *inside* a container and must never depend on the container SDK. As of M2a's prerequisite part the SDK is declared ahead of use — no `src/` module imports it yet, and when `DockerBackend` lands, [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md) behaviour 27 adds the import-linter contract that keeps `backend/docker_backend.py` the only module that may.
 
 **Pin policy, three rules:**
 

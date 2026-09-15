@@ -27,6 +27,7 @@ dependencies = [
     "pyyaml>=6",
     "python-dotenv>=1.0",
     "jsonschema>=4.21",
+    "docker>=7.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,8 @@ dev = [
     "python-dotenv>=1.0",
     "jsonschema>=4.21",
     "types-PyYAML",
+    "docker>=7.0",
+    "types-docker",
 ]
 
 [project.scripts]
