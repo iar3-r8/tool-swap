@@ -53,7 +53,7 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 | 5 — `ContainerHandle` / `ContainerState` / `ContainerStatus` | `backend/base.py` | `582fa4b` | `51a6ee2` |
 | 6 — `managed_labels` | `backend/labels.py` | `14cc4ef` | `a995d2a` |
 | 7 — `container_name` / `label_selector` | `backend/labels.py` | `6820911` | `cdd6cf7` |
-| 8 — `ContainerBackend` protocol | `backend/base.py` | — | — |
+| 8 — `ContainerBackend` protocol | `backend/base.py` | `9e5fe26` | `0401898` |
 | 9 — error taxonomy | `backend/errors.py` | — | — |
 
 Preparatory commits on this branch, outside the red/green cycle and touching no `src/` or
