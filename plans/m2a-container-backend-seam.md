@@ -54,7 +54,12 @@ out, so every behaviour here is a pure function, a dataclass or a declaration.
 | 6 — `managed_labels` | `backend/labels.py` | `14cc4ef` | `a995d2a` |
 | 7 — `container_name` / `label_selector` | `backend/labels.py` | `6820911` | `cdd6cf7` |
 | 8 — `ContainerBackend` protocol | `backend/base.py` | `9e5fe26` | `0401898` |
-| 9 — error taxonomy | `backend/errors.py` | — | — |
+| 9 — error taxonomy | `backend/errors.py` | `08962ab` | `7a2880b` |
+
+**All seven behaviours on this branch are complete**, each with its own red and green
+commit. Suite at the branch tip: **1339 passed, 2 skipped**, from the 1121 baseline when
+this slice began; `make lint` clean with mypy strict over 36 source files. Behaviour 28's
+documentation for this slice follows, then the pull request.
 
 Preparatory commits on this branch, outside the red/green cycle and touching no `src/` or
 `tests/` file: `b1dd93c`, attaching the dev container to the `llm-network` bridge, and
