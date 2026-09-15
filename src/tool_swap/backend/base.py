@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,3 +97,67 @@ class ContainerSpec:
     cpus: float | None = None
     memory: str | None = None  # e.g. "16g"
     published_port: int | None = None  # None publishes nothing
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerHandle:
+    """One started container, as the backend knows it.
+
+    Identified by all four fields together, never by ``id`` alone: a
+    recreated container keeps its name and tool while its runtime id
+    changes, so a handle is the seam's unit of identity for dict
+    keying and equality alike.
+
+    Attributes:
+        id: Container runtime id (hex digest), as reported by the
+            runtime.
+        name: Final container name, prefix applied.
+        tool: Logical tool name (label value).
+        image: Container image reference.
+    """
+
+    id: str
+    name: str
+    tool: str
+    image: str
+
+
+class ContainerState(StrEnum):
+    """Backend-level container state.
+
+    Deliberately NOT the M2b tool state machine: ``STARTING``,
+    ``LOADING`` and ``READY`` are readiness concepts owned by M2b's
+    health probe, and the backend only knows whether a process exists.
+    Adding a readiness member here would blur the two state machines;
+    the four-member test in ``test_container_handle_state_status.py``
+    pins the boundary on purpose, not by accident.
+    """
+
+    CREATED = "created"
+    RUNNING = "running"
+    EXITED = "exited"
+    GONE = "gone"
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerStatus:
+    """One point-in-time reading of a started container.
+
+    ``exit_code`` defaults to ``None`` rather than ``0``: a running
+    container has exited neither successfully nor at all, and
+    conflating ``None`` with ``0`` would report live containers as
+    clean exits.  ``started_at`` is the runtime-reported start time as
+    a plain string; no coercion to ``datetime`` at the seam.
+
+    Attributes:
+        handle: The container this reading describes.
+        state: Backend-level state; the M2b tool state machine is a
+            separate concern.
+        exit_code: Process exit code, or ``None`` while running.
+        started_at: Runtime start time as reported, or ``None``.
+    """
+
+    handle: ContainerHandle
+    state: ContainerState
+    exit_code: int | None = None
+    started_at: str | None = None
