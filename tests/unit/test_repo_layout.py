@@ -49,6 +49,7 @@ SRC_RUNTIME_PACKAGES: list[str] = [
 # Data — test directories (NO __init__.py needed)
 # ---------------------------------------------------------------------------
 TEST_DIRS: list[str] = [
+    "tests/unit/backend",
     "tests/unit/config",
     "tests/unit/schema",
     "tests/unit/scheduler",
