@@ -1,6 +1,9 @@
 """Base data types for the container backend seam (M2a).
 
-This module holds already-resolved data types.  Its boundary
+This module holds already-resolved data types, and declares the
+``ContainerBackend`` protocol — the seam interface every lifecycle
+component is written against.  No backend implementation lives here.
+Its boundary
 (plans/m2a-container-backend-seam.md §4.2): it stores values and knows
 nothing about strings.  A :class:`MountSpec` carries an
 already-resolved ``source``, an already-checked ``target`` and a
@@ -14,9 +17,10 @@ deferred to the config to spec builder of a later milestone.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,3 +165,61 @@ class ContainerStatus:
     state: ContainerState
     exit_code: int | None = None
     started_at: str | None = None
+
+
+@runtime_checkable
+class ContainerBackend(Protocol):
+    """The ONLY component that touches a container runtime.
+
+    Declares the seam every lifecycle component is written against;
+    no implementation lives here — ``FakeBackend`` and ``DockerBackend``
+    are later milestones with their own modules.
+
+    Deliberate decisions, each pinned by the behaviour-8 tests:
+
+    - **Synchronous by design** (architecture §12): the docker SDK is
+      blocking, and M2b's ``LifecycleManager`` is the async layer that
+      off-loads these calls.  Making the seam async would hide that
+      fact inside the driver.
+    - **``build`` is absent** although architecture §12 lists it: it is
+      M5's, and issue #3's Definition of Done names exactly the six
+      methods below without it.  Adding it now would force both
+      implementations to carry a stub.
+    - **``inspect`` returns ``ContainerStatus``**, never a raw SDK
+      dict — the seam exists to contain SDK vocabulary, not leak it.
+    - **``stop`` and ``logs`` take keyword-only arguments**:
+      ``stop(handle, timeout_s=30)`` reads unambiguously where a
+      positional timeout invites confusion with a retry count.
+
+    Not-found contract (plan §4.3), relied on by M2b's liveness sweep:
+    ``is_running`` returns ``False`` for a missing container rather
+    than raising, ``inspect`` returns ``ContainerState.GONE``, and
+    ``stop`` on a missing container is a no-op.  Every other method
+    raises the error-taxonomy member instead.
+    """
+
+    def start(self, spec: ContainerSpec) -> ContainerHandle:
+        """Start the container described by ``spec`` and return its handle."""
+        ...
+
+    def stop(self, handle: ContainerHandle, *, timeout_s: float) -> None:
+        """Stop the container within ``timeout_s``; a no-op if it is gone."""
+        ...
+
+    def is_running(self, handle: ContainerHandle) -> bool:
+        """Whether the container is running; ``False`` if it is gone."""
+        ...
+
+    def inspect(self, handle: ContainerHandle) -> ContainerStatus:
+        """Current status; ``ContainerState.GONE`` if the container is gone."""
+        ...
+
+    def list_managed(self) -> list[ContainerHandle]:
+        """Every managed container, stopped ones included."""
+        ...
+
+    def logs(
+        self, handle: ContainerHandle, *, follow: bool, tail: int
+    ) -> Iterator[str]:
+        """Log lines of the container; ``tail`` caps how many are kept."""
+        ...
