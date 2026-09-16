@@ -1336,3 +1336,12 @@ knows whether a process exists; everything above that is M2b's.
     rather than a `TSWAP-C5xx` one naming the file and line. **A config rule is the right fix
     and belongs to the config layer, not to M2a** — the same shape of gap as item 10, and the
     reason behaviour 17 ships no size parser of its own. Not filed by this task.
+12. **The daemon's wording for a refused GPU device request is unknown — found during
+    behaviour 19.** `GpuUnavailableError` is reached by matching `"nvidia"` or `"gpu"` in an
+    `APIError`'s message, because the SDK has no GPU exception class and the type carries no
+    other signal. No saved page records the daemon's actual text, the installed source does
+    not contain it, and this environment has no daemon and no NVIDIA toolkit to observe one.
+    **The heuristic is therefore untested against reality**, and the deferred daemon tests of
+    item 7 are where it would be confirmed. If it proves wrong, the failure mode is mild —
+    a GPU refusal surfaces as `ContainerStartError` with the daemon's text intact, so the
+    operator still sees the real message, only with a less specific remedy.
