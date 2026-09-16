@@ -21,7 +21,7 @@ network kwarg (routing step 5), which the SDK also turns into
 
 from __future__ import annotations
 
-from tool_swap.backend.base import ContainerSpec
+from tool_swap.backend.base import ContainerSpec, MountSpec
 from tool_swap.backend.labels import managed_labels
 
 
@@ -34,15 +34,16 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
     state with another.
 
     The output carries exactly the keys ``image``, ``name``, ``labels``
-    and, when non-empty, ``environment`` and ``network``.  ``labels``
-    is the full :func:`managed_labels` set for *label_namespace* and
-    the spec's tool, with the spec's own labels merged in (collision
-    precedence is deliberately not decided by behaviour 14; the
-    current order lets spec labels win).  ``environment`` is the spec's
-    mapping copied as a plain dict, and ``network`` is the spec's
-    network name.  No ``detach`` key: the start path is
-    ``create`` + ``start``, not ``run(detach=True)``
-    (plan §5 behaviour 14, amended).
+    and, when non-empty, ``environment``, ``network`` and ``volumes``.
+    ``labels`` is the full :func:`managed_labels` set for
+    *label_namespace* and the spec's tool, with the spec's own labels
+    merged in (collision precedence is deliberately not decided by
+    behaviour 14; the current order lets spec labels win).
+    ``environment`` is the spec's mapping copied as a plain dict,
+    ``network`` is the spec's network name, and ``volumes`` is the
+    spec's mounts in the documented dict form (behaviour 15).  No
+    ``detach`` key: the start path is ``create`` + ``start``, not
+    ``run(detach=True)`` (plan §5 behaviour 14, amended).
 
     Args:
         spec: The fully resolved container spec to translate.
@@ -55,7 +56,8 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         A fresh kwargs dict for ``client.containers.create(**kwargs)``:
         always ``image``, ``name`` and ``labels``; ``environment`` only
         when ``spec.env`` is non-empty, ``network`` only when
-        ``spec.network`` is not ``None``.
+        ``spec.network`` is not ``None``, ``volumes`` only when
+        ``spec.mounts`` is non-empty.
 
     Raises:
         ValueError: ``spec.image`` is empty — a caller programming
@@ -74,4 +76,22 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         kwargs["environment"] = dict(spec.env)
     if spec.network is not None:
         kwargs["network"] = spec.network
+    if spec.mounts:
+        kwargs["volumes"] = _volumes_from_mounts(spec.mounts)
     return kwargs
+
+
+def _volumes_from_mounts(mounts: tuple[MountSpec, ...]) -> dict[str, dict[str, str]]:
+    """Translate resolved mounts into the ``volumes`` dict form.
+
+    Each entry is ``{source: {"bind": target, "mode": "ro" | "rw"}}``,
+    the exact shape documented in
+    ``plan/third-party-docs/docker/containers-run-create.md`` §2;
+    declaration order is preserved by dict insertion order.  No
+    de-duplication: collapsing entries is config-validation's job, not
+    the driver's.
+    """
+    return {
+        mount.source: {"bind": mount.target, "mode": "ro" if mount.read_only else "rw"}
+        for mount in mounts
+    }
