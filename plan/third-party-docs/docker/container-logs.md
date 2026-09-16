@@ -3,10 +3,13 @@
 **Source:** installed `docker` package **7.2.0** (source read, not online docs):
 - `Container.logs` — `.venv/lib/python3.11/site-packages/docker/models/containers.py:294`
 - `APIClient.logs` — `.venv/lib/python3.11/site-packages/docker/api/container.py:821`
-- result shaping — `APIClient._get_result_tty` — `api/client.py:485`
-- `CancellableStream` — `utils/socket.py`
+- result shaping — `APIClient._get_result` / `_get_result_tty` — `api/client.py:482` / `:485`
+- `CancellableStream` — `types/daemon.py:8` (**corrected**: it is *not* in `utils/socket.py`)
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26.
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree (confirmation pass before
+behaviour 14's first test). Every line citation below was re-resolved; the two corrections
+made in that pass are marked **[CORRECTED 2026-09-16]**.
 
 ---
 
@@ -61,11 +64,27 @@ for chunk in container.logs(stream=True, follow=True, tail=200):
 ```
 
 The stream object returned when `stream=True` is a **`CancellableStream`**
-(api/container.py:898–899, `utils/socket.py`) — an iterator that also exposes
-`close()` to abort an open follow early. The docstring calls it *"a blocking
-generator"* — iterating it **blocks until output arrives**; there is no
-built-in per-chunk timeout (the `requests`-level timeout is what applies to
-the open connection).
+(constructed at api/container.py:898–899; **the class is defined at
+`types/daemon.py:8`** and re-exported from `docker.types`
+(`types/__init__.py:2`)) — an iterator that also exposes `close()`
+(types/daemon.py:37) to abort an open follow early. The docstring calls it
+*"a blocking generator"* — iterating it **blocks until output arrives**; there
+is no built-in per-chunk timeout (the `requests`-level timeout is what applies
+to the open connection).
+
+**[CORRECTED 2026-09-16]** This page previously cited `utils/socket.py` as
+`CancellableStream`'s home. That is wrong: `utils/socket.py` holds the frame
+helpers (`frames_iter`, `demux_adaptor`, `consume_socket_output`), and
+`grep -rn "class CancellableStream"` over the package matches **only**
+`types/daemon.py:8`. A test importing it from the cited module would have
+failed at import — the exact class of silent rot this confirmation pass exists
+to catch.
+
+**One `__next__` behaviour worth knowing for behaviour 26**
+(types/daemon.py:27–33) **[READ]**: `CancellableStream.__next__` converts
+`urllib3.exceptions.ProtocolError` **and `OSError`** into `StopIteration`. A
+follow stream broken by a dying daemon therefore **ends quietly** rather than
+raising — a truncated log looks exactly like a complete one to the caller.
 
 ## 3. Details that bite in behaviours 14–26 **[READ]**
 
