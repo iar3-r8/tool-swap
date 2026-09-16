@@ -1,27 +1,29 @@
-"""Docker backend seam (M2a behaviours 14-27).
+"""Docker translation layer for the container backend seam (M2a).
 
-This module will hold the docker-py implementation of the
-``ContainerBackend`` protocol.  Behaviour 14 delivers the first pure
-half of it: :func:`build_run_kwargs`, a translation of a
+This module holds the pure half of the Docker backend: plan
+behaviours 14-19 of ``plans/m2a-container-backend-seam.md``.
+:func:`build_run_kwargs` translates a
 :class:`~tool_swap.backend.base.ContainerSpec` into the kwargs dict
 that ``DockerBackend.start`` (behaviour 21) passes to
-``client.containers.create``.  No client, no daemon, no
-``DockerBackend`` class in this file yet — those arrive with their own
-behaviours, keeping this module a thin shell over pure functions
-(plan §4.5).
+``client.containers.create``; :func:`map_sdk_error` translates an SDK
+exception — or anything else — into a member of the seven-member
+taxonomy of :mod:`tool_swap.backend.errors` for the caller to raise.
 
-The kwarg names emitted here are the exact ``create``-accepted names
-from the saved docker-py reference
-``plan/third-party-docs/docker/containers-run-create.md`` §2 and its
-routing table — ``image``, ``name``, ``environment`` and ``labels``
-are in ``RUN_CREATE_KWARGS``, and ``network`` is the special-cased
-network kwarg (routing step 5), which the SDK also turns into
-``network_mode`` internally, so this function never emits that one.
-``device_requests`` (behaviour 16) is in ``RUN_HOST_CONFIG_KWARGS``
-and takes a list of ``docker.types.DeviceRequest`` instances
-(``plan/third-party-docs/docker/gpu-device-requests.md`` §2); this
-module is the first — and, per behaviour 27's import-linter contract,
-the only — ``tool_swap`` module that imports the docker SDK.
+Responsibility: every docker-py fact the backend needs — the kwarg
+names, the device-request shape, the exception classification —
+lives in these functions rather than in a class, so the shell that
+will call them stays thin (plan §4.5) and every fact is
+table-testable with no client and no daemon.
+
+Boundary: this module is the only ``tool_swap`` module that imports
+the Docker SDK; the import-linter contract that enforces that is
+behaviour 27 and is not in the tree yet.  No ``DockerBackend``
+class, no client and no daemon round-trip live here — behaviours
+20-27 build the shell on top of these functions, and nothing in the
+repository calls them yet.  Every kwarg name and exception branch is
+cited in the function docstrings from the saved reference
+``plan/third-party-docs/docker/``; nothing here was verified against
+a running daemon.
 """
 
 from __future__ import annotations
