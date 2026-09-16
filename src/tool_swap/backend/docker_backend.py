@@ -15,19 +15,23 @@ lives in these functions rather than in a class, so the shell that
 will call them stays thin (plan §4.5) and every fact is
 table-testable with no client and no daemon.
 
+The thin shell itself — :class:`DockerBackend` — is behaviour 20: a
+constructor that takes an **already-built** client and never reads
+the ambient environment, plus a ``from_config`` classmethod that is
+the only path permitted to build a real one (behaviours 21-27 add
+the protocol methods and the import-linter contract on top).
+
 Boundary: this module is the only ``tool_swap`` module that imports
 the Docker SDK; the import-linter contract that enforces that is
-behaviour 27 and is not in the tree yet.  No ``DockerBackend``
-class, no client and no daemon round-trip live here — behaviours
-20-27 build the shell on top of these functions, and nothing in the
-repository calls them yet.  Every kwarg name and exception branch is
-cited in the function docstrings from the saved reference
-``plan/third-party-docs/docker/``; nothing here was verified against
-a running daemon.
+behaviour 27 and is not in the tree yet.  Nothing here was verified
+against a running daemon.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import docker
 import docker.errors
 import requests.exceptions
 from docker.types import DeviceRequest
@@ -43,6 +47,14 @@ from tool_swap.backend.errors import (
     ImageNotFoundError,
 )
 from tool_swap.backend.labels import managed_labels
+
+if TYPE_CHECKING:
+    # Annotation-only: ``from_config``'s parameter is the only use, and
+    # a runtime ``backend -> config`` import would re-couple the
+    # backend's import graph to the config layer, which plan §4.2
+    # deliberately kept free (the edge is structurally legal per
+    # .importlinter contract 3, but still avoided).
+    from tool_swap.config.schema import BackendConfig
 
 #: The daemon 404 message fragments that name a missing image.  The
 #: SDK's own classifier matches exactly these, lowercased, to choose
@@ -475,3 +487,90 @@ def text_of(value: object) -> str:
     non-exception input, so the fallback never swallows anything.
     """
     return str(value)
+
+
+class DockerBackend:
+    """The thin shell over :func:`build_run_kwargs` / :func:`map_sdk_error`.
+
+    Behaviour 20 of ``plans/m2a-container-backend-seam.md`` (§4.5):
+    the constructor takes an **already-built** client and stores exactly
+    that object, while :meth:`from_config` is the only path that builds
+    a real one.  The two paths are split so the seam is testable with no
+    daemon and no ambient state — see behaviour 20's guard test.
+    """
+
+    def __init__(
+        self, client: object, *, label_namespace: str, container_prefix: str
+    ) -> None:
+        """Store an already-built client; never build one from the environment.
+
+        **This constructor must never read the ambient environment, touch
+        ``~/.docker/config.json`` or build a client** — it takes what it is
+        given.  That is the point of the seam: it is what lets behaviours
+        21-26 be tested against a stub with no daemon.  Do not add a
+        convenience default that would construct a client here.
+
+        The ``client`` parameter is typed ``object`` on purpose: no
+        ``DockerClientLike`` protocol is introduced by behaviour 20 — its
+        guard test pins the constructor's *names and positions*, never its
+        annotations, and the protocol the seam actually needs will be forced
+        by the shapes behaviours 21-26 pin.  Both a stub and a real
+        ``DockerClient`` satisfy ``object``.
+
+        Args:
+            client: The already-built Docker client (or a test stand-in).
+                Stored exactly as given — no wrapping, copying or
+                re-derivation.
+            label_namespace: Resolved label namespace, required and
+                keyword-only; no default is re-stated here, matching the
+                style of :func:`build_run_kwargs` and behaviours 6 and 7.
+            container_prefix: Resolved container-name prefix, required and
+                keyword-only; likewise no default.
+
+        Raises:
+            TypeError: ``client`` is ``None`` — a programming error at the
+                seam, refused loudly rather than let through to an SDK call.
+        """
+        if client is None:
+            raise TypeError("client must not be None")
+        self.client = client
+        self.label_namespace = label_namespace
+        self.container_prefix = container_prefix
+
+    @classmethod
+    def from_config(cls, cfg: BackendConfig) -> DockerBackend:
+        """Build a backend from a :class:`BackendConfig`, creating a real client.
+
+        The **only** path permitted to construct a real client (plan §4.5):
+        the injected-client constructor is environment-free, so this factory
+        is where the ambient state is read, via ``docker.from_env()`` — the
+        SDK's documented env-reading entry point
+        (``plan/third-party-docs/docker/client-construction-and-env.md`` §1).
+
+        ``docker.from_env()`` passes no explicit ``version``, so the underlying
+        ``APIClient.__init__`` performs a **live daemon round-trip** to
+        negotiate the API version (``client-construction-and-env.md`` §4).
+        That is inherent to building a real client: there is no
+        ``BackendConfig`` field carrying a pinned API version, so the
+        round-trip cannot be suppressed without either inventing a config
+        field nothing demands or hard-coding a daemon-specific version — both
+        worse than the failure this produces.  A dead daemon surfaces that
+        round-trip's ``DockerException`` ("Error while fetching server API
+        version: …"), which :func:`map_sdk_error` already maps to
+        ``BackendUnavailableError``.  Behaviour 20 does not exercise this
+        method (it would need a daemon); its behaviour belongs to a later
+        ledger entry.
+
+        Args:
+            cfg: The resolved backend configuration block; supplies
+                ``label_namespace`` and ``container_prefix``.
+
+        Returns:
+            A :class:`DockerBackend` whose ``client`` is the real client
+            built from the ambient environment.
+        """
+        return cls(
+            docker.from_env(),
+            label_namespace=cfg.label_namespace,
+            container_prefix=cfg.container_prefix,
+        )
