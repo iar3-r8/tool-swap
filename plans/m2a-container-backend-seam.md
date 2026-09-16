@@ -146,6 +146,45 @@ docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-req
 `container-logs.md`, `container-stop-wait.md`, `containers-list-filters.md` and
 `container-attrs-reload.md`. Behaviours 14–26 are unblocked, on their own branch.
 
+### 0.1.2 Fourth split — behaviours 14–27 land as two pull requests, cut at purity
+
+**Branch `feature/m2a-docker-backend` carries behaviours 14–27**, cut from the merged tip of
+`feature/m2a-fake-backend` (`e1ec272`, pull request #11). Baseline re-measured at that tip
+rather than trusted: **1378 passed, 2 skipped**.
+
+Fourteen behaviours in one pull request is not reviewable — the same judgement §0.1 and
+§0.1.1 already made twice — so this branch ships **two pull requests**, cut at the boundary
+that matters here, which is **purity**:
+
+| Pull request | Behaviours | What makes it one slice |
+|---|---|---|
+| **A — the pure translation layer** | 14–19 | `build_run_kwargs` and `map_sdk_error`. No client, no daemon, no `DockerBackend` class. Every behaviour is a pure function over a `ContainerSpec` or an exception instance, exhaustively table-testable. |
+| **B — the thin shell and the boundary** | 20–27 | The `DockerBackend` methods, which need a stub client, and the import-linter contract. Each method is thin *because* A landed first: a stub asserting "called once with the pure function's output" is all there is to check. |
+
+The boundary is not arbitrary. §4.5's design makes the shell thin precisely so the
+interesting logic is pure, and A is exactly that logic. A reviewer of A needs no knowledge of
+the SDK's call surface, only of its kwarg *names* — which are cited from
+`plan/third-party-docs/docker/` — while a reviewer of B checks call-shape and error contracts
+against an injected stub. Landing A first also means B's tests can assert equality against
+`build_run_kwargs(spec)` output that is already reviewed and merged, rather than against a
+dict invented in the same diff.
+
+**Behaviour 28's documentation is split to match**, as it was for the previous two slices:
+each pull request documents what it delivered, extending `docs/backend-seam.md` rather than
+duplicating it.
+
+**Two commitments this branch makes explicitly, because both are easy to overstate:**
+
+- **No daemon verification is claimed.** M2a runs no docker tests. The `docker` marker is
+  registered and deselected by default through `addopts`, no test carries it, and
+  `TSWAP_TEST_DOCKER_HOST` appears in no source or test file. Behaviours 22 and 25 state in
+  their own text what they do *not* show; §7 item 7's three deferred daemon tests, and the
+  DinD harness they need, remain unfiled and are not this branch's work.
+- **Every test for behaviours 14–26 cites the saved page** that justifies each third-party
+  fact it asserts. §3 explains why: an invented signature produces a passing test, a matching
+  shim, and a broken integration with a green suite. Behaviour 7's reworked red step is the
+  precedent.
+
 ---
 
 ## 0.2 Pull request — opened as [#10](https://github.com/iar3-r8/tool-swap/pull/10)
