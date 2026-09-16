@@ -198,6 +198,77 @@ namespace means containers labelled under an older namespace stay recognisable a
 
 ---
 
+## 0.3 Continuation prompt — the next branch, behaviours 10–13 (`FakeBackend`)
+
+Hand the text below to a fresh TDD-manager session once this slice's pull request is merged.
+It is written to be self-contained, since a new session has none of this conversation.
+
+---
+
+Continue M2a on a new branch: **behaviours 10–13, `FakeBackend`**.
+
+Intake is [GitHub issue iar3-r8/tool-swap#3](https://github.com/iar3-r8/tool-swap/issues/3).
+The plan is [`plans/m2a-container-backend-seam.md`](m2a-container-backend-seam.md) — read §0,
+§0.1, §4.4, §6 and behaviours 10–13 before delegating anything. Test command: `make test`.
+
+**Start from the merged tip of `feature/m2a-backend-seam-types`**, which delivered behaviours
+3–9: `MountSpec`, `ContainerSpec`, `ContainerHandle`/`ContainerState`/`ContainerStatus` and
+the `ContainerBackend` protocol in `src/tool_swap/backend/base.py`; `managed_labels`,
+`container_name` and `label_selector` in `src/tool_swap/backend/labels.py`; and the
+seven-member error taxonomy in `src/tool_swap/backend/errors.py`. Suite at that tip:
+**1339 passed, 2 skipped**. Create `feature/m2a-fake-backend` — a *feature* branch, since
+this is new capability rather than a correction.
+
+Behaviours 10–13 deliver `src/tool_swap/backend/fake_backend.py`: the happy path, scripted
+`FAIL_TO_START`, death and vanishing, and `logs` plus the call journal. **This is the first
+branch with a real implementation**, so it is where the seam's contracts stop being
+declarations and start being behaviour.
+
+Four things carry disproportionate weight, all from §6:
+
+1. **The call journal** (`fake.calls`) is what lets M2b assert "ten concurrent `ensure_ready`
+   produce exactly one start" by counting entries rather than inferring from side effects.
+2. **`is_running` returns `False` for a missing container rather than raising**, `inspect`
+   returns `ContainerState.GONE`, and `stop` on a missing container is a no-op. Without
+   that, M2b's liveness sweep becomes an unhandled traceback in the watchdog. The contract is
+   already written into the protocol's method docstrings.
+3. **Thread-safe internals**, because M2b's coalescing test drives the fake concurrently.
+4. **`vanish()` and `DIE_AFTER_START`** drive "a vanished container becomes `FAILED`" with no
+   daemon.
+
+Also note §4.4: "never ready" is deliberately **not** a `FakeBackend` failure mode, because
+readiness belongs to M2b's probe; and §7 assumption 5 flags that `FailureMode.STOP_HANGS`
+may be unused by M2a's own tests — it exists for M2b's drain test, so confirm with the user
+whether to ship it now or drop it.
+
+Three hard-won lessons from the previous branch, worth carrying forward:
+
+- **A red step that aborts pytest collection is not a red step.** Behaviour 3's first attempt
+  imported a missing name at module scope and stopped all 1128 tests from running; the
+  committed tests use a deferred-import gate per test instead. Since `fake_backend.py` will
+  not exist, the same pattern applies.
+- **Never let a test assert a third-party fact from memory.** Behaviour 7's red step was
+  reworked because it pinned Docker's name charset and a length limit from recollection, and
+  `plan/third-party-docs/` stated neither. Behaviours 10–13 should need no docker fact at
+  all — the fake is in-memory by construction. If one seems necessary, that is a signal the
+  design has drifted toward `DockerBackend`.
+- **Guards must be proven non-vacuous and must not write into `src/`.** Behaviour 3's first
+  boundary guard did both wrong.
+
+`tests/unit/backend/test_backend_mount_parsing_guard.py` walks every module under
+`src/tool_swap/backend/` and will police `fake_backend.py` too: no `parse_mount`, no string
+split on `":"`. `fake_backend.py` must also stay importable with the docker SDK absent —
+behaviour 27's import-linter contract depends on it, and the fake must be usable in
+environments with no SDK at all.
+
+After behaviours 10–13 are green, hand behaviour 28's documentation for *this* slice to
+docs-manager, commit it, then push and open the pull request. Behaviours 14–27
+(`DockerBackend` and the import-linter contract) are the branch after, and §3's blocking
+pre-condition for them is already discharged: `plan/third-party-docs/docker/` holds the
+docker-py reference.
+
+---
+
 ## 1. Scope
 
 M2a delivers **the seam only** — the interface the rest of the lifecycle will be built on,
