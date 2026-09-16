@@ -161,8 +161,9 @@ class FakeBackend:
 
         The handle echoes the spec's ``name``, ``tool`` and ``image``
         and carries a fresh, non-empty, unique id per start.  A name
-        already taken — by a running *or* a stopped container, as with
-        the real runtime until the container is removed — raises
+        already managed by this backend — by a running *or* a stopped
+        container, since stopping leaves the record behind and only
+        :meth:`vanish` removes one — raises
         :class:`ContainerNameConflictError`; no record is created.
 
         A tool scripted ``FAIL_TO_START`` refuses before anything is
@@ -175,7 +176,7 @@ class FakeBackend:
         not a refusal — but its record is created already ``EXITED``
         with a non-zero exit code: the fake has no daemon, clock or
         thread, so there is no observable ``RUNNING`` window and the
-        container is dead by the first observation (plan §6 item 4).
+        container is dead by the first observation (plan §6 item 3).
         Like a stopped one it stays in ``list_managed``; only
         :meth:`vanish` removes a record.
 
