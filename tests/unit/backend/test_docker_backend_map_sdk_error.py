@@ -31,8 +31,13 @@ file but not the signature:
   never raises, it *returns* an exception for the caller to raise,
   for any input at all — including an input that is not an
   exception;
-- the returned member always chains the original input as
-  ``__cause__``, so the diagnostic trail is preserved;
+- the returned member chains the original input as
+  ``__cause__``, so the diagnostic trail is preserved — for a
+  genuine exception.  A non-exception input *cannot* be chained:
+  CPython's ``__cause__`` setter rejects anything that is not a
+  ``BaseException`` with ``TypeError`` (see
+  ``test_map_sdk_error_never_raises_on_any_input``), so there the
+  text rides in ``message`` and ``__cause__`` stays ``None``;
 - the original text is never swallowed: the returned member's
   ``message`` carries a distinctive part of the input's text for
   every row of the table.
@@ -583,13 +588,29 @@ def test_map_sdk_error_never_raises_on_any_input() -> None:
     input that is not an exception at all: the function is total, so
     a programming error at the seam — a string where an exception
     was expected — becomes a ``BackendError`` the caller can raise,
-    with the text preserved and the object chained, rather than a
-    ``TypeError`` escaping the seam.
+    rather than a ``TypeError`` escaping the seam.
+
+    The genuine-exception rows are chained: ``__cause__ is original``
+    is asserted in the loop below, and it is satisfiable.  The
+    non-exception input *cannot* be chained — this is a deliberate
+    relaxation, not a gap: CPython's ``__cause__`` setter raises
+    ``TypeError`` ("exception cause must be None or derive from
+    BaseException") for anything that is not a ``BaseException``, and
+    the only alternative — a custom ``__cause__`` property on a
+    returned ``BackendError`` subclass that hands back the input —
+    crashes CPython's own traceback rendering with
+    ``AttributeError: 'str' object has no attribute
+    '__traceback__'``.  The assertion is therefore pinned to what
+    CPython actually permits, ``__cause__ is None``, and the input's
+    diagnostic value is asserted in ``message`` below.  Do not
+    "restore" a ``__cause__ is <input>`` assertion here without
+    re-deriving that wall — verified on CPython 3.11.
     """
     # Arrange
     fn = _map_sdk_error()
     non_exception: object = "a bare string that is not an exception"
-    # Act / Assert: every input returns a taxonomy member, chained.
+    # Act / Assert: every exception input returns a taxonomy member,
+    # chained.
     for _row_id, factory, *_rest in _RAW_ROWS:
         original = factory()
         result = fn(original)
@@ -599,9 +620,10 @@ def test_map_sdk_error_never_raises_on_any_input() -> None:
         assert result.__cause__ is original
     # Act
     result = fn(non_exception)
-    # Assert: the non-exception's text is preserved, never swallowed.
+    # Assert: the text is preserved, never swallowed; ``__cause__``
+    # stays None — CPython cannot chain a non-exception (docstring).
     assert isinstance(result, BackendError)
-    assert result.__cause__ is non_exception
+    assert result.__cause__ is None
     assert "a bare string" in result.message
 
 
