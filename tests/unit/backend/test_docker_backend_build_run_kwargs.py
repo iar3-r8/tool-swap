@@ -1,8 +1,10 @@
-"""RED step for M2a behaviour 14 (core translation) and behaviour 15
-(mounts) — ``build_run_kwargs``.
+"""RED step for M2a behaviour 14 (core translation), behaviour 15
+(mounts) and behaviour 16 (GPU device requests) —
+``build_run_kwargs``.
 
-See ``plans/m2a-container-backend-seam.md`` §5 behaviour 14 (amended)
-and §0.1.2 pull request A: ``build_run_kwargs(spec, *, label_namespace)``
+See ``plans/m2a-container-backend-seam.md`` §5 behaviour 14 (amended),
+behaviour 16 and §0.1.2 pull request A:
+``build_run_kwargs(spec, *, label_namespace)``
 is a pure translation of a :class:`ContainerSpec` into the kwargs dict
 that ``DockerBackend.start`` (behaviour 21) will pass to
 ``client.containers.create(**kwargs)``.  No client, no daemon, no
@@ -18,13 +20,16 @@ suite.  docker-py raises ``TypeError`` for any kwarg it does not know
 name fails fast at the SDK layer, not at the daemon.
 
 Deliberately out of scope (later ledger behaviours, each with its own
-red/green cycle): GPU device requests (16), resource limits (17),
-port publication (18), ``map_sdk_error`` (19) and the
-``DockerBackend`` class itself (20+).  The spec therefore carries the
-structural defaults for the fields those behaviours own (``command``
-``None``, ``devices`` ``()``, ``shm_size`` ``None``, ``cpus`` ``None``,
-``memory`` ``None``, ``published_port`` ``None``), and the snapshot
-test pins that none of those keys appears in the output yet.
+red/green cycle): resource limits (17), port publication (18),
+``map_sdk_error`` (19) and the ``DockerBackend`` class itself (20+).
+The spec therefore carries the structural defaults for the fields
+those behaviours own (``command`` ``None``, ``devices`` ``()``,
+``shm_size`` ``None``, ``cpus`` ``None``, ``memory`` ``None``,
+``published_port`` ``None``), and the snapshot test pins that none of
+those keys appears in the output yet.  ``devices`` is no longer out of
+scope in this file: the behaviour-16 tests below exercise it, and the
+snapshot test's spec keeps ``devices=()`` so its exact five-key
+equality is unaffected.
 ``mounts`` is no longer out of scope in this file: the behaviour-15
 tests below exercise it, and the snapshot test's spec keeps
 ``mounts=()`` so its exact five-key equality is unaffected.
@@ -42,6 +47,40 @@ page (that directory's INDEX defers them), and plan §3 forbids
 asserting a third-party interface from memory — an invented
 ``Mount(...)`` signature would produce a passing test, a matching shim
 and a broken integration behind a green suite.
+
+Behaviour 16's mechanism decision, likewise recorded once here rather
+than restated per test: the GPU runtime is carried as
+``DeviceRequest(driver=spec.gpu_runtime)``, *not* as the separate
+host-config kwarg ``runtime``.  The saved page
+``plan/third-party-docs/docker/containers-run-create.md``, routing
+consequence 3, records that ``runtime`` is a host-config kwarg, that
+the two are different mechanisms, and that behaviour 16 must pick one
+deliberately.  The ``driver`` mechanism is chosen because the saved
+page ``plan/third-party-docs/docker/gpu-device-requests.md`` §1
+records the canonical GPU form for specific devices as
+``DeviceRequest(driver='nvidia', device_ids=[...])`` (noted there as
+inferred from the arguments) — the named indices and the named runtime
+live in one request, which is exactly the behaviour-16 contract ("one
+request naming exactly those indices and that runtime").  The legacy
+``runtime`` host-config kwarg names a runtime and *no* indices, so it
+cannot express that contract, and emitting both mechanisms would
+double-select the GPU stack.
+
+Behaviour 16's ``device_ids`` decision: ``ContainerSpec.devices`` is a
+``tuple[int, ...]`` of GPU indices while ``DeviceRequest.device_ids``
+is a list of *strings* (``plan/third-party-docs/docker/
+gpu-device-requests.md`` §1 constructor table), so the translation
+converts each index with ``str(index)`` preserving declaration order.
+The ``count`` argument is never emitted: the docstring says "set
+either ``count`` or ``device_ids``" and the SDK does not enforce that
+client-side (same page, "Mutually exclusive / constraint"), so
+emitting both would encode a request the daemon may reject and no
+test here can catch.  The assertions compare the full five-key wire
+dict (wire keys ``Driver``, ``Count``, ``DeviceIDs``,
+``Capabilities``, ``Options``; defaults ``''``, ``0``, ``[]``,
+``[]``, ``{}`` — same §1), so an implementation that forgets to emit
+``count`` or ``device_ids`` because the constructor defaults fill
+them fails here: the wire dict is what the daemon receives.
 (``gpu_runtime``, ``container_port``) are supplied with neutral values
 deliberately distinct from ``BUILT_IN_DEFAULTS``.
 
@@ -78,6 +117,7 @@ from collections.abc import Callable
 from types import ModuleType
 from typing import Any, cast
 
+from docker.types import DeviceRequest
 import pytest
 
 from tool_swap.backend.base import ContainerSpec, MountSpec
@@ -143,7 +183,10 @@ def _spec(**overrides: Any) -> ContainerSpec:
     behaviour 14 is about the translation, not any configured default.
     ``gpu_runtime`` and ``container_port`` are keyword-only required
     fields of :class:`ContainerSpec`, so they must be supplied even
-    though they belong to later behaviours.
+    though they belong to later behaviours.  ``devices`` keeps the
+    structural default ``()`` (CPU-only) so the behaviour-14 snapshot
+    test's exact five-key equality is unaffected; the behaviour-16
+    tests override it explicitly.
     """
     defaults: dict[str, Any] = dict(
         tool="llama",
@@ -154,6 +197,7 @@ def _spec(**overrides: Any) -> ContainerSpec:
         env={"FOO": "bar"},
         labels={"app": "test-tool"},
         network="llm-network",
+        devices=(),
     )
     defaults.update(overrides)
     return ContainerSpec(**defaults)
@@ -610,3 +654,226 @@ def test_build_run_kwargs_read_write_mount_distinguished_from_read_only() -> Non
     # Assert
     assert kwargs["volumes"]["/srv/ro"]["mode"] == "ro"
     assert kwargs["volumes"]["/srv/rw"]["mode"] == "rw"
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 16 — ``build_run_kwargs``, GPU device requests
+# ---------------------------------------------------------------------------
+#
+# Representation decision (see module docstring): one
+# ``docker.types.DeviceRequest`` under the exact kwarg
+# ``device_requests``, with ``driver=spec.gpu_runtime`` and
+# ``device_ids`` = the spec's GPU indices as strings — *not* the
+# legacy ``runtime`` host-config kwarg.  Every third-party fact below
+# is cited from the saved reference
+# ``plan/third-party-docs/docker/gpu-device-requests.md``:
+#   * the constructor takes the keyword arguments ``driver`` /
+#     ``count`` / ``device_ids`` / ``capabilities`` / ``options``
+#     (§1, ``__init__`` at types/containers.py:187) with defaults
+#     ``''`` / ``0`` / ``[]`` / ``[]`` / ``{}`` and wire keys
+#     ``Driver`` / ``Count`` / ``DeviceIDs`` / ``Capabilities`` /
+#     ``Options`` (lines 215–221);
+#   * ``device_ids`` is a list of *strings* (§1 constructor table),
+#     so the spec's ``tuple[int, ...]`` indices are converted with
+#     ``str()``;
+#   * ``device_requests`` is in ``RUN_HOST_CONFIG_KWARGS``
+#     (``models/containers.py`` line 1079, §2), so ``create`` accepts
+#     it as a *list* of ``DeviceRequest`` instances.
+# The kwarg name itself is cited from
+# ``plan/third-party-docs/docker/containers-run-create.md`` routing
+# table (line 1079); a typo'd name is a ``TypeError`` at the SDK
+# layer (same page, routing step 6).
+#
+# The SDK import is at module scope here, deliberately: the SDK is an
+# installed dependency (behaviour 2), so it cannot abort collection,
+# and keeping it out of the shared helpers (``_spec`` etc.) is what
+# keeps them usable with no SDK present — behaviour 27 will make
+# ``docker_backend`` the only ``tool_swap`` module allowed to import
+# ``docker``.
+#
+# No ``capabilities`` is asserted: the cited canonical form for
+# specific devices is ``DeviceRequest(driver='nvidia',
+# device_ids=[...])`` with no capability list, and inventing one
+# (e.g. ``[["gpu"]]``) from memory is exactly what plan §3 forbids.
+
+
+def _device_request_wire(request: DeviceRequest) -> dict[str, object]:
+    """The full wire dict a :class:`DeviceRequest` carries to the daemon.
+
+    ``DeviceRequest`` subclasses ``dict``
+    (``docker/types/base.py``, ``class DictType(dict)``) and its
+    ``__init__`` (``docker/types/containers.py`` lines 215–221;
+    ``plan/third-party-docs/docker/gpu-device-requests.md`` §1)
+    stores exactly the five PascalCase wire keys.  Comparing the full
+    wire dict — not just the fields under test — is what makes a
+    translation that forgets to emit ``count`` or ``device_ids`` fail:
+    the constructor defaults would silently fill them, and the wire
+    dict is what the daemon receives.
+    """
+    return dict(request)
+
+
+def test_build_run_kwargs_no_devices_omits_device_requests_key() -> None:
+    """Edge case: ``devices=()`` produces **no key**, not an empty list.
+
+    Behaviour 16: "an empty device request is not the same as none".
+    The omission is *our* contract — ``device_requests`` is a plain
+    ``RUN_HOST_CONFIG_KWARGS`` pass-through (``plan/third-party-docs/
+    docker/containers-run-create.md`` routing table, line 1079), so
+    the SDK would accept an empty list; pinning the absence is the
+    stricter assertion.
+    """
+    # Arrange
+    spec = _spec(devices=())
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "device_requests" not in kwargs
+
+
+def test_build_run_kwargs_single_device_names_index_and_runtime() -> None:
+    """``devices=(0,)`` is one request naming exactly index 0 and the runtime.
+
+    The request is a ``docker.types.DeviceRequest`` with
+    ``driver=spec.gpu_runtime`` and ``device_ids=["0"]`` — the
+    canonical GPU form for specific devices (``plan/
+    third-party-docs/docker/gpu-device-requests.md`` §1:
+    ``DeviceRequest(driver='nvidia', device_ids=[...])``).
+    ``device_ids`` is a list of *strings* (same §1 constructor
+    table), so the int index 0 travels as ``"0"``.  The wire dict is
+    asserted in full: ``Count`` pinned at its default ``0`` enforces
+    the "set either ``count`` or ``device_ids``" docstring constraint
+    (same §1, "Mutually exclusive / constraint") — the SDK does not
+    enforce it client-side, so a translation that also emits
+    ``count=len(devices)`` sets both, which no daemon-free test could
+    otherwise catch.
+    """
+    # Arrange
+    spec = _spec(devices=(0,), gpu_runtime="nvidia")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    requests = kwargs["device_requests"]
+    assert len(requests) == 1
+    (request,) = requests
+    assert isinstance(request, DeviceRequest)
+    assert _device_request_wire(request) == {
+        "Driver": "nvidia",
+        "Count": 0,
+        "DeviceIDs": ["0"],
+        "Capabilities": [],
+        "Options": {},
+    }
+
+
+def test_build_run_kwargs_multiple_devices_is_one_request_naming_each_index() -> None:
+    """``devices=(0, 1)`` is one request naming exactly indices 0 and 1.
+
+    One request, not two: the behaviour-16 contract is "one request
+    naming exactly those indices and that runtime".  ``device_ids``
+    carries both indices in declaration order as strings (``plan/
+    third-party-docs/docker/gpu-device-requests.md`` §1:
+    ``device_ids`` is a list of strings); ``Driver`` is the spec's
+    runtime, ``Count`` stays at its default ``0``.
+    """
+    # Arrange
+    spec = _spec(devices=(0, 1), gpu_runtime="nvidia")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    requests = kwargs["device_requests"]
+    assert len(requests) == 1
+    (request,) = requests
+    assert isinstance(request, DeviceRequest)
+    assert _device_request_wire(request) == {
+        "Driver": "nvidia",
+        "Count": 0,
+        "DeviceIDs": ["0", "1"],
+        "Capabilities": [],
+        "Options": {},
+    }
+
+
+def test_build_run_kwargs_non_default_gpu_runtime_is_honoured() -> None:
+    """Edge case: a non-default ``gpu_runtime`` is honoured, not dropped.
+
+    ``"nvidia"`` is the built-in default
+    (``src/tool_swap/config/defaults.py`` line 74); this spec uses a
+    deliberately different value, and the request's ``Driver`` must
+    carry it verbatim (``plan/third-party-docs/docker/
+    gpu-device-requests.md`` §1: ``driver`` is the driver string, a
+    plain ``str`` with no enumeration).
+    """
+    # Arrange
+    spec = _spec(devices=(0,), gpu_runtime="rocm")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    (request,) = kwargs["device_requests"]
+    assert _device_request_wire(request)["Driver"] == "rocm"
+
+
+def test_build_run_kwargs_duplicate_device_indices_collapse() -> None:
+    """Edge case: duplicate indices collapse to a single entry.
+
+    Behaviour 16: the request must name *exactly* those indices, and
+    an index declared twice is not two devices — ``devices=(0, 0)``
+    yields ``DeviceIDs == ["0"]`` (``plan/third-party-docs/docker/
+    gpu-device-requests.md`` §1: ``device_ids`` is a list of
+    strings).
+    """
+    # Arrange
+    spec = _spec(devices=(0, 0), gpu_runtime="nvidia")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    (request,) = kwargs["device_requests"]
+    assert _device_request_wire(request)["DeviceIDs"] == ["0"]
+
+
+def test_build_run_kwargs_device_requests_is_list_of_device_request_instances() -> None:
+    """The kwarg is a *list* of ``DeviceRequest`` instances under the
+    exact name ``device_requests``.
+
+    ``device_requests`` is in ``RUN_HOST_CONFIG_KWARGS``
+    (``models/containers.py`` line 1079; ``plan/third-party-docs/
+    docker/gpu-device-requests.md`` §2), so ``create`` accepts a list
+    of instances — a single bare instance, or a typo'd name (a
+    ``TypeError`` at routing step 6 of
+    ``plan/third-party-docs/docker/containers-run-create.md``), is a
+    different call shape.
+    """
+    # Arrange
+    spec = _spec(devices=(0,), gpu_runtime="nvidia")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    requests = kwargs["device_requests"]
+    assert isinstance(requests, list)
+    assert all(isinstance(item, DeviceRequest) for item in requests)
+
+
+def test_build_run_kwargs_negative_device_index_raises_value_error() -> None:
+    """Error behaviour: a negative device index raises plain
+    ``ValueError``.
+
+    Behaviour 16: ``devices=(-1,)`` is a caller programming error,
+    raised *before any SDK call* — so a plain ``ValueError``, not a
+    member of the seven-member taxonomy in
+    ``tool_swap.backend.errors`` (the same reasoning as behaviour 14's
+    empty-image check: a pure function makes no backend call).  The
+    validation precedes the ``str()`` conversion, so a negative index
+    can never reach the wire as the string ``"-1"``.
+    """
+    # Arrange
+    spec = _spec(devices=(-1,), gpu_runtime="nvidia")
+    fn = _build_run_kwargs()
+    # Act / Assert
+    with pytest.raises(ValueError):
+        fn(spec, label_namespace=_NAMESPACE)
