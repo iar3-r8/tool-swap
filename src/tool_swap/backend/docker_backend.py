@@ -17,9 +17,16 @@ routing table — ``image``, ``name``, ``environment`` and ``labels``
 are in ``RUN_CREATE_KWARGS``, and ``network`` is the special-cased
 network kwarg (routing step 5), which the SDK also turns into
 ``network_mode`` internally, so this function never emits that one.
+``device_requests`` (behaviour 16) is in ``RUN_HOST_CONFIG_KWARGS``
+and takes a list of ``docker.types.DeviceRequest`` instances
+(``plan/third-party-docs/docker/gpu-device-requests.md`` §2); this
+module is the first — and, per behaviour 27's import-linter contract,
+the only — ``tool_swap`` module that imports the docker SDK.
 """
 
 from __future__ import annotations
+
+from docker.types import DeviceRequest
 
 from tool_swap.backend.base import ContainerSpec, MountSpec
 from tool_swap.backend.labels import managed_labels
@@ -34,7 +41,8 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
     state with another.
 
     The output carries exactly the keys ``image``, ``name``, ``labels``
-    and, when non-empty, ``environment``, ``network`` and ``volumes``.
+    and, when non-empty, ``environment``, ``network``, ``volumes`` and
+    ``device_requests``.
     ``labels`` is the full :func:`managed_labels` set for
     *label_namespace* and the spec's tool, with the spec's own labels
     merged in (collision precedence is deliberately not decided by
@@ -57,13 +65,14 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         always ``image``, ``name`` and ``labels``; ``environment`` only
         when ``spec.env`` is non-empty, ``network`` only when
         ``spec.network`` is not ``None``, ``volumes`` only when
-        ``spec.mounts`` is non-empty.
+        ``spec.mounts`` is non-empty, and ``device_requests`` (one
+        ``DeviceRequest``) only when ``spec.devices`` is non-empty.
 
     Raises:
-        ValueError: ``spec.image`` is empty — a caller programming
-            error, raised before any SDK call, so a plain
-            ``ValueError`` rather than a ``tool_swap.backend.errors``
-            taxonomy member.
+        ValueError: ``spec.image`` is empty, or a ``spec.devices`` index
+            is negative — caller programming errors, raised before any
+            SDK call, so a plain ``ValueError`` rather than a
+            ``tool_swap.backend.errors`` taxonomy member.
     """
     if not spec.image:
         raise ValueError("container image must not be empty")
@@ -78,7 +87,34 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         kwargs["network"] = spec.network
     if spec.mounts:
         kwargs["volumes"] = _volumes_from_mounts(spec.mounts)
+    if spec.devices:
+        kwargs["device_requests"] = _device_requests_from_devices(spec)
     return kwargs
+
+
+def _device_requests_from_devices(spec: ContainerSpec) -> list[DeviceRequest]:
+    """Translate resolved GPU indices into one :class:`DeviceRequest`.
+
+    The canonical GPU form for specific devices is
+    ``DeviceRequest(driver=spec.gpu_runtime, device_ids=[...])`` — the
+    named indices and the named runtime live in one request
+    (``plan/third-party-docs/docker/gpu-device-requests.md`` §1).
+    ``device_ids`` is a list of *strings*, so each int index is
+    converted with ``str()`` in declaration order, duplicates
+    collapsed.  ``count`` is never set: the docstring says to set
+    either ``count`` or ``device_ids`` and the SDK does not enforce
+    that client-side (same §1), so setting both would encode a request
+    only a daemon could reject.
+
+    Raises:
+        ValueError: a device index is negative — raised before any
+            construction, naming the offending index.
+    """
+    if any(index < 0 for index in spec.devices):
+        offending = next(index for index in spec.devices if index < 0)
+        raise ValueError(f"device index must be non-negative, got {offending}")
+    device_ids = [str(index) for index in dict.fromkeys(spec.devices)]
+    return [DeviceRequest(driver=spec.gpu_runtime, device_ids=device_ids)]
 
 
 def _volumes_from_mounts(mounts: tuple[MountSpec, ...]) -> dict[str, dict[str, str]]:
