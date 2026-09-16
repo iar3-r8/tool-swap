@@ -192,6 +192,18 @@ Preparatory commits outside the red/green cycle, touching no `src/` or `tests/` 
 `d220c42` (this split), `ea18a0d` (the §3 re-verification) and `f887061` (the create+start
 decision).
 
+**Pull request [#12](https://github.com/iar3-r8/tool-swap/pull/12)** — open. Head `99144b2`,
+18 commits, 14 files, +3434 −68. Documentation commit `99144b2` precedes it, as behaviour 28
+requires. The push used the `.roo/mcp.json` token through a one-shot `http.extraheader`, for
+the reason §0.2 records.
+
+**Behaviour 28's documentation for this slice is `99144b2`**, which also corrected
+`docker_backend.py`'s module docstring: it claimed the import-linter contract already made
+this the only SDK-importing module, but `.importlinter` carries four contracts and none
+covers `docker`. That enforcement is behaviour 27 and is not yet in the tree — a docstring
+asserting an enforcement that does not exist is the same defect as a stale document, and it
+is exactly what behaviour 27 will make true.
+
 **One red step was corrected, and the correction is visible as its own commit.** Behaviour
 19's original red asserted that a non-exception input is chained as `__cause__`. The coder
 implemented the function, got 20 of 21 tests passing, and **refused to edit the failing one**,
