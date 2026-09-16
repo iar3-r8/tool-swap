@@ -173,6 +173,50 @@ dict invented in the same diff.
 each pull request documents what it delivered, extending `docs/backend-seam.md` rather than
 duplicating it.
 
+#### Pull request A — behaviours 14–19, complete
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 14 — `build_run_kwargs` core translation | `594e2b1` | `ff30006` | 1393 passed |
+| 15 — mounts → `volumes` | `506892d` | `8e6190e` | 1398 passed |
+| 16 — GPU device requests | `02c48db` | `e00b8e9` | 1405 passed |
+| 17 — resource limits | `0fc0862` | `b693e45` | 1417 passed |
+| 18 — port publication | `be929eb` | `cf74380` | 1425 passed |
+| 19 — `map_sdk_error` | `622d355`, corrected `557f994` | `cba735b` | 1446 passed |
+
+**All six behaviours are complete**, each with its own red and green commit. Suite at this
+point: **1446 passed, 2 skipped**, from the re-measured 1378 at the merge base; `make lint`
+clean with mypy strict over 38 source files.
+
+Preparatory commits outside the red/green cycle, touching no `src/` or `tests/` file:
+`d220c42` (this split), `ea18a0d` (the §3 re-verification) and `f887061` (the create+start
+decision).
+
+**One red step was corrected, and the correction is visible as its own commit.** Behaviour
+19's original red asserted that a non-exception input is chained as `__cause__`. The coder
+implemented the function, got 20 of 21 tests passing, and **refused to edit the failing one**,
+escalating instead — which is the behaviour this pipeline exists to produce. The argument was
+granted only after being checked directly: CPython's `__cause__` setter raises `TypeError`
+for a non-`BaseException`, and the one workaround — a `__cause__` property on a subclass —
+makes `traceback.format_exception` die with
+`AttributeError: 'str' object has no attribute '__traceback__'`. An implementation satisfying
+the assertion would have produced an error object that crashes the interpreter's own traceback
+machinery when printed. The qna-tester corrected the assertion to `__cause__ is None` in
+`557f994`, kept the neighbouring text-preservation assertion so the test is not vacuous, and
+left `__cause__` chaining asserted for all fifteen genuine-exception rows. **Narrowed, not
+weakened** — and the original red step's totality contract had already earned its place by
+catching a real `TypeError` in the coder's first draft.
+
+**Three facts the plan asserted loosely were pinned from the installed SDK, and two were
+wrong.** Behaviour 14's "detached start" implied `run(detach=True)`, which hides an immediate
+crash and auto-pulls a missing image; the start path is now `create` + `start` (`f887061`).
+Behaviour 17's error clause demanded a `ValueError` for an unparseable size string, which the
+SDK already raises as a `DockerException` naming the accepted suffixes — so no size parser
+ships, and the absence of any config rule for size strings is recorded as §7 item 11.
+Behaviour 17's `cpus` conversion was the sharpest: the SDK has **no `cpus` kwarg**, and
+`nano_cpus` is an `int` in units of 1e-9 CPUs. A multiplier invented from memory there is a
+1e9 error that no unit test would have revealed.
+
 **Two commitments this branch makes explicitly, because both are easy to overstate:**
 
 - **No daemon verification is claimed.** M2a runs no docker tests. The `docker` marker is
