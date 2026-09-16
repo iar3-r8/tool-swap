@@ -560,10 +560,14 @@ to confirm against a real daemon later.
 class FailureMode(StrEnum):
     FAIL_TO_START = "fail_to_start"
     DIE_AFTER_START = "die_after_start"
-    STOP_HANGS = "stop_hangs"
 
 FakeBackend(script: Mapping[str, FailureMode] | None = None)
 ```
+
+**`STOP_HANGS` was dropped from this milestone**, confirmed by the user before the
+behaviour-10 red step (§7 assumption 5 offered the choice). No behaviour in 10–13 exercises
+it, so shipping it would mean shipping a member no test proves — M2b adds it in the same
+red/green cycle as the drain test that needs it.
 
 Keyed by **tool name**, so a test scripts a failure before any handle exists. Plus
 `fake.vanish(handle)` for out-of-band removal (the M2b "vanished container" path), and a
@@ -1146,8 +1150,14 @@ knows whether a process exists; everything above that is M2b's.
    follows the issue and includes it.
 4. **The backend seam is synchronous.** If M2b finds it needs an async seam, that is a change
    to behaviour 8 and a re-review, not a quiet adaptation.
-5. **`FailureMode.STOP_HANGS` may be unused by M2a's own tests** — it exists for M2b's drain
-   test. If the user prefers strictly-needed-now, drop it from behaviour 12.
+5. **`FailureMode.STOP_HANGS` is dropped from M2a — resolved.** It was unused by M2a's own
+   tests and existed only for M2b's drain test. The user chose strictly-needed-now before
+   behaviour 10's red step, so `FailureMode` ships two members and M2b introduces the third
+   with its own red/green cycle. **A second departure from issue #3 was accepted in the same
+   breath:** the issue's Scope names "never ready" among `FakeBackend`'s scriptable failures,
+   and §4.4 excludes it because readiness is the M2b probe's concern and the fake has no
+   probe to be un-ready against. The user confirmed the plan's reading over the issue's
+   wording; the issue was not amended, so this entry is the record.
 6. **Docker vs Podman.** `plan/third-party-docs/podman/` exists and `BackendConfig.type`
    admits other values, but issue #3 says docker SDK, so M2a implements `DockerBackend` only.
 7. **The three deferred daemon tests need their own issue**, including the DinD harness, the
