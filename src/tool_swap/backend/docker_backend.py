@@ -26,10 +26,53 @@ the only — ``tool_swap`` module that imports the docker SDK.
 
 from __future__ import annotations
 
+import docker.errors
+import requests.exceptions
 from docker.types import DeviceRequest
 
 from tool_swap.backend.base import ContainerSpec, MountSpec
+from tool_swap.backend.errors import (
+    BackendError,
+    BackendUnavailableError,
+    ContainerNameConflictError,
+    ContainerNotFoundError,
+    ContainerStartError,
+    GpuUnavailableError,
+    ImageNotFoundError,
+)
 from tool_swap.backend.labels import managed_labels
+
+#: The daemon 404 message fragments that name a missing image.  The
+#: SDK's own classifier matches exactly these, lowercased, to choose
+#: ``ImageNotFound`` over ``NotFound``
+#: (``.venv/lib/python3.11/site-packages/docker/errors.py:3-10``;
+#: ``plan/third-party-docs/docker/errors.md`` §2 "The 404 mapping").
+#: :func:`map_sdk_error` mirrors them — rather than importing the
+#: private ``_image_not_found_explanation_fragments`` — and
+#: re-classifies by the daemon's text so an ``ImageNotFound`` that
+#: degrades to a plain ``NotFound`` (the daemon's wording stops
+#: matching) still maps to ``ImageNotFoundError``.
+_IMAGE_NOT_FOUND_FRAGMENTS: tuple[str, ...] = (
+    "no such image",
+    "not found: does not exist or no pull access",
+    "repository does not exist",
+    "was found but does not match the specified platform",
+)
+
+#: Message fragments that identify an unsatisfiable GPU device request.
+#: The SDK has no GPU exception class — the refusal surfaces as a bare
+#: ``APIError`` (``plan/third-party-docs/docker/errors.md`` §3), so the
+#: daemon's text is the only channel.  **Brittle heuristic, not a
+#: stable interface**: the daemon's real wording is recorded nowhere
+#: (plan §7 item 12); if it proves wrong, the failure mode is mild —
+#: a GPU refusal surfaces as ``ContainerStartError`` with the daemon's
+#: text intact.
+_GPU_MESSAGE_FRAGMENTS: tuple[str, ...] = ("nvidia", "gpu")
+
+#: The daemon's name-conflict phrase, whose quoted-name shape is
+#: ``The container name "/<name>" is already in use by container
+#: "<id>"``.
+_NAME_CONFLICT_PHRASE = " is already in use"
 
 
 def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, object]:
@@ -203,3 +246,230 @@ def _volumes_from_mounts(mounts: tuple[MountSpec, ...]) -> dict[str, dict[str, s
         mount.source: {"bind": mount.target, "mode": "ro" if mount.read_only else "rw"}
         for mount in mounts
     }
+
+
+def map_sdk_error(exc: BaseException) -> BackendError:
+    """Translate an SDK exception — or anything else — into the taxonomy.
+
+    Pure and **total**: it reads the exception and nothing else — no
+    client, no daemon, no environment — and it never raises.  It
+    *returns* a member of the seven-member taxonomy
+    ``tool_swap.backend.errors`` (plan §4.3) for the caller to raise,
+    so no raw SDK exception escapes the seam.  When the input is an
+    exception, the returned member chains it as ``__cause__``; and for
+    every input the ``message`` carries a distinctive part of the
+    input's text, so the original is never swallowed.  A non-exception
+    input cannot be *chained* — CPython allows an exception's
+    ``__cause__`` to be only ``None`` or a ``BaseException`` and raises
+    ``TypeError`` for anything else — so for that one input the text
+    is preserved in the message instead.
+
+    The mapping (plan §4.3, read against
+    ``plan/third-party-docs/docker/errors.md``, re-verified against the
+    installed docker 7.2.0):
+
+    - a 404 whose daemon text names a missing image — an
+      ``ImageNotFound``, or a ``NotFound`` carrying that text (the SDK
+      classifies 404s by string-matching the daemon's message and
+      degrades to the parent when the wording stops matching,
+      errors.md §2) — maps to ``ImageNotFoundError`` naming the image
+      ref;
+    - any other 404 (a vanished container) maps to
+      ``ContainerNotFoundError``;
+    - an ``APIError`` 409 whose daemon text names a taken name maps to
+      ``ContainerNameConflictError`` naming the conflicting name;
+    - an ``APIError`` whose text matches ``_GPU_MESSAGE_FRAGMENTS``
+      case-insensitively maps to ``GpuUnavailableError`` — a brittle
+      message heuristic (plan §7 item 12), not a stable interface;
+    - any other ``APIError`` maps to ``ContainerStartError`` carrying
+      the daemon's text;
+    - a dead daemon — a bare ``requests`` connection error from an
+      operational call, or the construction-path
+      ``DockerException`` "Error while fetching server API version: …"
+      (errors.md §3 [CORRECTED 2026-09-16]) — maps to
+      ``BackendUnavailableError``;
+    - anything else — an unrelated ``DockerException`` included, and a
+      non-exception input — maps to the ``BackendError`` fallback,
+      preserving the text.
+
+    The ``isinstance`` checks below are **ordered and must stay
+    ordered**: ``APIError`` inherits ``requests.exceptions.HTTPError``
+    (errors.md §1), so the broad ``requests`` connection check runs
+    after it — a broad check placed first would swallow every 4xx/5xx
+    API error and turn a 500 into "daemon unavailable"; and a 404 is
+    re-classified by the daemon's message *inside* the ``APIError``
+    branch, before the 409, so the image/container split (including the
+    degraded ``NotFound``) is decided by text rather than by which
+    parent class a later check reaches first.  Do not "tidy" this
+    order.
+
+    Args:
+        exc: The exception to translate — in practice whatever a
+            ``DockerBackend`` method caught from an SDK call
+            (behaviours 21+).  Any value is accepted, not only
+            exceptions.
+
+    Returns:
+        The taxonomy member the caller should raise, with ``exc``
+        chained as its ``__cause__``.
+    """
+    # A non-exception (a programming error at the seam) is the fallback:
+    # the function stays total.  Its text is preserved in the message;
+    # the object itself cannot be chained as ``__cause__`` (CPython
+    # restricts that to ``None`` or a ``BaseException``).
+    if not isinstance(exc, BaseException):
+        return BackendError(text_of(exc))
+
+    # 1. APIError FIRST: it is a requests.exceptions.HTTPError, so any
+    #    broader requests check placed earlier would shadow every real
+    #    API error (test_api_error_not_swallowed_by_requests_catch).
+    if isinstance(exc, docker.errors.APIError):
+        # 404: re-classified by the daemon's message, not the SDK's
+        #    class — an ImageNotFound that degrades to a plain NotFound
+        #    (errors.md §2) must still map as a missing image.
+        if exc.status_code == 404:
+            return _map_not_found(exc)
+        # 409: only a daemon text that names a taken name is a name
+        #    conflict; any other 409 is a refused start.
+        if exc.status_code == 409 and _conflict_name(exc) is not None:
+            return _map_name_conflict(exc)
+        # GPU refusal: no SDK class exists, the message is the only
+        # channel (brittle heuristic — see _GPU_MESSAGE_FRAGMENTS).
+        if _gpu_message(_explanation_or_text(exc)):
+            return _map_gpu_unavailable(exc)
+        return _map_api_error(exc)
+
+    # 2. Operational dead daemon: a bare requests connection error —
+    #    ConnectTimeout included, it is a ConnectionError subclass —
+    #    from a call against an unreachable daemon (errors.md §3).
+    #    APIError was matched above, so only genuinely non-response
+    #    errors reach here.
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return _map_unavailable(exc)
+
+    # 3. Construction-path dead daemon: APIClient.__init__ wraps a
+    #    connection failure in a DockerException "Error while fetching
+    #    server API version: …" with the connection error chained as
+    #    __cause__ (api/client.py:221-232).  The match is on that exact
+    #    template: the *other* _retrieve_server_version wrap — a
+    #    reachable daemon answering without an "ApiVersion" key — is a
+    #    different message and must fall through to the fallback, not
+    #    be called unavailable.
+    if isinstance(exc, docker.errors.DockerException) and str(exc).startswith(
+        "Error while fetching server API version: "
+    ):
+        return _map_unavailable(exc)
+
+    # 4. Fallback: an unrecognised SDK exception (an unrelated
+    #    DockerException included) or any non-exception input.
+    return _backend_error_from(exc, text_of(exc))
+
+
+def _map_not_found(exc: docker.errors.APIError) -> BackendError:
+    """Map a 404 to the missing-image or vanished-container member.
+
+    The daemon's text decides (errors.md §2 "The 404 mapping"): a
+    message naming a missing image maps to ``ImageNotFoundError`` with
+    the image ref in the remedy, whatever class the SDK chose; any
+    other 404 maps to ``ContainerNotFoundError``.
+    """
+    explanation = _explanation_or_text(exc)
+    error: BackendError
+    if any(fragment in explanation.lower() for fragment in _IMAGE_NOT_FOUND_FRAGMENTS):
+        image_ref = explanation.split(_IMAGE_NOT_FOUND_FRAGMENTS[0], 1)[-1].lstrip(": ")
+        error = ImageNotFoundError(
+            f"Image not found: {exc}",
+            remedy=f"The image reference {image_ref!r} does not exist — build it "
+            "with `tswap build <tool>`.",
+        )
+    else:
+        error = ContainerNotFoundError(f"Container not found: {exc}")
+    error.__cause__ = exc
+    return error
+
+
+def _conflict_name(exc: docker.errors.APIError) -> str | None:
+    """Extract the conflicting container name from a 409's daemon text.
+
+    The daemon's shape is ``The container name "/<name>" is already in
+    use by container "<id>"``.  Returns the name without its leading
+    slash, or ``None`` when the text does not carry that shape — such
+    a 409 is a refused start, not a name conflict.
+    """
+    explanation = _explanation_or_text(exc)
+    if _NAME_CONFLICT_PHRASE not in explanation:
+        return None
+    marker = 'The container name "'
+    start = explanation.find(marker)
+    if start == -1:
+        return None
+    name_start = start + len(marker)
+    name_end = explanation.find('"', name_start)
+    if name_end == -1:
+        return None
+    return explanation[name_start:name_end].lstrip("/")
+
+
+def _map_name_conflict(exc: docker.errors.APIError) -> ContainerNameConflictError:
+    """Map a name-conflict 409, naming the conflicting name in the remedy."""
+    name = _conflict_name(exc)
+    error = ContainerNameConflictError(
+        f"Container name conflict: {exc}",
+        remedy=f"The container name {name!r} is already taken — free it with "
+        "`tswap down`.",
+    )
+    error.__cause__ = exc
+    return error
+
+
+def _map_gpu_unavailable(exc: docker.errors.APIError) -> GpuUnavailableError:
+    """Map an unsatisfiable GPU device request (message heuristic)."""
+    error = GpuUnavailableError(
+        f"GPU device request could not be satisfied: {exc}",
+        remedy="Install or repair the NVIDIA container toolkit so the requested "
+        "GPU device can be satisfied.",
+    )
+    error.__cause__ = exc
+    return error
+
+
+def _map_api_error(exc: docker.errors.APIError) -> ContainerStartError:
+    """Map any other APIError to a refused start, carrying the daemon's text."""
+    error = ContainerStartError(f"Daemon refused the start: {exc}")
+    error.__cause__ = exc
+    return error
+
+
+def _map_unavailable(exc: BaseException) -> BackendUnavailableError:
+    """Map a dead-daemon failure (either hierarchy) to unavailable."""
+    error = BackendUnavailableError(f"Container daemon unreachable: {exc}")
+    error.__cause__ = exc
+    return error
+
+
+def _backend_error_from(exc: BaseException, message: str) -> BackendError:
+    """Build the ``BackendError`` fallback, chaining the input as the cause."""
+    error = BackendError(message)
+    error.__cause__ = exc
+    return error
+
+
+def _explanation_or_text(exc: docker.errors.APIError) -> str:
+    """The daemon's text for an ``APIError``: ``explanation``, else ``str()``."""
+    return exc.explanation if exc.explanation is not None else str(exc)
+
+
+def _gpu_message(text: str) -> bool:
+    """Whether an APIError's text matches the GPU refusal heuristic."""
+    lowered = text.lower()
+    return any(fragment in lowered for fragment in _GPU_MESSAGE_FRAGMENTS)
+
+
+def text_of(value: object) -> str:
+    """The text a taxonomy message should carry for *value*.
+
+    An exception's text (``str(exc)``) — which for an ``APIError``
+    includes the daemon's explanation — or ``str(value)`` for a
+    non-exception input, so the fallback never swallows anything.
+    """
+    return str(value)
