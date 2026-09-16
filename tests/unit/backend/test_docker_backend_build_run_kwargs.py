@@ -20,11 +20,14 @@ suite.  docker-py raises ``TypeError`` for any kwarg it does not know
 name fails fast at the SDK layer, not at the daemon.
 
 Deliberately out of scope (later ledger behaviours, each with its own
-red/green cycle): port publication (18), ``map_sdk_error`` (19) and
-the ``DockerBackend`` class itself (20+).  The spec therefore carries
-the structural defaults for the fields those behaviours own
-(``command`` ``None``, ``published_port`` ``None``), and the snapshot
-test pins that none of those keys appears in the output yet.
+red/green cycle): ``map_sdk_error`` (19) and the ``DockerBackend``
+class itself (20+).  The snapshot test's spec keeps the structural
+default for every field those tests own (``command`` ``None``), and
+the snapshot pins that none of those keys appears in the output yet.
+``published_port`` is no longer out of scope in this file: the
+behaviour-18 tests below exercise it, and the snapshot test's spec
+keeps ``published_port=None`` so its exact five-key equality is
+unaffected.
 ``devices`` is no longer out of scope in this file: the behaviour-16
 tests below exercise it, and the snapshot test's spec keeps
 ``devices=()`` so its exact five-key equality is unaffected.
@@ -1177,3 +1180,218 @@ def test_build_run_kwargs_unknown_size_suffix_passes_through_verbatim(
     kwargs = fn(spec, label_namespace=_NAMESPACE)
     # Assert
     assert kwargs[kwarg] == value
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 18 — ``build_run_kwargs``, port publication
+# ---------------------------------------------------------------------------
+#
+# The decisions this section pins, recorded once here rather than restated
+# per test:
+#
+# 1. The mapping is ``{container_port: published_port}`` — the container
+#    port is the **key**, the host port the **value**.  Cited from
+#    ``plan/third-party-docs/docker/containers-run-create.md`` §2, line 84:
+#    the ``ports`` row documents the key as *"container port (``2222/tcp``
+#    form, int, or ``port/protocol`` with ``tcp``/``udp``/``sctp``)"* and
+#    the value as *"host port int, ``None`` (random), ``(address, port)``
+#    tuple, or list of ints"*.  The installed source walks the mapping
+#    key-first when it converts it: ``convert_port_bindings`` iterates
+#    ``port_bindings.items()`` and treats ``k`` as the container port,
+#    building ``HostPort`` from ``v`` (``.venv/lib/python3.11/
+#    site-packages/docker/utils/utils.py`` lines 113–123; the value
+#    handling is ``_convert_port_binding``, lines 85–110).  An inverted
+#    mapping (host port as key) would publish the container's port to the
+#    wrong host address, and only a live container would ever reveal it.
+#
+# 2. The key is the **bare int container port — the pre-normalisation
+#    form, not the post-normalisation ``"8000/tcp"`` string**.  The SDK
+#    adds the protocol suffix itself: ``convert_port_bindings`` does
+#    ``key = str(k); if '/' not in key: key += '/tcp'``
+#    (``.venv/lib/python3.11/site-packages/docker/utils/utils.py`` lines
+#    116–118).  The saved page's §2 line 84 lists the int form alongside
+#    the ``2222/tcp`` form as accepted key shapes, so both reach the same
+#    daemon payload — but the test asserts the shape *we* hand the SDK,
+#    which is the bare int: pinning ``"8000/tcp"`` instead would pass
+#    while the pre-normalisation form (and the int the resolver carries)
+#    silently drifted, and pinning the post-normalisation form would make
+#    the test assert the SDK's output, not our input.  ``spec.container_port``
+#    is an ``int`` (``src/tool_swap/backend/base.py`` line 93), and the
+#    SDK accepts ints (saved page line 84), so no string conversion
+#    belongs in the translation.
+#
+# 3. ``published_port=None`` **omits the ``ports`` key entirely** — the
+#    D21 reading: tools are addressed by container name on the shared
+#    network, so nothing is published in normal operation
+#    (``plan/README.md`` decision table, **D21**; ``src/tool_swap/
+#    backend/base.py`` line 103: ``None publishes nothing``).  The
+#    omission is *our* contract, stricter than the SDK's falsy-drop
+#    (``plan/third-party-docs/docker/containers-run-create.md``
+#    consequence 1, lines 148–152: ``ports`` is dropped when falsy, and
+#    "behaviours 15 and 18 should still omit the key"; installed source
+#    ``docker/models/containers.py`` lines 1138–1140: ``ports = kwargs.
+#    pop('ports', {}); if ports:``).
+#
+# 4. **A host port outside ``BackendConfig.port_range`` is not rejected
+#    here.**  Range policy is config validation's; the container backend
+#    "must not contain policy. It is a dumb driver behind an interface"
+#    (``plan/01_ARCHITECTURE.md`` §2.1, line 158).  No test in this file
+#    asserts that the driver rejects an out-of-range port — doing so
+#    would pin the wrong contract, and the plan's behaviour-18 edge-case
+#    clause names this explicitly.
+#
+# 5. **The plan's error clause — "a port ≤ 0 raises ``ValueError``" —
+#    is read to cover *both* ports.**  The clause names no field, and
+#    both ``spec.container_port`` and ``spec.published_port`` are ports
+#    the translation consumes: ``container_port`` is the mapping key and
+#    ``published_port`` the value, so a non-positive value on *either*
+#    side would travel to the daemon as an invalid port.  ``container_port``
+#    also serves the health probe later (behaviours 24+ read it via the
+#    handle), where a non-positive value is equally malformed.  This is
+#    well-formedness, not the ``port_range`` policy of decision point 4:
+#    every port a resolved spec carries must be usable by the daemon, and
+#    ``≤ 0`` is not.  Both are caller programming errors raised *before
+#    any SDK call*, so a plain ``ValueError``, not a member of the
+#    seven-member taxonomy in ``tool_swap.backend.errors`` (the same
+#    reasoning as behaviour 14's empty-image check and behaviour 16's
+#    negative-index check).
+#
+# 6. ``published_port=None`` is the built-in default (D21 — nothing
+#    published), and the spec's ``published_port`` field defaults to
+#    ``None`` (``src/tool_swap/backend/base.py`` line 103).  The
+#    ``container_port`` value in the mapping tests is read live from
+#    ``BUILT_IN_DEFAULTS["container_port"]`` (``src/tool_swap/config/
+#    defaults.py`` line 54) — restating ``8000`` here would be the second
+#    copy behaviours 4, 6, 7 and 17 refuse to make.
+
+
+def test_build_run_kwargs_published_port_none_omits_ports_key() -> None:
+    """Edge case: ``published_port=None`` omits the ``ports`` key.
+
+    The D21 reading: nothing is published in normal operation, and
+    ``container_port`` alone (which the health probe uses later) must
+    not produce a ``ports`` key.  The omission is *our* contract,
+    stricter than the SDK's falsy-drop (``plan/third-party-docs/docker/
+    containers-run-create.md`` consequence 1, lines 148–152; installed
+    source ``docker/models/containers.py`` lines 1138–1140).
+    """
+    # Arrange: the built-in default — nothing published.
+    spec = _spec(published_port=None)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "ports" not in kwargs
+
+
+def test_build_run_kwargs_publishes_container_port_to_host_port() -> None:
+    """``published_port=7001`` publishes the container port to host 7001.
+
+    The mapping is ``{spec.container_port: spec.published_port}`` —
+    container port as the **key**, host port as the **value**
+    (``plan/third-party-docs/docker/containers-run-create.md`` §2, line
+    84; installed source ``docker/utils/utils.py`` lines 113–123 walks
+    the mapping key-first).  The key is the **bare int** container port —
+    the *pre-normalisation* form we hand the SDK; the SDK appends
+    ``"/tcp"`` itself (``docker/utils/utils.py`` lines 116–118), so this
+    test asserts what *we* pass, not what the SDK does next.  The
+    ``container_port`` value is read live from
+    ``BUILT_IN_DEFAULTS["container_port"]`` — never restated.
+    """
+    # Arrange: the built-in container port, read live, never restated.
+    default_port = BUILT_IN_DEFAULTS["container_port"]
+    assert isinstance(default_port, int)
+    spec = _spec(published_port=7001, container_port=default_port)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert: the pre-normalisation form — bare int key, int value.
+    assert kwargs["ports"] == {default_port: 7001}
+
+
+def test_build_run_kwargs_ports_key_is_bare_int_not_protocol_suffixed() -> None:
+    """The key is the bare int container port, not ``"8000/tcp"``.
+
+    The SDK adds the protocol suffix when it is missing (``.venv/lib/
+    python3.11/site-packages/docker/utils/utils.py`` lines 116–118:
+    ``key = str(k); if '/' not in key: key += '/tcp'``), so both the int
+    and the suffixed string reach the same daemon payload — but the test
+    asserts the shape *we* pass, which is the bare int: ``spec.
+    container_port`` is an ``int`` (``src/tool_swap/backend/base.py``
+    line 93) and the saved page lists the int form as an accepted key
+    (``containers-run-create.md`` §2, line 84).  A translation that
+    pre-suffixed the key to ``"8000/tcp"`` would pass the SDK's
+    normalization and silently drift from the int the resolver carries;
+    pinning the bare int is what catches it.
+    """
+    # Arrange: the built-in container port, read live, never restated.
+    default_port = BUILT_IN_DEFAULTS["container_port"]
+    assert isinstance(default_port, int)
+    spec = _spec(published_port=7001, container_port=default_port)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert: the key is an int, not a string with or without "/tcp".
+    ports = kwargs["ports"]
+    assert isinstance(ports, dict)
+    (key,) = ports
+    assert isinstance(key, int)
+    assert not isinstance(key, bool)
+    assert key == default_port
+    assert ports[key] == 7001
+
+
+def test_build_run_kwargs_out_of_range_host_port_is_not_rejected() -> None:
+    """Edge case: a host port outside ``port_range`` is not rejected here.
+
+    Range policy is config validation's, explicitly — the container
+    backend "must not contain policy. It is a dumb driver behind an
+    interface" (``plan/01_ARCHITECTURE.md`` §2.1, line 158), and the
+    plan's behaviour-18 edge-case clause names this.  The translation
+    therefore passes an out-of-range host port through verbatim rather
+    than raising; a driver that rejected it would be asserting the wrong
+    contract.  The value is deliberately far outside the built-in
+    ``port_range`` (``src/tool_swap/config/defaults.py`` line 76:
+    ``[7000, 7999]``) so a policy check, if introduced, would trip.
+    """
+    # Arrange: a host port far outside the built-in range.
+    spec = _spec(published_port=60000)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert: passed through verbatim, no range check.
+    assert kwargs["ports"] == {spec.container_port: 60000}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("container_port", -1),
+        ("container_port", 0),
+        ("published_port", -1),
+        ("published_port", 0),
+    ],
+)
+def test_build_run_kwargs_non_positive_port_raises_value_error(
+    field: str, value: int
+) -> None:
+    """Error behaviour: a port ≤ 0 raises plain ``ValueError``.
+
+    The plan's clause — "a port ≤ 0 raises ``ValueError``" — names no
+    field, and both ports the translation consumes are covered:
+    ``container_port`` is the mapping key, ``published_port`` the value,
+    and ``container_port`` also serves the health probe later, where a
+    non-positive value is equally malformed.  ``≤ 0`` is
+    well-formedness, not the ``port_range`` policy (see this section's
+    header, decision point 5).  A caller programming error raised *before
+    any SDK call* — a plain ``ValueError``, not a member of the
+    seven-member taxonomy in ``tool_swap.backend.errors`` (the same
+    reasoning as behaviour 14's empty-image and behaviour 16's
+    negative-index checks).
+    """
+    # Arrange: the non-positive port on the named field.
+    spec = _spec(**{field: value})
+    fn = _build_run_kwargs()
+    # Act / Assert
+    with pytest.raises(ValueError):
+        fn(spec, label_namespace=_NAMESPACE)
