@@ -11,10 +11,14 @@ missing container rather than raising, ``inspect`` returns
 
 Behaviour 11 adds the first scripted failure: a tool scripted
 ``FAIL_TO_START`` refuses to start with ``ContainerStartError`` —
-repeatedly, and recording nothing.  The remaining behaviours extend
-this same module, each with its own red step: death and ``vanish()``
-(12), ``logs`` and the ``fake.calls`` journal (13);
-``DIE_AFTER_START`` is stored but still un-honoured.
+repeatedly, and recording nothing.  Behaviour 12 honours
+``DIE_AFTER_START`` — the start succeeds and returns a handle, but the
+record is created already ``EXITED`` with a non-zero exit code, so the
+container is dead by the first observation with no daemon, clock or
+thread — and adds ``vanish()``, a test-control method (not a
+``ContainerBackend`` member) that removes a container's record out of
+band.  One behaviour extends this same module, with its own red step:
+``logs`` and the ``fake.calls`` journal (13).
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from tool_swap.backend.base import (
 )
 from tool_swap.backend.errors import (
     ContainerNameConflictError,
+    ContainerNotFoundError,
     ContainerStartError,
 )
 
@@ -43,8 +48,7 @@ class FailureMode(StrEnum):
     Exactly two members in M2a: ``STOP_HANGS`` was dropped from the
     milestone (plan §7 assumption 5) and "never ready" is the M2b
     probe's concern, not the fake's.  Behaviour 11 honours
-    ``FAIL_TO_START``; behaviour 10 stores scripts but acts on none of
-    them.
+    ``FAIL_TO_START`` and behaviour 12 honours ``DIE_AFTER_START``.
     """
 
     FAIL_TO_START = "fail_to_start"
@@ -82,8 +86,9 @@ class FakeBackend:
             script: Tool name to scripted failure, as declared by
                 §4.4.  Behaviour 11 honours ``FAIL_TO_START`` through
                 this argument: a scripted tool refuses to start,
-                repeatedly, recording nothing.  ``DIE_AFTER_START`` is
-                stored but un-honoured until behaviour 12.
+                repeatedly, recording nothing.  Behaviour 12 honours
+                ``DIE_AFTER_START``: the start succeeds, but the
+                container is already dead by the first observation.
         """
         self._script = script
         self._lock = threading.Lock()
@@ -103,6 +108,14 @@ class FakeBackend:
         unaffected, and the refusal repeats on every call — the
         script is not one-shot, so a retry loop can never silently
         succeed.
+
+        A tool scripted ``DIE_AFTER_START`` starts — this is a death,
+        not a refusal — but its record is created already ``EXITED``
+        with a non-zero exit code: the fake has no daemon, clock or
+        thread, so there is no observable ``RUNNING`` window and the
+        container is dead by the first observation (plan §6 item 4).
+        Like a stopped one it stays in ``list_managed``; only
+        :meth:`vanish` removes a record.
 
         Args:
             spec: The fully resolved container to start.
@@ -136,9 +149,15 @@ class FakeBackend:
                 tool=spec.tool,
                 image=spec.image,
             )
+            if scripted is FailureMode.DIE_AFTER_START:
+                # The plan pins only "non-zero"; no saved document
+                # names a code, so the simplest non-zero one stands.
+                state, exit_code = ContainerState.EXITED, 1
+            else:
+                state, exit_code = ContainerState.RUNNING, None
             self._containers[handle] = _Container(
-                state=ContainerState.RUNNING,
-                exit_code=None,
+                state=state,
+                exit_code=exit_code,
             )
             return handle
 
@@ -240,3 +259,38 @@ class FakeBackend:
                 step for this method.
         """
         raise NotImplementedError("FakeBackend.logs is implemented in M2a behaviour 13")
+
+    # Test control, not seam surface: the methods above are the
+    # ``ContainerBackend`` contract; everything below exists only so a
+    # test can drive states the fake cannot reach on its own.
+
+    def vanish(self, handle: ContainerHandle) -> None:
+        """Test control: remove the container's record out of band.
+
+        This method is **not** a ``ContainerBackend`` member — it is
+        an affordance for tests, like the ``script`` argument, and
+        must never be called by ``LifecycleManager`` or any other
+        seam consumer.  It stands in for removal the backend cannot
+        see (``docker rm -f`` behind its back), so afterwards the
+        handle reads exactly like one that was never started:
+        ``is_running`` ``False``, ``inspect`` ``GONE``, ``stop`` a
+        no-op — the §4.3 not-found contract.  Nothing but this method
+        removes a record, which is why a dead or stopped container
+        stays in ``list_managed`` while a vanished one disappears
+        (plan §6 item 5).
+
+        Args:
+            handle: The container whose record is removed.
+
+        Raises:
+            ContainerNotFoundError: the backend does not manage the
+                handle — ``vanish`` is an active operation, so naming
+                a container that is not there raises, unlike the
+                lenient read side.
+        """
+        with self._lock:
+            if handle not in self._containers:
+                raise ContainerNotFoundError(
+                    f"container {handle.name!r} is not managed by this backend"
+                )
+            del self._containers[handle]
