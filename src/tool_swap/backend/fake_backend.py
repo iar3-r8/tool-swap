@@ -9,11 +9,12 @@ missing container rather than raising, ``inspect`` returns
 ``ContainerState.GONE``, and ``stop`` on a missing container is a no-op
 — because M2b's liveness sweep relies on exactly that.
 
-Later behaviours on the same branch extend this module, each with its
-own red step: scripted ``FAIL_TO_START`` (behaviour 11), death and
-``vanish()`` (12), ``logs`` and the ``fake.calls`` journal (13).
-The ``script`` parameter and the in-memory records exist now so those
-behaviours are additive; nothing here acts on the script yet.
+Behaviour 11 adds the first scripted failure: a tool scripted
+``FAIL_TO_START`` refuses to start with ``ContainerStartError`` —
+repeatedly, and recording nothing.  The remaining behaviours extend
+this same module, each with its own red step: death and ``vanish()``
+(12), ``logs`` and the ``fake.calls`` journal (13);
+``DIE_AFTER_START`` is stored but still un-honoured.
 """
 
 from __future__ import annotations
@@ -30,7 +31,10 @@ from tool_swap.backend.base import (
     ContainerState,
     ContainerStatus,
 )
-from tool_swap.backend.errors import ContainerNameConflictError
+from tool_swap.backend.errors import (
+    ContainerNameConflictError,
+    ContainerStartError,
+)
 
 
 class FailureMode(StrEnum):
@@ -76,9 +80,10 @@ class FakeBackend:
 
         Args:
             script: Tool name to scripted failure, as declared by
-                §4.4.  Behaviour 10 stores it and honours none of it —
-                acting on scripts is behaviour 11, which scripts
-                ``FAIL_TO_START`` through exactly this argument.
+                §4.4.  Behaviour 11 honours ``FAIL_TO_START`` through
+                this argument: a scripted tool refuses to start,
+                repeatedly, recording nothing.  ``DIE_AFTER_START`` is
+                stored but un-honoured until behaviour 12.
         """
         self._script = script
         self._lock = threading.Lock()
@@ -93,6 +98,12 @@ class FakeBackend:
         the real runtime until the container is removed — raises
         :class:`ContainerNameConflictError`; no record is created.
 
+        A tool scripted ``FAIL_TO_START`` refuses before anything is
+        recorded: no container is created and ``list_managed`` is
+        unaffected, and the refusal repeats on every call — the
+        script is not one-shot, so a retry loop can never silently
+        succeed.
+
         Args:
             spec: The fully resolved container to start.
 
@@ -100,10 +111,20 @@ class FakeBackend:
             The handle of the now-running container.
 
         Raises:
+            ContainerStartError: ``spec.tool`` is scripted
+                ``FAIL_TO_START``.
             ContainerNameConflictError: ``spec.name`` is already
                 managed by this backend.
         """
         with self._lock:
+            # The refusal precedes the name-conflict check and every
+            # mutation, so a scripted tool records no partial state.
+            scripted = None if self._script is None else self._script.get(spec.tool)
+            if scripted is FailureMode.FAIL_TO_START:
+                raise ContainerStartError(
+                    f"tool {spec.tool!r} refused to start: "
+                    f"scripted failure {scripted.value}"
+                )
             for existing in self._containers:
                 if existing.name == spec.name:
                     raise ContainerNameConflictError(
