@@ -6,7 +6,7 @@
     },
 
     "runArgs": [
-        "--network=host",
+        "--add-host=host.docker.internal:host-gateway",
         "--security-opt=no-new-privileges:true",
         "--cap-drop=ALL",
         "--shm-size=2g"

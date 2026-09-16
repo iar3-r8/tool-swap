@@ -9,3 +9,7 @@ anvil.local.yaml
 zoo-code-settings.json
 .roo/mcp.json
 .venv/.anvil-requirements-stamp
+
+# Python bytecode caches — nothing matching these was tracked when added.
+__pycache__/
+*.py[cod]
