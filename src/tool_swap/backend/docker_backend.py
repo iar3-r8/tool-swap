@@ -41,8 +41,8 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
     state with another.
 
     The output carries exactly the keys ``image``, ``name``, ``labels``
-    and, when non-empty, ``environment``, ``network``, ``volumes`` and
-    ``device_requests``.
+    and, when set, ``environment``, ``network``, ``volumes``,
+    ``device_requests``, ``nano_cpus``, ``mem_limit`` and ``shm_size``.
     ``labels`` is the full :func:`managed_labels` set for
     *label_namespace* and the spec's tool, with the spec's own labels
     merged in (collision precedence is deliberately not decided by
@@ -65,8 +65,14 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         always ``image``, ``name`` and ``labels``; ``environment`` only
         when ``spec.env`` is non-empty, ``network`` only when
         ``spec.network`` is not ``None``, ``volumes`` only when
-        ``spec.mounts`` is non-empty, and ``device_requests`` (one
-        ``DeviceRequest``) only when ``spec.devices`` is non-empty.
+        ``spec.mounts`` is non-empty, ``device_requests`` (one
+        ``DeviceRequest``) only when ``spec.devices`` is non-empty,
+        ``nano_cpus`` only when ``spec.cpus`` is not ``None``, and
+        ``mem_limit`` / ``shm_size`` only when the matching spec field
+        is not ``None``.  Size strings are passed through verbatim —
+        parsing them is the SDK's job (``HostConfig`` calls
+        ``parse_bytes``), so no local size-string check is made here
+        (plan §5 behaviour 17, amended).
 
     Raises:
         ValueError: ``spec.image`` is empty, or a ``spec.devices`` index
@@ -89,6 +95,16 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         kwargs["volumes"] = _volumes_from_mounts(spec.mounts)
     if spec.devices:
         kwargs["device_requests"] = _device_requests_from_devices(spec)
+    if spec.cpus is not None:
+        # nano_cpus is an int in units of 1e-9 CPUs (models/containers.py:681).
+        # round() — not int() — because the float product can land just
+        # below the true integer (e.g. 1.001 * 1e9 == 1000999999.9999999),
+        # which int() would truncate and drop a whole nano-CPU.
+        kwargs["nano_cpus"] = round(spec.cpus * 1e9)
+    if spec.memory is not None:
+        kwargs["mem_limit"] = spec.memory
+    if spec.shm_size is not None:
+        kwargs["shm_size"] = spec.shm_size
     return kwargs
 
 
