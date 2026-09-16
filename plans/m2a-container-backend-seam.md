@@ -1054,8 +1054,37 @@ all** — no `reload()` follows the start, since that would put state-polling lo
 - **Edge cases:** `cpus` is a float in the config but the SDK's quota field may be an integer
   in different units — the conversion is pinned by the saved reference and snapshotted;
   a `memory` string with an unknown suffix.
-- **Error behaviour:** an unparseable size string raises `ValueError` naming the field and the
-  accepted forms.
+- **Error behaviour — amended during the red step; the original clause was wrong.** The
+  original text required an unparseable size string to raise `ValueError` naming the field and
+  the accepted forms. **`build_run_kwargs` raises nothing for a size string**, for two reasons
+  established from the installed docker 7.2.0 rather than assumed:
+
+  1. **The SDK already parses these strings and already produces that message.**
+     `HostConfig.__init__` calls `parse_bytes` on `mem_limit` and on a string `shm_size`, and
+     `parse_bytes` raises with *"should specify the units. The postfix should be one of the
+     `b` `k` `m` `g` characters"* — which is the "names the accepted forms" contract the clause
+     asked for, owned by the layer that also owns the suffix table. Note it is a
+     `DockerException`, **not** a `ValueError`, so the original clause could not have been
+     satisfied by passing the string through.
+  2. **A local form-checker would be a second parser**, and would have to re-list the SDK's
+     suffix table from `docker/constants.py` to do it — free to drift from the real one. That
+     is the duplication §4.2 removed for mounts, in a new place.
+
+  **Config validation cannot own this either**: searched, and `src/tool_swap/config/` has no
+  size-string rule at all — `schema.py` types `memory` as `str | None` and `shm_size` as `str`
+  with no pattern and no validator. So unlike mounts, there is nothing to defer to. **A
+  `TSWAP-C5xx` rule for size strings would be the better fix and belongs to the config layer**
+  (recorded as §7 item 11). Until it exists, an authored `"16zz"` reaches the daemon call and
+  fails there with the SDK's own message.
+
+  The behaviour therefore **passes size strings through verbatim**, and the red step pins that
+  rather than a `ValueError`.
+- **`cpus` conversion, pinned from source:** the SDK has **no `cpus` kwarg**. `cpus=4.0`
+  becomes `nano_cpus=4_000_000_000` — *"CPU quota in units of 1e-9 CPUs"*, an **int**, which
+  `HostConfig` type-checks. The `cpu_quota`/`cpu_period` pair is the alternative mechanism and
+  is **not** emitted: it would need a period value nothing in this plan pins, and emitting both
+  mechanisms for one limit is the double-selection mistake behaviour 16 avoided for
+  `driver` versus `runtime`. The red step pins both keys absent.
 - **Files:** `src/tool_swap/backend/docker_backend.py`.
 - **Verified:** snapshot. Pure.
 
@@ -1299,3 +1328,11 @@ knows whether a process exists; everything above that is M2b's.
     `backend.container_prefix` reaches behaviour 7 unjudged, which is why that behaviour's
     `ValueError` names the prefix. **A `TSWAP-C5xx` rule for `container_prefix` would be the
     better fix and belongs to the config layer, not to M2a.** Not filed by this task.
+11. **No config rule validates a size string either — found during behaviour 17.**
+    `defaults.shm_size` and `memory` are typed as plain strings by
+    [`schema.py`](../src/tool_swap/config/schema.py:150) with no pattern and no validator, so
+    an authored `"16zz"` passes validation, passes `build_run_kwargs` untouched (behaviour
+    17's amended error clause) and fails only at the daemon call, with the SDK's message
+    rather than a `TSWAP-C5xx` one naming the file and line. **A config rule is the right fix
+    and belongs to the config layer, not to M2a** — the same shape of gap as item 10, and the
+    reason behaviour 17 ships no size parser of its own. Not filed by this task.

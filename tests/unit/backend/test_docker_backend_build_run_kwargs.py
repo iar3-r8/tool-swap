@@ -1,6 +1,6 @@
 """RED step for M2a behaviour 14 (core translation), behaviour 15
-(mounts) and behaviour 16 (GPU device requests) —
-``build_run_kwargs``.
+(mounts), behaviour 16 (GPU device requests) and behaviour 17
+(resource limits) — ``build_run_kwargs``.
 
 See ``plans/m2a-container-backend-seam.md`` §5 behaviour 14 (amended),
 behaviour 16 and §0.1.2 pull request A:
@@ -20,16 +20,18 @@ suite.  docker-py raises ``TypeError`` for any kwarg it does not know
 name fails fast at the SDK layer, not at the daemon.
 
 Deliberately out of scope (later ledger behaviours, each with its own
-red/green cycle): resource limits (17), port publication (18),
-``map_sdk_error`` (19) and the ``DockerBackend`` class itself (20+).
-The spec therefore carries the structural defaults for the fields
-those behaviours own (``command`` ``None``, ``devices`` ``()``,
-``shm_size`` ``None``, ``cpus`` ``None``, ``memory`` ``None``,
-``published_port`` ``None``), and the snapshot test pins that none of
-those keys appears in the output yet.  ``devices`` is no longer out of
-scope in this file: the behaviour-16 tests below exercise it, and the
-snapshot test's spec keeps ``devices=()`` so its exact five-key
-equality is unaffected.
+red/green cycle): port publication (18), ``map_sdk_error`` (19) and
+the ``DockerBackend`` class itself (20+).  The spec therefore carries
+the structural defaults for the fields those behaviours own
+(``command`` ``None``, ``published_port`` ``None``), and the snapshot
+test pins that none of those keys appears in the output yet.
+``devices`` is no longer out of scope in this file: the behaviour-16
+tests below exercise it, and the snapshot test's spec keeps
+``devices=()`` so its exact five-key equality is unaffected.
+``shm_size``, ``cpus`` and ``memory`` are no longer out of scope in
+this file: the behaviour-17 tests below exercise them, and the
+behaviour-14 snapshot test's spec keeps them ``None`` so its exact
+five-key equality is unaffected.
 ``mounts`` is no longer out of scope in this file: the behaviour-15
 tests below exercise it, and the snapshot test's spec keeps
 ``mounts=()`` so its exact five-key equality is unaffected.
@@ -122,6 +124,7 @@ import pytest
 
 from tool_swap.backend.base import ContainerSpec, MountSpec
 from tool_swap.backend.labels import managed_labels
+from tool_swap.config.defaults import BUILT_IN_DEFAULTS
 
 # Neutral label namespace, deliberately distinct from
 # BUILT_IN_DEFAULTS["label_namespace"] — this file must not restate a
@@ -877,3 +880,300 @@ def test_build_run_kwargs_negative_device_index_raises_value_error() -> None:
     # Act / Assert
     with pytest.raises(ValueError):
         fn(spec, label_namespace=_NAMESPACE)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 17 — ``build_run_kwargs``, resource limits
+# ---------------------------------------------------------------------------
+#
+# The decisions this section pins, recorded once here rather than restated
+# per test:
+#
+# 1. The CPU limit travels as ``nano_cpus`` — one kwarg, no ``cpu_period``.
+#    The saved reference ``plan/third-party-docs/docker/
+#    containers-run-create.md`` §2 (line 82) lists the mechanisms:
+#    ``cpu_quota`` (int, "Microseconds of CPU time that the container can
+#    get in a CPU period") paired with ``cpu_period`` (int, microseconds),
+#    or ``nano_cpus`` — "CPU quota in units of 1e-9 CPUs" (installed
+#    docstring ``.venv/lib/python3.11/site-packages/docker/models/
+#    containers.py:681``).  ``nano_cpus`` is in ``RUN_HOST_CONFIG_KWARGS``
+#    (same page, routing table, line 1098; ``models/containers.py:1098``),
+#    so ``create`` accepts it.  It is chosen over the ``cpu_quota`` +
+#    ``cpu_period`` pair because the pair requires a period value the plan
+#    pins nowhere — inventing one would be an unsourced constant — and
+#    because emitting both mechanisms for one limit is the same
+#    double-selection mistake behaviour 16 avoided.  ``HostConfig``
+#    requires the field to be an ``int`` (``docker/types/containers.py:
+#    621-623``: non-int raises a host-config type error before any daemon
+#    call), so the float ``spec.cpus`` is converted before emission:
+#    ``cpus=4.0`` is ``nano_cpus=4_000_000_000`` — 4 CPUs × 1e9, the
+#    "units of 1e-9 CPUs" convention — and the conversion is snapshotted.
+#
+# 2. ``memory`` and ``shm_size`` travel as **strings, verbatim** — the
+#    translation does not parse them.  ``mem_limit`` is ``int or str`` with
+#    the documented string forms ``100000b``, ``1000k``, ``128m``, ``1g``
+#    (``plan/third-party-docs/docker/containers-run-create.md`` §2, line 83;
+#    installed docstring ``models/containers.py:665-670``), and
+#    ``shm_size`` is ``str or int`` (same page, line 81;
+#    ``models/containers.py:757``: "Size of /dev/shm (e.g. ``1G``)").  The
+#    SDK parses strings *itself*: ``HostConfig.__init__`` calls
+#    ``parse_bytes`` on ``mem_limit`` (``docker/types/containers.py:
+#    289-290``) and on a str ``shm_size`` (``types/containers.py:309-313``).
+#    A local size-string parser would duplicate ``docker.utils.parse_bytes``
+#    — a second parser of exactly the kind plan §4.2 removed for mounts —
+#    and would have to re-list ``BYTE_UNITS`` (``docker/constants.py:
+#    17-22``), drifting from the SDK.  Config validation owns no size rule
+#    to defer to either: ``src/tool_swap/config/schema.py:194-207`` types
+#    ``memory`` as ``str | None`` and ``shm_size`` as ``str`` with no
+#    pattern or validator, and ``src/tool_swap/config/validate.py``
+#    contains no size rule.  Consequence: the plan's behaviour-17 error
+#    clause ("an unparseable size string raises ``ValueError`` naming the
+#    field and the accepted forms") does **not** apply to the pure
+#    translation — the SDK rejects an unknown suffix itself, at
+#    ``create`` time, with ``DockerException`` naming the accepted
+#    postfixes ``b``/``k``/``m``/``g`` (``docker/utils/utils.py:443-446``)
+#    — and the tests below pin the pass-through instead of a local
+#    ``ValueError``.
+#
+# 3. Each ``None`` limit **omits its key** — the omission is *our*
+#    contract, stricter than the SDK's own falsy-drops
+#    (``docker/types/containers.py:289`` ``if mem_limit is not None``,
+#    ``:309`` ``if shm_size is not None``, ``:621`` ``if nano_cpus:``),
+#    per the same reasoning as the behaviour-14/15 omission pins
+#    (``plan/third-party-docs/docker/containers-run-create.md``
+#    consequence 1).
+
+
+@pytest.mark.parametrize(
+    ("cpus", "expected_nano_cpus"),
+    [(4.0, 4_000_000_000), (2.5, 2_500_000_000)],
+)
+def test_build_run_kwargs_cpus_converted_to_nano_cpus(
+    cpus: float, expected_nano_cpus: int
+) -> None:
+    """The config's float CPU limit is emitted as an integer ``nano_cpus``.
+
+    ``cpus`` is a ``float`` (``src/tool_swap/backend/base.py``:
+    ``cpus: float | None``) while the SDK's quota field ``nano_cpus`` is an
+    ``int`` in units of 1e-9 CPUs (installed docstring
+    ``.venv/lib/python3.11/site-packages/docker/models/containers.py:681``;
+    ``plan/third-party-docs/docker/containers-run-create.md`` §2, line 82),
+    so ``cpus=4.0`` is ``nano_cpus=4_000_000_000`` — 4 CPUs × 1e9 — and the
+    fractional case ``cpus=2.5`` is ``2_500_000_000``.  The conversion is
+    snapshotted here: a wrong multiplier (e.g. the microseconds-per-CPU
+    figure of the ``cpu_period`` mechanism, 100 000 at a 100 ms period)
+    would move the value by five orders of magnitude, and only a live
+    container would ever reveal it.
+    """
+    # Arrange
+    spec = _spec(cpus=cpus)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["nano_cpus"] == expected_nano_cpus
+
+
+def test_build_run_kwargs_nano_cpus_is_int_not_float() -> None:
+    """``nano_cpus`` is an ``int`` — a float would be a client-side error.
+
+    ``HostConfig`` type-checks the field: a non-``int`` raises a
+    host-config type error before any daemon call (``.venv/
+    lib/python3.11/site-packages/docker/types/containers.py:621-623``; the
+    docstring type is ``int``, ``models/containers.py:681``).  The
+    conversion to ``int`` therefore happens in the translation, so the
+    returned dict is already safe to ``**``-unpack into
+    ``client.containers.create``.
+    """
+    # Arrange
+    spec = _spec(cpus=4.0)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    value = kwargs["nano_cpus"]
+    assert isinstance(value, int)
+    assert not isinstance(value, bool)
+    assert value == 4_000_000_000
+
+
+def test_build_run_kwargs_cpus_emits_nano_cpus_not_cpu_quota_pair() -> None:
+    """Only ``nano_cpus`` is emitted — never the ``cpu_quota`` pair.
+
+    The saved reference (``plan/third-party-docs/docker/
+    containers-run-create.md`` §2, line 82) lists the pair as the
+    *alternative* mechanism ("pair with ``cpu_period`` … or use
+    ``nano_cpus``"); both are in ``RUN_HOST_CONFIG_KWARGS`` (routing
+    table, lines 1066-1067).  Emitting both mechanisms for one limit is
+    the same double-selection mistake behaviour 16 avoided for
+    ``driver`` versus ``runtime``, and the pair would require a
+    ``cpu_period`` value the plan pins nowhere.
+    """
+    # Arrange
+    spec = _spec(cpus=4.0)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "cpu_quota" not in kwargs
+    assert "cpu_period" not in kwargs
+
+
+def test_build_run_kwargs_cpus_none_omits_all_cpu_quota_keys() -> None:
+    """Edge case: ``cpus=None`` omits every CPU-quota key, not just one.
+
+    The omission is *our* contract, stricter than ``HostConfig``'s own
+    falsy-drop (``docker/types/containers.py:621``: ``if nano_cpus:``),
+    per the behaviour-14/15 omission pins.  All three quota keys are named
+    so a translation that defaults one of them to ``0`` is caught: ``0``
+    is a different limit (no CPU) than no limit at all.
+    """
+    # Arrange
+    spec = _spec(cpus=None)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "nano_cpus" not in kwargs
+    assert "cpu_quota" not in kwargs
+    assert "cpu_period" not in kwargs
+
+
+def test_build_run_kwargs_carries_shm_size_verbatim() -> None:
+    """The built-in ``shm_size`` default travels verbatim under ``shm_size``.
+
+    The value is read live from ``BUILT_IN_DEFAULTS["shm_size"]``
+    (``src/tool_swap/config/defaults.py``) — restating it here would be the
+    second copy behaviours 4, 6 and 7 refuse to make.  The string form is
+    what the SDK expects: ``shm_size`` is ``str or int`` (``plan/
+    third-party-docs/docker/containers-run-create.md`` §2, line 81;
+    installed docstring ``models/containers.py:757``: "Size of /dev/shm
+    (e.g. ``1G``)"), and ``HostConfig`` parses a str value itself via
+    ``parse_bytes`` (``docker/types/containers.py:309-313``) — so the
+    translation passes the string through, unit character included.
+    """
+    # Arrange: the built-in default, read live, never restated.
+    default_shm = BUILT_IN_DEFAULTS["shm_size"]
+    assert isinstance(default_shm, str)
+    spec = _spec(shm_size=default_shm)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["shm_size"] == default_shm
+
+
+def test_build_run_kwargs_carries_memory_verbatim() -> None:
+    """A ``memory`` string travels verbatim under the exact kwarg
+    ``mem_limit``.
+
+    ``mem_limit`` is ``int or str`` — bytes, or a string with a unit char
+    (``100000b``, ``1000k``, ``128m``, ``1g``); a unitless string means
+    bytes (``plan/third-party-docs/docker/containers-run-create.md`` §2,
+    line 83; installed docstring ``models/containers.py:665-670``;
+    ``RUN_HOST_CONFIG_KWARGS``, routing table line 1093).  ``HostConfig``
+    calls ``parse_bytes`` on it (``docker/types/containers.py:289-290``),
+    so the translation passes the string through unchanged.  The kwarg
+    name is ``mem_limit``, not ``memory`` — a typo'd name would be a
+    ``TypeError`` at routing step 6 of the same page.
+    """
+    # Arrange
+    spec = _spec(memory="16g")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["mem_limit"] == "16g"
+
+
+def test_build_run_kwargs_memory_unitless_string_passes_through() -> None:
+    """Edge case: a unitless ``memory`` string passes through as the
+    documented bytes form.
+
+    The SDK documents "if a string is specified without a units
+    character, bytes are assumed as an intended unit" (installed
+    docstring ``models/containers.py:665-670``; ``plan/
+    third-party-docs/docker/containers-run-create.md`` §2, line 83), and
+    ``parse_bytes`` implements exactly that branch (``docker/utils/
+    utils.py:423-427``).  A translation that *converted* the string to
+    an int here would be a local size parser (see this section's header)
+    and would fail this pass-through pin.
+    """
+    # Arrange
+    spec = _spec(memory="536870912")
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["mem_limit"] == "536870912"
+
+
+def test_build_run_kwargs_memory_none_omits_mem_limit_key() -> None:
+    """Edge case: ``memory=None`` omits the ``mem_limit`` key.
+
+    The omission is *our* contract, stricter than ``HostConfig``'s own
+    drop (``docker/types/containers.py:289``: ``if mem_limit is not
+    None``), per the behaviour-14/15 omission pins.  ``None`` is the
+    built-in default (``BUILT_IN_DEFAULTS["memory"]``,
+    ``src/tool_swap/config/defaults.py``) — unlimited — and "unlimited"
+    must not travel as a key the daemon would have to interpret.
+    """
+    # Arrange
+    spec = _spec(memory=None)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "mem_limit" not in kwargs
+
+
+def test_build_run_kwargs_shm_size_none_omits_shm_size_key() -> None:
+    """Edge case: ``shm_size=None`` omits the ``shm_size`` key.
+
+    The omission is *our* contract, stricter than ``HostConfig``'s own
+    drop (``docker/types/containers.py:309``: ``if shm_size is not
+    None``), per the behaviour-14/15 omission pins.  ``ContainerSpec``
+    types the field ``str | None`` (``src/tool_swap/backend/base.py``),
+    so a spec that resolves it to "unset" carries ``None`` and must
+    emit no key.
+    """
+    # Arrange
+    spec = _spec(shm_size=None)
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "shm_size" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "kwarg"),
+    [("memory", "16zz", "mem_limit"), ("shm_size", "2zz", "shm_size")],
+)
+def test_build_run_kwargs_unknown_size_suffix_passes_through_verbatim(
+    field: str, value: str, kwarg: str
+) -> None:
+    """Edge case: an unknown suffix is passed through, not rejected here.
+
+    The plan's behaviour-17 error clause — "an unparseable size string
+    raises ``ValueError`` naming the field and the accepted forms" — does
+    **not** apply to the pure translation; see this section's header for
+    the full reasoning.  In short: the SDK owns size-string parsing and
+    rejects an unknown suffix itself, at ``create`` time, with
+    ``DockerException`` naming the accepted postfixes ``b``/``k``/``m``/
+    ``g`` (``docker/utils/utils.py:443-446``; the table is
+    ``docker/constants.py:17-22``).  A local ``ValueError`` check would
+    be a second parser (plan §4.2 removed exactly that for mounts), and
+    config validation owns no size rule to defer to
+    (``src/tool_swap/config/schema.py:194-207`` is a bare ``str`` field
+    with no pattern or validator).  The pass-through is therefore the
+    contract, asserted for both size fields so a parser introduced for
+    one of them is caught.
+    """
+    # Arrange
+    spec = _spec(**{field: value})
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs[kwarg] == value
