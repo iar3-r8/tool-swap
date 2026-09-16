@@ -89,6 +89,51 @@ amended texts are in §5.
 contract) are the next two branches. Behaviour 28's documentation is split to match: each
 branch documents what it delivered.
 
+### 0.1.1 Third split — behaviours 10–13 land as the `FakeBackend` pull request
+
+**Branch `feature/m2a-fake-backend` carries behaviours 10–13 only**, cut from the merged tip
+of `feature/m2a-backend-seam-types` (`9f1f715`, pull request #10). This is **the first slice
+with a real implementation**: everything before it was a dataclass, a pure function or a
+declaration, so this is where the seam's contracts stop being declarations and start being
+behaviour. One module, `src/tool_swap/backend/fake_backend.py`.
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 10 — `FakeBackend` happy path | `d8dc17f` | `8e7448a` | 1350 passed |
+| 11 — scripted `FAIL_TO_START` | `f7ff8c0` | `2dbbf1a` | 1355 passed |
+| 12 — death and vanishing | `910c818` | `c44953a` | 1365 passed |
+| 13 — `logs` and the call journal | `2f639db` | `9066f40` | 1378 passed |
+
+**All four behaviours are complete**, each with its own red and green commit. Suite at the
+branch tip: **1378 passed, 2 skipped**, from the re-measured 1339 at the merge base;
+`make lint` clean with mypy strict over 37 source files. The behaviour-13 concurrency test
+was re-run 25 times consecutively before its green was accepted, since a flaky green is not
+a green.
+
+Preparatory commit outside the red/green cycle, touching no `src/` or `tests/` file:
+`a8568c8`, recording the two decisions in §4.4 and §7 item 5 below.
+
+**Four contracts here exist for M2b rather than for M2a**, and each would look like
+over-engineering without §6 to point at: the call journal records on **entry** and therefore
+captures calls that raise, since a losing racer's refused start leaves no trace in
+`list_managed`; `is_running` returns `False` for a missing container rather than raising, so
+M2b's liveness sweep is not an unhandled traceback in a watchdog; the internals are
+lock-guarded because M2b's coalescing test drives the fake concurrently; and `vanish()` plus
+`DIE_AFTER_START` are what let "a vanished container becomes `FAILED`" be tested with no
+daemon.
+
+**`vanish()` and `seed_logs()` are test control, not seam surface.** Both sit below a
+separator comment saying so, neither is journalled, and their docstrings state they must
+never be called by `LifecycleManager`. The journal counts protocol attempts and nothing
+else, so M2b's counts cannot depend on which scaffolding a test happened to use.
+
+**No red step was rejected on this branch.** The two lessons from the previous one held:
+every test file uses a per-test deferred-import gate, so the absent module and the absent
+`vanish`/`calls`/`seed_logs` attributes produced individual assertion failures rather than
+an aborted collection; and no test asserts a docker fact, the fake being in-memory by
+construction. `plan/third-party-docs/docker/container-logs.md` was deliberately not consulted
+— it belongs to behaviour 26.
+
 **§3's blocking pre-condition is now discharged.** `plan/third-party-docs/docker/` holds the
 docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-requests.md`,
 `container-logs.md`, `container-stop-wait.md`, `containers-list-filters.md` and
