@@ -1,4 +1,5 @@
-"""RED step for M2a behaviour 14 — ``build_run_kwargs`` core translation.
+"""RED step for M2a behaviour 14 (core translation) and behaviour 15
+(mounts) — ``build_run_kwargs``.
 
 See ``plans/m2a-container-backend-seam.md`` §5 behaviour 14 (amended)
 and §0.1.2 pull request A: ``build_run_kwargs(spec, *, label_namespace)``
@@ -17,14 +18,30 @@ suite.  docker-py raises ``TypeError`` for any kwarg it does not know
 name fails fast at the SDK layer, not at the daemon.
 
 Deliberately out of scope (later ledger behaviours, each with its own
-red/green cycle): mounts (15), GPU device requests (16), resource
-limits (17), port publication (18), ``map_sdk_error`` (19) and the
+red/green cycle): GPU device requests (16), resource limits (17),
+port publication (18), ``map_sdk_error`` (19) and the
 ``DockerBackend`` class itself (20+).  The spec therefore carries the
 structural defaults for the fields those behaviours own (``command``
-``None``, ``mounts`` ``()``, ``devices`` ``()``, ``shm_size`` ``None``,
-``cpus`` ``None``, ``memory`` ``None``, ``published_port`` ``None``),
-and the snapshot test pins that none of those keys appears in the
-output yet.  The two required-and-keyword-only spec fields
+``None``, ``devices`` ``()``, ``shm_size`` ``None``, ``cpus`` ``None``,
+``memory`` ``None``, ``published_port`` ``None``), and the snapshot
+test pins that none of those keys appears in the output yet.
+``mounts`` is no longer out of scope in this file: the behaviour-15
+tests below exercise it, and the snapshot test's spec keeps
+``mounts=()`` so its exact five-key equality is unaffected.
+
+Behaviour 15's mount representation decision, recorded here so the
+tests cite it rather than restating it per test: the ``volumes`` dict
+form is used, not ``list[docker.types.Mount]``.  Cited from
+``plan/third-party-docs/docker/containers-run-create.md``: the
+``volumes`` row of the §2 kwarg table (line 77) documents the exact
+shape ``{host_path_or_volume_name: {"bind": container_path, "mode":
+"rw"|"ro"}}``, and routing step 4 (line 116) shows ``volumes`` is
+routed into the host config as ``binds``.  The ``Mount`` form was
+rejected because its constructor arguments are captured in no saved
+page (that directory's INDEX defers them), and plan §3 forbids
+asserting a third-party interface from memory — an invented
+``Mount(...)`` signature would produce a passing test, a matching shim
+and a broken integration behind a green suite.
 (``gpu_runtime``, ``container_port``) are supplied with neutral values
 deliberately distinct from ``BUILT_IN_DEFAULTS``.
 
@@ -63,7 +80,7 @@ from typing import Any, cast
 
 import pytest
 
-from tool_swap.backend.base import ContainerSpec
+from tool_swap.backend.base import ContainerSpec, MountSpec
 from tool_swap.backend.labels import managed_labels
 
 # Neutral label namespace, deliberately distinct from
@@ -436,3 +453,160 @@ def test_build_run_kwargs_is_pure_and_returns_fresh_dict() -> None:
     # Assert
     assert first == second
     assert first is not second
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 15 — ``build_run_kwargs``, mounts
+# ---------------------------------------------------------------------------
+#
+# Representation decision (see module docstring): the ``volumes`` dict
+# form, not ``list[docker.types.Mount]``.  Every third-party fact below
+# is cited from the saved reference
+# ``plan/third-party-docs/docker/containers-run-create.md``:
+#   * the ``volumes`` row of the §2 kwarg table (line 77) documents the
+#     exact shape ``{host_path_or_volume_name: {"bind": container_path,
+#     "mode": "rw"|"ro"}}``;
+#   * routing step 4 (line 116) shows ``volumes`` is routed into the
+#     host config as ``binds`` — i.e. ``volumes`` is a valid
+#     ``create`` kwarg, and a typo'd alternative would be a
+#     ``TypeError`` at the SDK layer (routing step 6, same section);
+#   * consequence 1 (line 148) records that ``volumes`` is dropped
+#     when *falsy*, and states that "behaviours 15 and 18 should still
+#     omit the key" — the omission is *our* contract, and the snapshot
+#     pinning it is the stricter assertion.
+# The falsy-drop is re-verified against the installed source
+# ``.venv/lib/python3.11/site-packages/docker/models/containers.py``
+# (``_create_container_args``, lines 1142–1144: ``volumes =
+# kwargs.pop('volumes', {}); if volumes:``).
+
+
+def test_build_run_kwargs_carries_mounts_in_declaration_order() -> None:
+    """Mounts travel under the exact kwarg ``volumes``, in order.
+
+    Behaviour 15: a spec whose ``mounts`` concatenate the global
+    defaults then the tool's own must produce the mount entries *in
+    declaration order*.  The ``volumes`` dict form is the documented
+    shape ``{host_path_or_volume_name: {"bind": container_path,
+    "mode": "rw"|"ro"}}`` (``plan/third-party-docs/docker/
+    containers-run-create.md`` §2, line 77); dicts preserve insertion
+    order, so pinning the key order pins the declaration order.
+    """
+    # Arrange: first two mounts are the global defaults, the last is
+    # the tool's own — the concatenation order of plan/02 §5.
+    spec = _spec(
+        mounts=(
+            MountSpec(source="/data/models", target="/models", read_only=True),
+            MountSpec(source="/data/cache", target="/cache", read_only=False),
+            MountSpec(source="/opt/tools/config", target="/etc/tool", read_only=True),
+        )
+    )
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["volumes"] == {
+        "/data/models": {"bind": "/models", "mode": "ro"},
+        "/data/cache": {"bind": "/cache", "mode": "rw"},
+        "/opt/tools/config": {"bind": "/etc/tool", "mode": "ro"},
+    }
+    assert list(kwargs["volumes"]) == [
+        "/data/models",
+        "/data/cache",
+        "/opt/tools/config",
+    ]
+
+
+def test_build_run_kwargs_volumes_entry_carries_source_target_and_mode() -> None:
+    """Each entry carries source, target and the read-only flag.
+
+    The source is the dict key, the target lives under ``"bind"`` and
+    the read-only flag under ``"mode"`` — the exact shape from
+    ``plan/third-party-docs/docker/containers-run-create.md`` §2, line
+    77 (``{host_path_or_volume_name: {"bind": container_path, "mode":
+    "rw"|"ro"}}``).  A read-only :class:`MountSpec` maps to
+    ``"mode": "ro"``.
+    """
+    # Arrange
+    spec = _spec(
+        mounts=(MountSpec(source="/srv/share", target="/share", read_only=True),)
+    )
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["volumes"]["/srv/share"] == {"bind": "/share", "mode": "ro"}
+
+
+def test_build_run_kwargs_no_mounts_omits_volumes_key() -> None:
+    """Edge case: no mounts omits the ``volumes`` key entirely.
+
+    Behaviour 15: "no mounts omits the key entirely."  The omission is
+    *our* contract, stricter than the SDK's falsy-drop
+    (``plan/third-party-docs/docker/containers-run-create.md``
+    consequence 1, line 148: "behaviours 15 and 18 should still omit
+    the key"); ``volumes={}`` and the omission are equivalent at the
+    SDK layer (installed source, ``containers.py`` lines 1142–1144)
+    but the snapshot pins the omission.
+    """
+    # Arrange
+    spec = _spec(mounts=())
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert "volumes" not in kwargs
+
+
+def test_build_run_kwargs_duplicate_target_keeps_both_entries_in_order() -> None:
+    """Edge case: the same target declared twice keeps both entries.
+
+    Behaviour 15: de-duplication is config-validation's job, not the
+    driver's — the pure translation must not collapse entries.  Both
+    sources are distinct keys of the ``volumes`` dict, and their
+    declaration order is preserved (insertion order of a dict, which
+    the SDK then walks verbatim when it converts ``volumes`` to
+    ``binds`` — ``plan/third-party-docs/docker/
+    containers-run-create.md`` routing step 4, line 116).
+    """
+    # Arrange: two different host paths mounted at the same target.
+    spec = _spec(
+        mounts=(
+            MountSpec(source="/data/a", target="/dup", read_only=True),
+            MountSpec(source="/data/b", target="/dup", read_only=False),
+        )
+    )
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["volumes"] == {
+        "/data/a": {"bind": "/dup", "mode": "ro"},
+        "/data/b": {"bind": "/dup", "mode": "rw"},
+    }
+    assert list(kwargs["volumes"]) == ["/data/a", "/data/b"]
+
+
+def test_build_run_kwargs_read_write_mount_distinguished_from_read_only() -> None:
+    """Edge case: a read-write mount is distinguishable from a
+    read-only one.
+
+    The ``read_only`` bool maps to ``"mode": "rw"`` versus
+    ``"mode": "ro"`` — the only two modes the documented ``volumes``
+    shape allows (``plan/third-party-docs/docker/
+    containers-run-create.md`` §2, line 77: ``"mode": "rw"|"ro"``).
+    The modes are asserted independently, so a translation that
+    ignores ``read_only`` (emitting one mode for all) fails here.
+    """
+    # Arrange: the same source shape, opposite flags.
+    spec = _spec(
+        mounts=(
+            MountSpec(source="/srv/ro", target="/ro", read_only=True),
+            MountSpec(source="/srv/rw", target="/rw", read_only=False),
+        )
+    )
+    fn = _build_run_kwargs()
+    # Act
+    kwargs = fn(spec, label_namespace=_NAMESPACE)
+    # Assert
+    assert kwargs["volumes"]["/srv/ro"]["mode"] == "ro"
+    assert kwargs["volumes"]["/srv/rw"]["mode"] == "rw"
