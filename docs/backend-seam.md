@@ -6,15 +6,16 @@ protocol. This guide describes that seam — its data types, its naming
 and labelling rules, its error taxonomy, and the boundary that keeps
 the container runtime contained in one place.
 
-**Status: this is the seam, not the engine.** The data types, the
-helpers, the protocol declaration and the error taxonomy are shipped;
-the two implementations behind the protocol are not. Nothing under
-`src/` references the protocol yet: the in-memory backend (plan
-behaviours 10–13) and the Docker backend (behaviours 14–27) land on
-later branches of the same milestone, each with its own module. The
-M2b tool state machine — `STOPPED`, `STARTING`, `LOADING`, `READY` —
-does not exist either. This page documents what is here, and says
-explicitly where it stops.
+**Status: one implementation of the seam is here.** The data types,
+the helpers, the protocol declaration and the error taxonomy are
+shipped, and so is the in-memory backend — `FakeBackend`, plan
+behaviours 10–13 — the first real implementation of the
+`ContainerBackend` protocol. The Docker backend (behaviours 14–27)
+lands on a later branch of the same milestone, and until it does,
+nothing under `src/` imports the Docker SDK. The M2b tool state
+machine — `STOPPED`, `STARTING`, `LOADING`, `READY` — does not exist
+either. This page documents what is here, and says explicitly where
+it stops.
 
 The design is specified in
 [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
@@ -35,9 +36,9 @@ flowchart LR
         HELPER[labels.py: managed_labels, container_name, label_selector]
         PROTO[base.py: ContainerBackend protocol, six synchronous methods]
         ERR[errors.py: the seven-member error taxonomy]
+        FAKE[fake_backend.py: FakeBackend, the first implementation, behaviours 10–13]
     end
     subgraph future[later branches and milestones — not shipped]
-        FAKE[behaviours 10–13: FakeBackend]
         DOCK[behaviours 14–27: DockerBackend, the only module that may import the Docker SDK]
         LIFE[M2b: LifecycleManager, the tool state machine]
         BLD[M5: build and BuildSpec]
@@ -47,24 +48,27 @@ flowchart LR
     TYPES --> PROTO
     HELPER --> PROTO
     PROTO -->|raises| ERR
-    FAKE -.->|will implement| PROTO
+    FAKE -->|implements| PROTO
     DOCK -.->|will implement| PROTO
     LIFE -.->|will call off the event loop| PROTO
     BLD -.->|deliberately absent from the protocol| PROTO
 ```
 
 Solid edges are shipped; dashed ones are named in the plan but not yet
-in the tree.
+in the tree. `FakeBackend` sits inside the seam's subgraph — it is
+shipped, in-memory, and importable with the Docker SDK absent.
 
 ## What is in the tree
 
-The seam is three modules, all under `src/tool_swap/backend/`:
+The seam is three modules, all under `src/tool_swap/backend/`, plus
+the first implementation of the protocol:
 
 | Module | Contents |
 |---|---|
 | [`base.py`](../src/tool_swap/backend/base.py) | [`MountSpec`](../src/tool_swap/backend/base.py:27), [`ContainerSpec`](../src/tool_swap/backend/base.py:49), [`ContainerHandle`](../src/tool_swap/backend/base.py:107), [`ContainerState`](../src/tool_swap/backend/base.py:129), [`ContainerStatus`](../src/tool_swap/backend/base.py:147), and the [`ContainerBackend`](../src/tool_swap/backend/base.py:171) protocol |
 | [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
 | [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
+| [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
 
 ## The data types
 
@@ -221,6 +225,94 @@ not a docker filter**: translating it into the SDK's filter form is a
 later behaviour's job, to be pinned against the saved docker-py
 reference.
 
+## The `FakeBackend`
+
+The first implementation of the protocol, in
+[`fake_backend.py`](../src/tool_swap/backend/fake_backend.py)
+(behaviours 10–13). It is a **test double, not a simulation**: state is
+a plain dict of per-container records guarded by a single
+`threading.Lock`, no thread is ever spawned and no I/O happens. It is
+importable with the Docker SDK absent and asserts no docker fact — it
+exists so a test can drive seam behaviour with no daemon.
+
+### How a test drives it
+
+```python
+from tool_swap.backend.fake_backend import FakeBackend, FailureMode
+
+backend = FakeBackend(script={"t1": FailureMode.FAIL_TO_START})
+```
+
+- `script` is a **tool-name → `FailureMode`** mapping, applied at
+  `start` time, so a failure is scripted before any handle exists.
+  `FAIL_TO_START` makes that tool's start refuse with
+  [`ContainerStartError`](../src/tool_swap/backend/errors.py:97),
+  repeatedly and without creating a record — the script is not
+  one-shot, so a retry loop can never silently succeed.
+  `DIE_AFTER_START` is a death, not a refusal: the start succeeds and
+  returns a handle, but the record is created already `EXITED` with a
+  non-zero exit code, so the container is dead by the first
+  observation.
+- **`vanish(handle)` and `seed_logs(handle, lines)` are test control,
+  not seam surface.** They sit below a separator comment in the
+  source, they are never journaled, and they are not
+  `ContainerBackend` members: `LifecycleManager` and every other seam
+  consumer must never call them. `vanish` removes a record out of
+  band — the in-memory stand-in for a `docker rm -f` behind the
+  backend's back — and `seed_logs` appends lines to the per-handle
+  buffer that `logs` reads. Both raise
+  [`ContainerNotFoundError`](../src/tool_swap/backend/errors.py:106)
+  for an unmanaged handle, because both are active operations naming a
+  container that may not exist.
+- **`backend.calls`** journals every protocol call on entry as a
+  `(name, args, kwargs)` triple — including calls that raise, since a
+  losing racer's refused start leaves no trace in `list_managed` — so
+  M2b can assert "exactly one start" by counting attempts. Test
+  control never reaches the journal, so counts depend only on what a
+  seam consumer called.
+
+### What it models — and what it cannot
+
+- **Dead versus vanished.** A dead or stopped container stays in
+  `list_managed`; only a vanished one disappears. That is deliberate:
+  reconciliation adopts by label, and M2b must still see a dead
+  handle to mark the tool `FAILED` (plan §6 item 5).
+- **`follow=True` returns a terminating snapshot**, because the fake
+  has no stream to follow and blocking would hang a caller that never
+  stops it. `tail` is pure list semantics: `tail=0` yields nothing, a
+  `tail` past the buffer returns everything, and a stopped
+  container's buffer survives `stop`.
+- **`started_at` stays `None`** for the fake's whole life: it has no
+  runtime clock to report from, and inventing a timestamp would be a
+  fake docker fact.
+
+### Four contracts exist for M2b, not for M2a
+
+Each would look like over-engineering from M2a's side alone; plan §6
+is the point of reference:
+
+1. **The journal records on entry**, so a call that raises is still
+   counted (plan §6 item 2).
+2. **`is_running` returns `False` for a missing container rather than
+   raising**, so M2b's liveness sweep is not an unhandled traceback in
+   the watchdog (plan §6 item 4).
+3. **The internals are lock-guarded**, because M2b's coalescing test
+   drives the fake concurrently (plan §6 item 2).
+4. **`vanish()` and `DIE_AFTER_START`** make "a vanished container
+   becomes `FAILED`" testable with no daemon (plan §6 item 3).
+
+### `FailureMode` has exactly two members
+
+`STOP_HANGS` is **not a mode in this milestone**: it existed only for
+M2b's drain test, and shipping a member no test proves would be
+dead code — M2b introduces it in the same red/green cycle as that
+test (plan §7 item 5). **"Never ready" is deliberately not a mode
+either**: readiness belongs to M2b's health probe, which does not
+exist yet, and the fake has no probe to be un-ready against. That is a
+knowing departure from issue #3's Scope wording, confirmed by the
+user and recorded in plan §7 item 5 — the issue was not amended, so
+that plan entry is the record.
+
 ## When the container is gone
 
 The protocol's not-found contract (plan §4.3), which M2b's liveness
@@ -232,6 +324,10 @@ sweep relies on:
 | `inspect` | returns `ContainerState.GONE` with `exit_code=None` |
 | `stop` | a no-op |
 | `start`, `list_managed`, `logs` | raise a taxonomy member |
+
+`FakeBackend` honours this contract exactly, which is how a test
+reproduces a missing container: `vanish` a running handle and the
+three lenient reads behave as the table says without a daemon.
 
 ## Troubleshooting: container start failures
 
@@ -257,17 +353,33 @@ today offers `validate`, `config show` and `version`
 
 Two honest limits on the table:
 
-- **No implementation exists yet**, so nothing in this repository
-  raises these classes today. The table describes the surface a user
-  will see once a backend lands, and every remedy is the exact string
-  the class ships — read it there if you need the verbatim text.
-- **How these failures are *produced* is pinned on a later branch.**
-  The mapping from the Docker SDK's own exceptions to these classes
-  (behaviour 19) is verified against the saved docker-py reference,
-  and the daemon behaviour itself (does `stop` return before the
-  container has exited? does the label selector really select?) is
-  covered by integration tests that are deferred until a daemon
-  harness exists.
+- **Which of these a real daemon raises has not been verified here.**
+  M2a runs no daemon tests, and the `DockerBackend` that would map
+  SDK exceptions to these classes (behaviour 19) lands on a later
+  branch, verified against the saved docker-py reference. What *is*
+  in the tree is
+  [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), which
+  raises three
+  of the seven for unit tests without a daemon:
+  [`ContainerStartError`](../src/tool_swap/backend/errors.py:97)
+  (`FAIL_TO_START` scripted on a tool name),
+  [`ContainerNameConflictError`](../src/tool_swap/backend/errors.py:88)
+  (starting an already-managed name) and
+  [`ContainerNotFoundError`](../src/tool_swap/backend/errors.py:106)
+  (`vanish` out-of-band, then `logs` the gone handle).
+- **The daemon behaviour itself is deferred.** The three daemon tests
+  of
+  [`plans/m2-docker-testing-recommendation.md`](../plans/m2-docker-testing-recommendation.md)
+  §3 — round trip, stop escalation, the vanished container — are
+  planned, not yet in the tree; when they land they will be marked
+  `docker` and will run **only** against a disposable daemon named by
+  the environment variable `TSWAP_TEST_DOCKER_HOST`, skipping rather
+  than touching the ambient daemon when it is unset. The DinD harness,
+  the `TSWAP_TEST_DOCKER_HOST` fixture and the loud-skip summary hook
+  all belong to the follow-up issue that plan §7 item 7 calls for,
+  which is not yet filed. Until that exists, `make test` — whose
+  default `-m 'not docker and not gpu and not slow'` deselects the
+  `docker` marker — exercises the seam through `FakeBackend` only.
 
 ## Where to go deeper
 

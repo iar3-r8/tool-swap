@@ -89,6 +89,58 @@ amended texts are in §5.
 contract) are the next two branches. Behaviour 28's documentation is split to match: each
 branch documents what it delivered.
 
+### 0.1.1 Third split — behaviours 10–13 land as the `FakeBackend` pull request
+
+**Branch `feature/m2a-fake-backend` carries behaviours 10–13 only**, cut from the merged tip
+of `feature/m2a-backend-seam-types` (`9f1f715`, pull request #10). This is **the first slice
+with a real implementation**: everything before it was a dataclass, a pure function or a
+declaration, so this is where the seam's contracts stop being declarations and start being
+behaviour. One module, `src/tool_swap/backend/fake_backend.py`.
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 10 — `FakeBackend` happy path | `d8dc17f` | `8e7448a` | 1350 passed |
+| 11 — scripted `FAIL_TO_START` | `f7ff8c0` | `2dbbf1a` | 1355 passed |
+| 12 — death and vanishing | `910c818` | `c44953a` | 1365 passed |
+| 13 — `logs` and the call journal | `2f639db` | `9066f40` | 1378 passed |
+
+**All four behaviours are complete**, each with its own red and green commit. Suite at the
+branch tip: **1378 passed, 2 skipped**, from the re-measured 1339 at the merge base;
+`make lint` clean with mypy strict over 37 source files. The behaviour-13 concurrency test
+was re-run 25 times consecutively before its green was accepted, since a flaky green is not
+a green.
+
+Preparatory commit outside the red/green cycle, touching no `src/` or `tests/` file:
+`a8568c8`, recording the two decisions in §4.4 and §7 item 5 below.
+
+**Pull request [#11](https://github.com/iar3-r8/tool-swap/pull/11)** — open and awaiting
+review. Head `ffe82d3`, 11 commits, 7 files, +2225 −27. Documentation commit `ffe82d3`
+precedes it, as behaviour 28 requires. The push used the `.roo/mcp.json` token through a
+one-shot `http.extraheader`, for the reason §0.2 records: `GITHUB_TOKEN` is set-but-empty in
+this dev container, git's only credential helper is VS Code's interactive one, and there is
+no `gh` CLI.
+
+**Four contracts here exist for M2b rather than for M2a**, and each would look like
+over-engineering without §6 to point at: the call journal records on **entry** and therefore
+captures calls that raise, since a losing racer's refused start leaves no trace in
+`list_managed`; `is_running` returns `False` for a missing container rather than raising, so
+M2b's liveness sweep is not an unhandled traceback in a watchdog; the internals are
+lock-guarded because M2b's coalescing test drives the fake concurrently; and `vanish()` plus
+`DIE_AFTER_START` are what let "a vanished container becomes `FAILED`" be tested with no
+daemon.
+
+**`vanish()` and `seed_logs()` are test control, not seam surface.** Both sit below a
+separator comment saying so, neither is journalled, and their docstrings state they must
+never be called by `LifecycleManager`. The journal counts protocol attempts and nothing
+else, so M2b's counts cannot depend on which scaffolding a test happened to use.
+
+**No red step was rejected on this branch.** The two lessons from the previous one held:
+every test file uses a per-test deferred-import gate, so the absent module and the absent
+`vanish`/`calls`/`seed_logs` attributes produced individual assertion failures rather than
+an aborted collection; and no test asserts a docker fact, the fake being in-memory by
+construction. `plan/third-party-docs/docker/container-logs.md` was deliberately not consulted
+— it belongs to behaviour 26.
+
 **§3's blocking pre-condition is now discharged.** `plan/third-party-docs/docker/` holds the
 docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-requests.md`,
 `container-logs.md`, `container-stop-wait.md`, `containers-list-filters.md` and
@@ -560,10 +612,14 @@ to confirm against a real daemon later.
 class FailureMode(StrEnum):
     FAIL_TO_START = "fail_to_start"
     DIE_AFTER_START = "die_after_start"
-    STOP_HANGS = "stop_hangs"
 
 FakeBackend(script: Mapping[str, FailureMode] | None = None)
 ```
+
+**`STOP_HANGS` was dropped from this milestone**, confirmed by the user before the
+behaviour-10 red step (§7 assumption 5 offered the choice). No behaviour in 10–13 exercises
+it, so shipping it would mean shipping a member no test proves — M2b adds it in the same
+red/green cycle as the drain test that needs it.
 
 Keyed by **tool name**, so a test scripts a failure before any handle exists. Plus
 `fake.vanish(handle)` for out-of-band removal (the M2b "vanished container" path), and a
@@ -1146,8 +1202,14 @@ knows whether a process exists; everything above that is M2b's.
    follows the issue and includes it.
 4. **The backend seam is synchronous.** If M2b finds it needs an async seam, that is a change
    to behaviour 8 and a re-review, not a quiet adaptation.
-5. **`FailureMode.STOP_HANGS` may be unused by M2a's own tests** — it exists for M2b's drain
-   test. If the user prefers strictly-needed-now, drop it from behaviour 12.
+5. **`FailureMode.STOP_HANGS` is dropped from M2a — resolved.** It was unused by M2a's own
+   tests and existed only for M2b's drain test. The user chose strictly-needed-now before
+   behaviour 10's red step, so `FailureMode` ships two members and M2b introduces the third
+   with its own red/green cycle. **A second departure from issue #3 was accepted in the same
+   breath:** the issue's Scope names "never ready" among `FakeBackend`'s scriptable failures,
+   and §4.4 excludes it because readiness is the M2b probe's concern and the fake has no
+   probe to be un-ready against. The user confirmed the plan's reading over the issue's
+   wording; the issue was not amended, so this entry is the record.
 6. **Docker vs Podman.** `plan/third-party-docs/podman/` exists and `BackendConfig.type`
    admits other values, but issue #3 says docker SDK, so M2a implements `DockerBackend` only.
 7. **The three deferred daemon tests need their own issue**, including the DinD harness, the
