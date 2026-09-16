@@ -113,6 +113,13 @@ a green.
 Preparatory commit outside the red/green cycle, touching no `src/` or `tests/` file:
 `a8568c8`, recording the two decisions in §4.4 and §7 item 5 below.
 
+**Pull request [#11](https://github.com/iar3-r8/tool-swap/pull/11)** — open and awaiting
+review. Head `ffe82d3`, 11 commits, 7 files, +2225 −27. Documentation commit `ffe82d3`
+precedes it, as behaviour 28 requires. The push used the `.roo/mcp.json` token through a
+one-shot `http.extraheader`, for the reason §0.2 records: `GITHUB_TOKEN` is set-but-empty in
+this dev container, git's only credential helper is VS Code's interactive one, and there is
+no `gh` CLI.
+
 **Four contracts here exist for M2b rather than for M2a**, and each would look like
 over-engineering without §6 to point at: the call journal records on **entry** and therefore
 captures calls that raise, since a losing racer's refused start leaves no trace in
