@@ -1,33 +1,38 @@
-"""In-memory ``FakeBackend`` for the container backend seam (M2a behaviour 10).
+"""In-memory ``FakeBackend`` for the container backend seam (M2a).
 
 The first real implementation of the :class:`ContainerBackend` protocol
 (``plans/m2a-container-backend-seam.md`` §4.4): a test double driven
 entirely by in-memory state, importable with the docker SDK absent and
-free of any docker fact.  Behaviour 10 lands the happy path plus the
+free of any docker fact.  Behaviour 10 landed the happy path plus the
 not-found contract of §4.3 — ``is_running`` returns ``False`` for a
 missing container rather than raising, ``inspect`` returns
 ``ContainerState.GONE``, and ``stop`` on a missing container is a no-op
 — because M2b's liveness sweep relies on exactly that.
 
-Behaviour 11 adds the first scripted failure: a tool scripted
+Behaviour 11 added the first scripted failure: a tool scripted
 ``FAIL_TO_START`` refuses to start with ``ContainerStartError`` —
-repeatedly, and recording nothing.  Behaviour 12 honours
+repeatedly, without creating any container.  Behaviour 12 honoured
 ``DIE_AFTER_START`` — the start succeeds and returns a handle, but the
 record is created already ``EXITED`` with a non-zero exit code, so the
 container is dead by the first observation with no daemon, clock or
-thread — and adds ``vanish()``, a test-control method (not a
+thread — and added ``vanish()``, a test-control method (not a
 ``ContainerBackend`` member) that removes a container's record out of
-band.  One behaviour extends this same module, with its own red step:
-``logs`` and the ``fake.calls`` journal (13).
+band.  Behaviour 13, the last of the branch, completed the module:
+``logs`` reads a per-handle buffer pre-seeded by the test-control
+``seed_logs`` and applies pure list semantics to ``tail``, and the
+``fake.calls`` journal records every protocol call on entry — including
+calls that raise — so M2b can assert "exactly one start" by counting
+attempts rather than inferring them from side effects.
 """
 
 from __future__ import annotations
 
 import threading
 import uuid
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from tool_swap.backend.base import (
     ContainerHandle,
@@ -57,10 +62,16 @@ class FailureMode(StrEnum):
 
 @dataclass
 class _Container:
-    """One managed container's mutable state, guarded by the backend lock."""
+    """One managed container's mutable state, guarded by the backend lock.
+
+    ``logs`` is the per-handle log buffer pre-seeded through
+    :meth:`FakeBackend.seed_logs`; it survives ``stop`` and is removed
+    with the record by :meth:`FakeBackend.vanish`.
+    """
 
     state: ContainerState
     exit_code: int | None
+    logs: list[str] = field(default_factory=list)
 
 
 class FakeBackend:
@@ -77,6 +88,12 @@ class FakeBackend:
     2), so every method snapshots or mutates under the lock.  No
     thread is ever spawned and no I/O happens — the fake exists so a
     test can assert seam behaviour with no daemon.
+
+    Every protocol call is recorded in ``self.calls`` — a plain
+    ``list`` of ``(name, args, kwargs)`` triples in call order, on
+    entry and including calls that raise — so a test can count
+    attempts (plan §6 item 2) rather than infer them from side
+    effects.  Test-control methods are deliberately not recorded.
     """
 
     def __init__(self, script: Mapping[str, FailureMode] | None = None) -> None:
@@ -93,7 +110,52 @@ class FakeBackend:
         self._script = script
         self._lock = threading.Lock()
         self._containers: dict[ContainerHandle, _Container] = {}
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
+    def _record(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Journal one protocol call, under the lock, on entry.
+
+        Recording happens before any work that may raise (plan §6 item
+        2: a losing racer's refused start must still be counted), and
+        inside a lock section that returns before the method re-enters
+        ``self._lock`` — the lock is a single non-reentrant lock, so
+        the journal must never be touched from an already-locked
+        section.
+
+        Args:
+            name: The protocol member's name.
+            args: Positional arguments, as passed.
+            kwargs: Keyword arguments, as passed.
+        """
+        with self._lock:
+            self.calls.append((name, args, kwargs))
+
+    @staticmethod
+    def _journalled(method: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap a protocol method so every call is journaled on entry.
+
+        The wrapper records first — before the body runs, so a call
+        that raises is still recorded — and passes through whatever
+        the body returns, raises or yields unchanged.  Test-control
+        methods are not wrapped, so they never reach the journal.
+
+        Args:
+            method: The unwrapped protocol method.
+
+        Returns:
+            A wrapper with the original signature, name and
+            docstring.
+        """
+
+        def wrapper(self: FakeBackend, *args: Any, **kwargs: Any) -> Any:
+            self._record(method.__name__, args, kwargs)
+            return method(self, *args, **kwargs)
+
+        wrapper.__name__ = method.__name__
+        wrapper.__doc__ = method.__doc__
+        return wrapper
+
+    @_journalled
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         """Record the container as running and return its handle.
 
@@ -107,7 +169,7 @@ class FakeBackend:
         recorded: no container is created and ``list_managed`` is
         unaffected, and the refusal repeats on every call — the
         script is not one-shot, so a retry loop can never silently
-        succeed.
+        succeed.  The attempt still appears in ``self.calls``.
 
         A tool scripted ``DIE_AFTER_START`` starts — this is a death,
         not a refusal — but its record is created already ``EXITED``
@@ -161,13 +223,15 @@ class FakeBackend:
             )
             return handle
 
+    @_journalled
     def stop(self, handle: ContainerHandle, *, timeout_s: float) -> None:
         """Move the container to ``EXITED`` with exit code ``0``.
 
         A no-op — not an error — when the container is already exited
         or has vanished, per the §4.3 not-found contract.  The fake
         honours no kill timing, so ``timeout_s`` is accepted for
-        signature parity and otherwise unused.
+        signature parity and otherwise unused.  Stopping never
+        touches the log buffer.
 
         Args:
             handle: The container to stop.
@@ -181,6 +245,7 @@ class FakeBackend:
             container.state = ContainerState.EXITED
             container.exit_code = 0
 
+    @_journalled
     def is_running(self, handle: ContainerHandle) -> bool:
         """Whether the container is running; ``False`` if it is gone.
 
@@ -199,6 +264,7 @@ class FakeBackend:
             container = self._containers.get(handle)
             return container is not None and container.state is ContainerState.RUNNING
 
+    @_journalled
     def inspect(self, handle: ContainerHandle) -> ContainerStatus:
         """Current status; ``ContainerState.GONE`` if the container is gone.
 
@@ -225,6 +291,7 @@ class FakeBackend:
                 exit_code=container.exit_code,
             )
 
+    @_journalled
     def list_managed(self) -> list[ContainerHandle]:
         """Every managed container, stopped ones included.
 
@@ -238,31 +305,56 @@ class FakeBackend:
         with self._lock:
             return list(self._containers)
 
+    @_journalled
     def logs(
         self, handle: ContainerHandle, *, follow: bool, tail: int
     ) -> Iterator[str]:
-        """Log lines of the container — unimplemented in behaviour 10.
+        """Trailing log lines of the container, as an iterator of ``str``.
 
-        Present only so the class structurally satisfies the
-        ``ContainerBackend`` protocol; the real body (pre-seeded lines,
-        ``tail`` capping, ``ContainerNotFoundError`` on an unknown
-        handle) lands with the ``fake.calls`` journal in behaviour 13.
+        The buffer is the per-handle list pre-seeded by
+        :meth:`seed_logs`; ``tail`` keeps its last ``tail`` lines —
+        pure list semantics, so ``tail`` larger than the buffer
+        returns everything and ``tail=0`` yields nothing.  A stopped
+        container's buffer survives; a vanished or never-started
+        handle is unknown and raises, since ``logs`` is not one of
+        the three lenient read-side calls of the §4.3 not-found
+        contract.
+
+        The lines are snapshotted under the lock and iterated from
+        the snapshot: a lazy generator would read the buffer after
+        the call returned and could observe later mutations.  With
+        ``follow=True`` the snapshot is likewise returned and then
+        the iterator terminates — the fake has no daemon and no
+        stream to follow, and blocking forever would hang a caller
+        that never stops it.
 
         Args:
             handle: The container whose logs are requested.
-            follow: Whether the real implementation would follow.
-            tail: How many trailing lines the real implementation
-                would keep.
+            follow: Whether the real implementation would follow;
+                accepted for signature parity — the fake returns a
+                terminating snapshot either way.
+            tail: How many trailing lines to return; ``0`` yields
+                nothing and a value past the buffer returns all of
+                it.
 
         Raises:
-            NotImplementedError: always — behaviour 13 is the green
-                step for this method.
+            ContainerNotFoundError: the backend does not manage the
+                handle.
         """
-        raise NotImplementedError("FakeBackend.logs is implemented in M2a behaviour 13")
+        with self._lock:
+            container = self._containers.get(handle)
+            if container is None:
+                raise ContainerNotFoundError(
+                    f"container {handle.name!r} is not managed by this backend"
+                )
+            lines = list(container.logs[-tail:]) if tail else []
+        return iter(lines)
 
     # Test control, not seam surface: the methods above are the
     # ``ContainerBackend`` contract; everything below exists only so a
-    # test can drive states the fake cannot reach on its own.
+    # test can drive states the fake cannot reach on its own.  Test
+    # control is deliberately never journaled, so ``fake.calls``
+    # counts protocol attempts and nothing else.
 
     def vanish(self, handle: ContainerHandle) -> None:
         """Test control: remove the container's record out of band.
@@ -274,10 +366,12 @@ class FakeBackend:
         see (``docker rm -f`` behind its back), so afterwards the
         handle reads exactly like one that was never started:
         ``is_running`` ``False``, ``inspect`` ``GONE``, ``stop`` a
-        no-op — the §4.3 not-found contract.  Nothing but this method
-        removes a record, which is why a dead or stopped container
-        stays in ``list_managed`` while a vanished one disappears
-        (plan §6 item 5).
+        no-op — the §4.3 not-found contract.  The log buffer goes
+        with the record, so ``logs`` on a vanished handle then raises
+        like any unknown handle.  Nothing but this method removes a
+        record, which is why a dead or stopped container stays in
+        ``list_managed`` while a vanished one disappears (plan §6
+        item 5).
 
         Args:
             handle: The container whose record is removed.
@@ -294,3 +388,32 @@ class FakeBackend:
                     f"container {handle.name!r} is not managed by this backend"
                 )
             del self._containers[handle]
+
+    def seed_logs(self, handle: ContainerHandle, lines: Sequence[str]) -> None:
+        """Test control: append ``lines`` to the container's log buffer.
+
+        The pre-seeding API behaviour 13's ``logs`` tests build on
+        (plan §5 behaviour 13: "pre-seeded log lines"): ``lines`` are
+        appended in the given order to the per-handle buffer, which
+        ``stop`` leaves intact and :meth:`vanish` removes with the
+        record.  Like ``vanish`` this is an active operation naming a
+        container that may not exist, so an unmanaged handle raises
+        rather than buffering lines no container will ever have.  It
+        is a test-control method, not a ``ContainerBackend`` member,
+        and is never journaled.
+
+        Args:
+            handle: The container whose buffer receives the lines.
+            lines: Log lines, appended in the given order.
+
+        Raises:
+            ContainerNotFoundError: the backend does not manage the
+                handle.
+        """
+        with self._lock:
+            container = self._containers.get(handle)
+            if container is None:
+                raise ContainerNotFoundError(
+                    f"container {handle.name!r} is not managed by this backend"
+                )
+            container.logs.extend(lines)
