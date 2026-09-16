@@ -42,7 +42,8 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
 
     The output carries exactly the keys ``image``, ``name``, ``labels``
     and, when set, ``environment``, ``network``, ``volumes``,
-    ``device_requests``, ``nano_cpus``, ``mem_limit`` and ``shm_size``.
+    ``device_requests``, ``nano_cpus``, ``mem_limit``, ``shm_size`` and
+    ``ports``.
     ``labels`` is the full :func:`managed_labels` set for
     *label_namespace* and the spec's tool, with the spec's own labels
     merged in (collision precedence is deliberately not decided by
@@ -67,18 +68,25 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         ``spec.network`` is not ``None``, ``volumes`` only when
         ``spec.mounts`` is non-empty, ``device_requests`` (one
         ``DeviceRequest``) only when ``spec.devices`` is non-empty,
-        ``nano_cpus`` only when ``spec.cpus`` is not ``None``, and
+        ``nano_cpus`` only when ``spec.cpus`` is not ``None``,
         ``mem_limit`` / ``shm_size`` only when the matching spec field
-        is not ``None``.  Size strings are passed through verbatim —
-        parsing them is the SDK's job (``HostConfig`` calls
-        ``parse_bytes``), so no local size-string check is made here
-        (plan §5 behaviour 17, amended).
+        is not ``None``, and ``ports`` (the container port keyed to the
+        host port) only when ``spec.published_port`` is not ``None``.
+        Size strings are passed through verbatim — parsing them is the
+        SDK's job (``HostConfig`` calls ``parse_bytes``), so no local
+        size-string check is made here (plan §5 behaviour 17,
+        amended).  Likewise no port *range* check: a host port outside
+        ``port_range`` passes through verbatim — range policy is
+        config validation's (plan §5 behaviour 18;
+        ``plan/01_ARCHITECTURE.md`` §2.1).
 
     Raises:
-        ValueError: ``spec.image`` is empty, or a ``spec.devices`` index
-            is negative — caller programming errors, raised before any
-            SDK call, so a plain ``ValueError`` rather than a
-            ``tool_swap.backend.errors`` taxonomy member.
+        ValueError: ``spec.image`` is empty, a ``spec.devices`` index
+            is negative, or ``spec.container_port`` /
+            ``spec.published_port`` is not positive — caller
+            programming errors, raised before any SDK call, so a plain
+            ``ValueError`` rather than a ``tool_swap.backend.errors``
+            taxonomy member.
     """
     if not spec.image:
         raise ValueError("container image must not be empty")
@@ -105,6 +113,9 @@ def build_run_kwargs(spec: ContainerSpec, *, label_namespace: str) -> dict[str, 
         kwargs["mem_limit"] = spec.memory
     if spec.shm_size is not None:
         kwargs["shm_size"] = spec.shm_size
+    ports = _ports_from_spec(spec)
+    if ports is not None:
+        kwargs["ports"] = ports
     return kwargs
 
 
@@ -131,6 +142,51 @@ def _device_requests_from_devices(spec: ContainerSpec) -> list[DeviceRequest]:
         raise ValueError(f"device index must be non-negative, got {offending}")
     device_ids = [str(index) for index in dict.fromkeys(spec.devices)]
     return [DeviceRequest(driver=spec.gpu_runtime, device_ids=device_ids)]
+
+
+def _ports_from_spec(spec: ContainerSpec) -> dict[int, int] | None:
+    """Translate the spec's ports into the ``ports`` mapping, or omit it.
+
+    The mapping is ``{container_port: published_port}`` — the container
+    port is the key and the host port the value, because the SDK walks
+    the mapping key-first: ``convert_port_bindings`` treats ``k`` as
+    the container port and builds the host binding from ``v``
+    (``.venv/lib/python3.11/site-packages/docker/utils/utils.py``
+    lines 113-123; ``plan/third-party-docs/docker/
+    containers-run-create.md`` §2, line 84).  The key stays a bare
+    ``int``: the SDK appends ``"/tcp"`` itself when the key holds no
+    protocol suffix (``docker/utils/utils.py`` lines 116-118), so
+    pre-suffixing would duplicate its normalisation.  No range check:
+    a host port outside ``port_range`` passes through verbatim —
+    range policy is config validation's (``plan/01_ARCHITECTURE.md``
+    §2.1).
+
+    Args:
+        spec: The fully resolved container spec.
+
+    Returns:
+        The one-entry ``ports`` mapping when ``spec.published_port``
+        is set, else ``None`` — ``published_port=None`` means nothing
+        is published (D21), so the key is omitted rather than emitted
+        empty.
+
+    Raises:
+        ValueError: ``spec.container_port`` is not positive, or
+            ``spec.published_port`` is set and not positive — raised
+            before anything is built, naming the offending field and
+            value.
+    """
+    if spec.container_port <= 0:
+        raise ValueError(
+            f"container_port must be a positive port, got {spec.container_port}"
+        )
+    if spec.published_port is None:
+        return None
+    if spec.published_port <= 0:
+        raise ValueError(
+            f"published_port must be a positive port, got {spec.published_port}"
+        )
+    return {spec.container_port: spec.published_port}
 
 
 def _volumes_from_mounts(mounts: tuple[MountSpec, ...]) -> dict[str, dict[str, str]]:
