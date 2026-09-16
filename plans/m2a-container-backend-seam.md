@@ -986,9 +986,31 @@ the concatenation can produce an illegal name.
 
 ### 14. `build_run_kwargs` — core translation
 
+**Amended before the red step: the start path is `create` + `start`, not `run(detach=True)`,
+so the kwargs carry no `detach` key.** The original text said "detached start", which implies
+`run`. Two properties of `run` found while re-verifying the saved reference against the
+installed docker 7.2.0 argue against it, and
+[issue #3](https://github.com/iar3-r8/tool-swap/issues/3)'s Scope line says
+"**create**/start/stop/inspect":
+
+1. **`run(detach=True)` returns before any exit check**
+   ([`models/containers.py:876`](../.venv/lib/python3.11/site-packages/docker/models/containers.py:876)),
+   so a container that starts and dies immediately is indistinguishable from one that started
+   cleanly, and `ContainerError` never fires on the detached path.
+2. **`run` auto-pulls a missing image** (`:879–882`), so `ImageNotFound` may never surface —
+   yet behaviour 21's edge case requires exactly that error.
+
+**The image must therefore pre-exist**, and a missing one is an honest `ImageNotFoundError`
+rather than a silent multi-gigabyte pull inside what the caller believes is a start. Confirmed
+by the user before this behaviour's red step. `detach` is a `run`-only kwarg, so it is simply
+absent from the output; **whether an immediate death is detected is not claimed by M2a at
+all** — no `reload()` follows the start, since that would put state-polling logic in a shell
+§4.5 wants thin, and liveness belongs to M2b's sweep.
+
 - **Inputs:** a minimal `ContainerSpec` (tool, name, image, env, labels, network).
-- **Outputs:** a kwargs dict carrying image, name, detached start, environment, the full
-  `managed_labels` set, and the network — key names taken from the saved reference.
+- **Outputs:** a kwargs dict carrying image, name, environment, the full `managed_labels` set,
+  and the network — key names taken from the saved reference. **No `detach` key**, per the
+  amendment above.
 - **Edge cases:** empty env and empty labels; a spec with `network=None` must omit the network
   key rather than pass `None`.
 - **Error behaviour:** a spec with an empty image raises `ValueError` before any SDK call.
@@ -1078,9 +1100,15 @@ the concatenation can produce an illegal name.
 
 ### 21. `DockerBackend.start`
 
+**The call pair is `client.containers.create(**build_run_kwargs(spec))` then `.start()` on the
+returned container object** — see behaviour 14's amendment for why `run(detach=True)` was
+rejected. The image must pre-exist; nothing here pulls.
+
 - **Inputs:** a `ContainerSpec` and a stub client recording its calls.
-- **Outputs:** exactly one create/run call whose kwargs equal `build_run_kwargs(spec)`; a
-  `ContainerHandle` carrying the id the stub returned plus the spec's name, tool and image.
+- **Outputs:** exactly one `create` call whose kwargs equal `build_run_kwargs(spec)`, followed
+  by exactly one `start` call on the object it returned; a `ContainerHandle` carrying the id
+  the stub returned plus the spec's name, tool and image. **No `run` call is made**, and a
+  test pins that, since `run` is the path that would reintroduce the auto-pull.
 - **Edge cases:** the stub raising image-not-found surfaces `ImageNotFoundError` via
   behaviour 19; a name conflict surfaces `ContainerNameConflictError`.
 - **Error behaviour:** every SDK exception passes through `map_sdk_error`; no raw SDK
