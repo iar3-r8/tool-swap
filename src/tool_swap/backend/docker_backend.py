@@ -1,32 +1,28 @@
-"""Docker translation layer for the container backend seam (M2a).
+"""Docker backend for the container backend seam (M2a).
 
-This module holds the pure half of the Docker backend: plan
-behaviours 14-19 of ``plans/m2a-container-backend-seam.md``.
-:func:`build_run_kwargs` translates a
-:class:`~tool_swap.backend.base.ContainerSpec` into the kwargs dict
-that ``DockerBackend.start`` (behaviour 21) passes to
-``client.containers.create``; :func:`map_sdk_error` translates an SDK
-exception — or anything else — into a member of the seven-member
-taxonomy of :mod:`tool_swap.backend.errors` for the caller to raise.
+This module is the Docker half of the seam: plan behaviours 14-27 of
+``plans/m2a-container-backend-seam.md``.  The pure half —
+:func:`build_run_kwargs` (behaviours 14-18) and :func:`map_sdk_error`
+(behaviour 19) — holds every docker-py fact the backend needs: the
+kwarg names, the device-request shape, the exception classification.
+Keeping those facts in functions rather than in a class is what lets
+the shell stay thin (plan §4.5) and every fact be table-testable with
+no client and no daemon.
 
-Responsibility: every docker-py fact the backend needs — the kwarg
-names, the device-request shape, the exception classification —
-lives in these functions rather than in a class, so the shell that
-will call them stays thin (plan §4.5) and every fact is
-table-testable with no client and no daemon.
-
-The thin shell itself — :class:`DockerBackend` — is behaviour 20: a
-constructor that takes an **already-built** client and never reads
-the ambient environment, plus a ``from_config`` classmethod that is
-the only path permitted to build a real one.  Behaviours 21-24 have
-since added the ``start``, ``stop``, ``is_running`` and ``inspect``
-protocol methods; behaviours 25-27 add the rest and the
-import-linter contract.
+:class:`DockerBackend` is that thin shell (behaviours 20-26): its
+constructor takes an **already-built** client and never reads the
+ambient environment, :meth:`DockerBackend.from_config` is the only
+path permitted to build a real one, and the six protocol methods are
+call pairs over the injected client that route every exception
+through :func:`map_sdk_error`, so no raw SDK exception escapes the
+seam.
 
 Boundary: this module is the only ``tool_swap`` module that imports
-the Docker SDK; the import-linter contract that enforces that is
-behaviour 27 and is not in the tree yet.  Nothing here was verified
-against a running daemon.
+the Docker SDK.  That is enforced, not hoped for — the fifth contract
+in ``.importlinter`` (behaviour 27) forbids ``docker`` from every
+other module, and the seam's other modules import with the SDK
+absent.  Nothing here was verified against a running daemon: M2a
+runs no docker tests.
 """
 
 from __future__ import annotations
