@@ -18,10 +18,10 @@ table-testable with no client and no daemon.
 The thin shell itself — :class:`DockerBackend` — is behaviour 20: a
 constructor that takes an **already-built** client and never reads
 the ambient environment, plus a ``from_config`` classmethod that is
-the only path permitted to build a real one.  Behaviours 21-23 have
-since added the ``start``, ``stop`` and ``is_running`` protocol
-methods; behaviours 24-27 add the rest and the import-linter
-contract.
+the only path permitted to build a real one.  Behaviours 21-24 have
+since added the ``start``, ``stop``, ``is_running`` and ``inspect``
+protocol methods; behaviours 25-27 add the rest and the
+import-linter contract.
 
 Boundary: this module is the only ``tool_swap`` module that imports
 the Docker SDK; the import-linter contract that enforces that is
@@ -31,6 +31,8 @@ against a running daemon.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 import docker
@@ -41,6 +43,8 @@ from docker.types import DeviceRequest
 from tool_swap.backend.base import (
     ContainerHandle,
     ContainerSpec,
+    ContainerState,
+    ContainerStatus,
     MountSpec,
 )
 from tool_swap.backend.errors import (
@@ -61,6 +65,10 @@ if TYPE_CHECKING:
     # deliberately kept free (the edge is structurally legal per
     # .importlinter contract 3, but still avoided).
     from tool_swap.config.schema import BackendConfig
+
+#: Module-level logger; behaviour 24's unknown-state warning goes here
+#: — the repository has no logging helper to follow, so it stays plain.
+logger = logging.getLogger(__name__)
 
 #: The daemon 404 message fragments that name a missing image.  The
 #: SDK's own classifier matches exactly these, lowercased, to choose
@@ -495,19 +503,89 @@ def text_of(value: object) -> str:
     return str(value)
 
 
+def _state_block(attrs: Mapping[str, object]) -> Mapping[str, object] | None:
+    """The raw inspect dict's ``State`` sub-mapping, or ``None``.
+
+    Shared by the two behaviour-24 attribute reads.  A missing or
+    non-mapping ``State`` is a malformed inspect response the saved
+    references never describe — logged once at WARNING so a rare case
+    is observed rather than guessed, and reported as ``None`` so the
+    caller falls back to the ``None`` fields rather than inventing
+    values (see :meth:`DockerBackend.inspect`).
+
+    Args:
+        attrs: The raw inspect dict ``container.attrs`` carries.
+
+    Returns:
+        The ``State`` sub-mapping, or ``None`` when it is absent or
+        carries no mapping at all.
+    """
+    state: object = attrs.get("State")
+    if not isinstance(state, Mapping):
+        logger.warning(
+            "container inspect response carries no State mapping — "
+            "exit code and start time are reported as None"
+        )
+        return None
+    return state
+
+
+def _state_exit_code(attrs: Mapping[str, object]) -> int | None:
+    """``attrs['State']['ExitCode']`` as an ``int``, or ``None``.
+
+    The key is **[INFERRED]** — ``container-attrs-reload.md`` §3.1:
+    the only ``ExitCode`` in the installed package belongs to
+    ``exec_inspect``, so the path rests on the Engine API contract,
+    not SDK source.  A missing key, or a value that is not an ``int``,
+    reads ``None`` rather than being coerced: the daemon's own number
+    is the only authority for this field, and a shape the Engine API
+    never names cannot lend one.
+    """
+    block = _state_block(attrs)
+    if block is None:
+        return None
+    code: object = block.get("ExitCode")
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
+def _state_started_at(attrs: Mapping[str, object]) -> str | None:
+    """``attrs['State']['StartedAt']`` as a ``str``, or ``None``.
+
+    The key is **[INFERRED]** — ``container-attrs-reload.md`` §3.1:
+    zero matches for ``StartedAt`` anywhere in the installed package,
+    so the path rests on the Engine API contract, not SDK source.
+    A missing key or a non-string value reads ``None``: the seam
+    passes the daemon's string through verbatim (no coercion to
+    ``datetime`` — base.py), so a value in a shape the Engine API
+    never names is dropped rather than transformed.
+    """
+    block = _state_block(attrs)
+    if block is None:
+        return None
+    started_at: object = block.get("StartedAt")
+    if isinstance(started_at, str):
+        return started_at
+    return None
+
+
 class _BackendContainer(Protocol):
     """The object ``containers.create`` / ``containers.get`` returns,
-    as far as ``start`` (behaviour 21), ``stop`` (behaviour 22) and
-    ``is_running`` (behaviour 23) touch it.
+    as far as ``start`` (behaviour 21), ``stop`` (behaviour 22),
+    ``is_running`` (behaviour 23) and ``inspect`` (behaviour 24)
+    touch it.
 
     A real object is a ``docker.models.containers.Container`` —
     ``id`` the runtime id, ``status`` the state property
     (``running``, ``exited``, …;
     ``plan/third-party-docs/docker/container-attrs-reload.md`` §3),
-    ``start`` and ``stop`` methods
+    ``attrs`` the raw inspect dict (``container-attrs-reload.md`` §1,
+    [READ]: the raw dict the daemon's inspect returned, cached and
+    refreshed only by ``reload()``), ``start`` and ``stop`` methods
     (``plan/third-party-docs/docker/containers-run-create.md`` §4;
     ``plan/third-party-docs/docker/container-stop-wait.md`` §1,
-    models/containers.py:441-453); the behaviour-21/22/23 recording
+    models/containers.py:441-453); the behaviour-21/22/23/24 recording
     stubs carry exactly the members each path uses, so this is also
     the widest shape any stub allows.
     """
@@ -517,6 +595,14 @@ class _BackendContainer(Protocol):
 
     #: The state the daemon reports (``running``, ``exited``, …).
     status: str
+
+    #: The raw inspect dict the daemon returned.  A nested mapping of
+    #: unknown shape — the Engine API's ``ContainerInspect`` — whose
+    #: only members this module reads are the ``State`` sub-mapping's
+    #: ``ExitCode`` and ``StartedAt`` (both **[INFERRED]** — see
+    #: :meth:`DockerBackend.inspect`), so it is typed honestly as a
+    #: mapping of unknown value type rather than a pinned schema.
+    attrs: Mapping[str, object]
 
     def start(self, **kwargs: object) -> None:
         """Start the container; the SDK's ``Container.start(**kwargs)``."""
@@ -529,10 +615,10 @@ class _BackendContainer(Protocol):
 
 class _BackendContainers(Protocol):
     """The ``client.containers`` collection, as far as ``start``,
-    ``stop`` and ``is_running`` touch it.
+    ``stop``, ``is_running`` and ``inspect`` touch it.
 
     Two members: ``create`` (behaviour 21) and ``get`` (behaviours
-    22-23),
+    22-24),
     both returning :class:`_BackendContainer`.  The image is declared
     keyword-only because the behaviour-21 stub records an explicitly
     passed ``image=`` into its kwargs dict, and the SDK's ``create``
@@ -878,6 +964,150 @@ class DockerBackend:
         # md §3.1): an unrecognised value must read False, never raise
         # or read True.
         return container.status == "running"
+
+    def inspect(self, handle: ContainerHandle) -> ContainerStatus:
+        """Current status; ``ContainerState.GONE`` if the container is gone.
+
+        The whole method is the behaviour-24 read (plan §5 behaviour 24;
+        §4.3 contract decision):
+
+        1. the shared lookup :meth:`_fetch_container` for ``handle.id`` —
+           ``client.containers.get``, the saved single-container fetch,
+           which performs a full inspect, reports a missing container
+           as ``None`` rather than raising, and routes every other
+           lookup failure through :func:`map_sdk_error` (``plan/
+           third-party-docs/docker/containers-list-filters.md`` §5,
+           models/containers.py:939-952).  No ``reload()``: ``get``'s
+           returned object already carries a fresh inspect
+           (``plan/third-party-docs/docker/container-attrs-reload.md``
+           §1-2).
+        2. the state is read through ``container.status`` — the one
+           state path the saved reference marks **[READ]**
+           (container-attrs-reload.md §3, containers.py:59-67), mapped
+           onto :class:`ContainerState` below;
+        3. the exit code and start time are read from the container's
+           ``attrs`` — the raw inspect dict (container-attrs-reload.md
+           §1, **[READ]**) — at ``State.ExitCode`` and
+           ``State.StartedAt``, both **[INFERRED]** (see
+           ``_state_exit_code`` and ``_state_started_at``).
+
+        **The exit-code route, and why not ``wait()``.**  The one
+        exit-code path with SDK code behind it is
+        ``wait()['StatusCode']`` (container-attrs-reload.md §3.1,
+        **[READ]**), but ``wait()`` **blocks until the container
+        exits** — for a running container that is unbounded, so an
+        inspect built on it would hang M2b's liveness poller on every
+        healthy container.  ``inspect`` is a point-in-time reading
+        (``ContainerStatus``'s own docstring), and the attrs route is
+        the only non-blocking read available; its keys are therefore
+        pinned as **[INFERRED]**, to be confirmed by the deferred
+        live-daemon test (container-attrs-reload.md §3.1 point 4).
+
+        **The state mapping, and the load-bearing edge.**  The
+        daemon's ``status`` vocabulary is an *open* set — no SDK line
+        enumerates it (container-attrs-reload.md §3.1) — so only the
+        strings with enum members are recognised: ``created`` →
+        ``CREATED``, ``running`` → ``RUNNING``, ``exited`` → ``EXITED``.
+        **Every other string — ``paused``, ``restarting``, or a value
+        nobody has ever seen — maps to ``EXITED`` with a logged warning
+        rather than raising**: the safe direction, since a liveness
+        sweep that believes an unrecognised container is running will
+        never reap it (plan §6 item 4), and the warning keeps the
+        misreport visible.  The comparison is a string ``==`` against
+        each known value, never an ``Enum[str]``-style lookup, so an
+        unknown string cannot raise — behaviour 23's lesson.
+        ``GONE`` is reserved for the not-found path: the daemon never
+        reports it as a ``status`` string, so no status value maps to
+        it.
+
+        **Only the literally-exited state carries the exit code.**
+        ``exit_code`` is read from attrs **only when the daemon
+        reports ``exited``**: a ``created`` or ``running`` container
+        has exited neither successfully nor at all, and passing the
+        daemon's ``0`` through for either would report a clean exit
+        that never happened — the same reasoning base.py's
+        ``None``-rather-than-``0`` default encodes.  An
+        **unrecognised** state likewise carries ``exit_code=None``:
+        the daemon's own status string is untrusted, so its numeric
+        fields cannot carry authority either.  ``started_at`` is
+        passed through verbatim as a plain string — no coercion to
+        ``datetime`` (base.py) — and is ``None`` for a missing
+        container and for an unrecognised state, for the same
+        authority reason as the exit code.
+
+        **The not-found contract (§4.3).**  A container the lookup
+        reports missing is ``GONE`` with ``exit_code=None`` and
+        ``started_at=None``, without raising: the absent container has
+        exited neither successfully nor at all, so no field is
+        invented about it, and M2b's reconciliation relies on the read
+        never turning into a traceback.  ``FakeBackend.inspect``
+        honours the same contract (behaviour 12).  The no-op applies
+        to *state* (missing), never to *availability*: a dead daemon
+        or a daemon refusal during the lookup is already raised by
+        :meth:`_fetch_container` through :func:`map_sdk_error`, so a
+        temporary outage cannot read as "every container is gone".
+
+        Args:
+            handle: The container to inspect.
+
+        Returns:
+            A point-in-time status for the handle, or a
+            ``ContainerState.GONE`` status carrying the handle as
+            given when the lookup reports it missing.
+
+        Raises:
+            BackendError: a taxonomy member routed through
+                :func:`map_sdk_error`, for every lookup failure that
+                is not ``NotFound`` — the mapping table itself is
+                behaviour 19's and is not re-tested here.
+        """
+        container = self._fetch_container(handle.id)
+        if container is None:
+            # Vanished: a state, not an availability failure — the
+            # §4.3 not-found contract, the same shape as stop's no-op
+            # and is_running's False.  Nothing is invented about a
+            # container no one can ask about.
+            return ContainerStatus(handle=handle, state=ContainerState.GONE)
+        # Positive string comparisons — not an enum lookup — because
+        # the status vocabulary is an open set (container-attrs-reload.
+        # md §3.1): an unrecognised value must map to the safe EXITED
+        # branch with a warning, never raise.  GONE is deliberately
+        # absent: no daemon status value maps to it.
+        status = container.status
+        if status == "created":
+            state = ContainerState.CREATED
+            exit_code = None
+            started_at = _state_started_at(container.attrs)
+        elif status == "running":
+            state = ContainerState.RUNNING
+            exit_code = None
+            started_at = _state_started_at(container.attrs)
+        elif status == "exited":
+            state = ContainerState.EXITED
+            exit_code = _state_exit_code(container.attrs)
+            started_at = _state_started_at(container.attrs)
+        else:
+            # The load-bearing edge: an unrecognised vocabulary value
+            # maps to the terminal EXITED state and logs a warning
+            # naming it — never raises, never RUNNING (a sweep that
+            # believes it is running never reaps it), never CREATED
+            # (which would block readiness logic expecting a terminal
+            # state).  Its numeric fields are untrusted, so they stay
+            # None.
+            logger.warning(
+                "unrecognised container state %r reported by the "
+                "daemon; reporting it as exited with no exit code",
+                status,
+            )
+            state = ContainerState.EXITED
+            exit_code = None
+            started_at = None
+        return ContainerStatus(
+            handle=handle,
+            state=state,
+            exit_code=exit_code,
+            started_at=started_at,
+        )
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
