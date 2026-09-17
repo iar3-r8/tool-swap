@@ -39,8 +39,16 @@ SDK's ``_create_container_args`` raises ``TypeError`` via
 ``docker/models/containers.py:1123`` ff.), so a real client rejects a typo'd
 kwarg that a permissive stub would swallow.  This stub is deliberately
 *recording but not validating*: its ``create`` accepts exactly the shape the
-call pair has — a single positional ``image`` plus keyword-only kwargs — and
-records ``(image, kwargs)`` verbatim.  Validation of the kwarg *names* is not
+call pair has — one ``**kwargs`` unpack of ``build_run_kwargs``'s output —
+and records that mapping verbatim, ``image`` included.  The keyword style is
+what the plan pins (behaviour 21, §5: "the call pair is
+``client.containers.create(**build_run_kwargs(spec))``") and what the real
+SDK accepts: ``ContainerCollection.create(self, image, command=None,
+**kwargs)`` re-binds its first positional into ``kwargs['image']`` before
+dispatch (``containers.py:914-932``), so a keyword ``image`` reaches the
+daemon by the same path — and it is the *only* shape under which the
+derived-equality assertion can hold, since ``build_run_kwargs``'s output
+always contains ``image`` as a key.  Validation of the kwarg *names* is not
 re-done here: behaviours 14–18 already pin every name against the saved page
 (``containers-run-create.md`` §2), and this behaviour's job is the *call
 shape* — who is called, how many times, with what object — not a second
@@ -51,7 +59,8 @@ snapshot of the names.  Fidelity where it matters:
   rather than an absence check on a permissive stub;
 - the returned container object is a distinct object carrying its own
   ``start`` and a fixed ``id``, so "``start`` is called on *the object
-  create returned*" (``test_start_calls_start_on_the_created_container``)
+  create returned*"
+  (``test_start_calls_start_on_the_created_container_exactly_once``)
   and "the handle carries *the id the stub returned*"
   (``test_start_returns_handle_with_the_stubs_id_and_the_specs_fields``)
   are identity- and value-checks against a stub that cannot satisfy them by
@@ -73,8 +82,14 @@ matches (same page, §2 "The 404 mapping").
 
 The ``start`` signature is **already pinned** by the ``ContainerBackend``
 protocol in ``src/tool_swap/backend/base.py`` (behaviour 8) and is not
-re-pinned here; one test asserts the constructed backend satisfies that
-runtime-checkable protocol.
+re-pinned here.  The *conformance* pin — an ``isinstance`` against the
+runtime-checkable protocol — is deliberately **absent** from this file:
+``isinstance`` matches on member *names* only and every one of the six
+must be present, so pinning it while only ``start`` exists would force
+this behaviour's GREEN step to ship five ``NotImplementedError``
+placeholders for the surface of behaviours 22–26.  One behaviour, one
+cycle.  The conformance pin moves to behaviour 26 (``logs``), where the
+class is complete and the check passes with no placeholders.
 
 This file is the RED step: ``DockerBackend`` exists (behaviour 20) but
 defines no ``start`` yet, so every subject test fails *individually* at the
@@ -99,7 +114,7 @@ import docker.errors
 import pytest
 import requests
 
-from tool_swap.backend.base import ContainerBackend, ContainerHandle, ContainerSpec
+from tool_swap.backend.base import ContainerHandle, ContainerSpec
 from tool_swap.backend.errors import (
     BackendError,
     ContainerNameConflictError,
@@ -230,9 +245,14 @@ def _spec(**overrides: Any) -> ContainerSpec:
 
 @dataclass
 class _RecordedCreate:
-    """One recorded ``create`` call: the positional image and the kwargs."""
+    """One recorded ``create`` call: the unpacked kwargs, verbatim.
 
-    image: str
+    A single dict — not an ``(image, kwargs)`` pair — because the pinned
+    call shape is ``create(**kwargs)``: the image is one key of the
+    unpacked mapping, so the record *is* the mapping, compared directly
+    with ``build_run_kwargs``'s output.
+    """
+
     kwargs: dict[str, Any]
 
 
@@ -245,13 +265,28 @@ class _RecordingContainer:
     ``docker/models/containers.py:412-421``).  Only those two members are
     provided, plus a call record for ``start``; anything else raises
     ``AttributeError`` by default.
+
+    ``__init__`` is explicit, not a dataclass ``__post_init__``: the code
+    under test wraps the call pair in ``except Exception``, so a
+    construction failure raised *inside* ``start`` (the ``TypeError`` a
+    missing generated ``__init__`` produces) would be routed through
+    ``map_sdk_error`` and surface as a ``BackendError`` that looks like
+    an implementation fault and is not one.  A recording stub must fail
+    where it is called from — in the test body — never inside the seam
+    it records.
     """
 
     #: The runtime id ``create`` reports for this container.
     id: str = "deadbeef"
 
-    def __post_init__(self) -> None:
-        """Record every ``start`` call's kwargs, in order."""
+    def __init__(self, container_id: str = "deadbeef") -> None:
+        """Store the runtime id and prepare the ``start`` call record.
+
+        The parameter is ``container_id`` — not ``id``, which ruff
+        forbids as a shadowed builtin — while the attribute it stores
+        stays ``id``, the name the SDK's ``Container`` carries.
+        """
+        self.id = container_id
         self.start_calls: list[dict[str, Any]] = []
 
     def start(self, **kwargs: Any) -> None:
@@ -288,9 +323,21 @@ class _RecordingContainers:
         self.create_calls: list[_RecordedCreate] = []
         self.run_calls: list[dict[str, Any]] = []
 
-    def create(self, image: str, **kwargs: Any) -> _RecordingContainer:
-        """Record the call; return the prepared container or raise."""
-        self.create_calls.append(_RecordedCreate(image=image, kwargs=kwargs))
+    def create(self, **kwargs: Any) -> _RecordingContainer:
+        """Record the call; return the prepared container or raise.
+
+        The signature is ``**kwargs`` only — no leading ``image``
+        parameter — because the pinned shape is
+        ``create(**build_run_kwargs(spec, …))`` and the pure function's
+        output always contains ``image`` as a key.  A leading ``image``
+        parameter would bind a positional call and drop that key from the
+        record, making the derived-equality assertion unsatisfiable; and
+        a positional call against this signature would ``TypeError`` at
+        binding, which the seam's ``except Exception`` would turn into a
+        ``BackendError`` — a stub fault dressed as an implementation
+        fault.
+        """
+        self.create_calls.append(_RecordedCreate(kwargs=kwargs))
         if self._error is not None:
             raise self._error
         if self._result is None:  # pragma: no cover - fixture misuse
@@ -419,13 +466,15 @@ def test_start_makes_exactly_one_create_with_the_pure_functions_kwargs() -> None
     Arrange: a recording stub whose ``create`` returns a container, and a
     spec exercising every optional field.
     Act: ``backend.start(spec)``.
-    Assert: exactly one ``create`` call; its positional ``image`` is
-    ``spec.image``; its kwargs dict **equals the fresh result of calling
-    ``build_run_kwargs(spec, label_namespace=…)``** — derived, never
-    restated, so this file cannot drift from the behaviour-14–18
-    snapshots.  If the backend passes its stored ``label_namespace`` (it
-    was constructed with ``_NAMESPACE``), the two agree; any other
-    namespace, dropped key or retyped value fails the equality.
+    Assert: exactly one ``create`` call, made as ``create(**kwargs)`` —
+    the recorded dict, ``image`` among its keys, **equals the fresh
+    result of calling ``build_run_kwargs(spec, label_namespace=…)``** —
+    derived, never restated, so this file cannot drift from the
+    behaviour-14–18 snapshots.  If the backend passes its stored
+    ``label_namespace`` (it was constructed with ``_NAMESPACE``), the two
+    agree; any other namespace, dropped key or retyped value fails the
+    equality, and so does a positional ``image`` — legal against the real
+    SDK but not the pinned shape.
     """
     spec = _spec()
     stub = _RecordingClient(result=_RecordingContainer())
@@ -434,11 +483,9 @@ def test_start_makes_exactly_one_create_with_the_pure_functions_kwargs() -> None
 
     containers = cast("_RecordingContainers", stub.containers)
     assert len(containers.create_calls) == 1
-    recorded = containers.create_calls[0]
-    assert recorded.image == spec.image
     module = _get_docker_backend_module()
     expected = module.build_run_kwargs(spec, label_namespace=_NAMESPACE)
-    assert recorded.kwargs == expected
+    assert containers.create_calls[0].kwargs == expected
 
 
 def test_start_calls_start_on_the_created_container_exactly_once() -> None:
@@ -461,7 +508,7 @@ def test_start_calls_start_on_the_created_container_exactly_once() -> None:
 
     containers = cast("_RecordingContainers", stub.containers)
     assert len(containers.create_calls) == 1
-    assert containers.create_calls[0].image == spec.image
+    assert containers.create_calls[0].kwargs["image"] == spec.image
     assert container.start_calls == [{}]
 
 
@@ -504,7 +551,7 @@ def test_start_returns_handle_with_the_stubs_id_and_the_specs_fields() -> None:
     """
     spec = _spec()
     container_id = "deadbeef"
-    stub = _RecordingClient(result=_RecordingContainer(id=container_id))
+    stub = _RecordingClient(result=_RecordingContainer(container_id=container_id))
     backend = _backend_with(stub)
     handle = backend.start(spec)
 
@@ -512,20 +559,6 @@ def test_start_returns_handle_with_the_stubs_id_and_the_specs_fields() -> None:
     assert handle == ContainerHandle(
         id=container_id, name=spec.name, tool=spec.tool, image=spec.image
     )
-
-
-def test_start_satisfies_the_container_backend_protocol() -> None:
-    """The constructed backend satisfies the behaviour-8 protocol.
-
-    ``start``'s signature is pinned by the runtime-checkable
-    ``ContainerBackend`` protocol in ``base.py`` (behaviour 8) — this
-    test only pins that the shipped class conforms, so the seam the
-    lifecycle components are written against is the one ``start`` lives
-    on.
-    """
-    stub = _RecordingClient(result=_RecordingContainer())
-    backend = _backend_with(stub)
-    assert isinstance(backend, ContainerBackend)
 
 
 # ---------------------------------------------------------------------------
