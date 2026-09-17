@@ -493,56 +493,79 @@ def text_of(value: object) -> str:
     return str(value)
 
 
-class _StartableContainer(Protocol):
-    """The object ``containers.create`` returns, as far as ``start``
-    touches it.
+class _BackendContainer(Protocol):
+    """The object ``containers.create`` / ``containers.get`` returns,
+    as far as ``start`` (behaviour 21) and ``stop`` (behaviour 22)
+    touch it.
 
-    A real object is a ``docker.models.containers.Container`` — ``id``
-    the runtime id, ``start`` a method
-    (``plan/third-party-docs/docker/containers-run-create.md`` §4);
-    the behaviour-21 recording stub carries exactly these two members
-    and nothing else, so this is also the widest shape the stub allows.
+    A real object is a ``docker.models.containers.Container`` —
+    ``id`` the runtime id, ``status`` the state property
+    (``running``, ``exited``, …;
+    ``plan/third-party-docs/docker/container-attrs-reload.md`` §3),
+    ``start`` and ``stop`` methods
+    (``plan/third-party-docs/docker/containers-run-create.md`` §4;
+    ``plan/third-party-docs/docker/container-stop-wait.md`` §1,
+    models/containers.py:441-453); the behaviour-21/22 recording stubs
+    carry exactly the members each path uses, so this is also the
+    widest shape either stub allows.
     """
 
-    #: The runtime id ``create`` reports for the container.
+    #: The runtime id the container is known by.
     id: str
+
+    #: The state the daemon reports (``running``, ``exited``, …).
+    status: str
 
     def start(self, **kwargs: object) -> None:
         """Start the container; the SDK's ``Container.start(**kwargs)``."""
         ...
 
-
-class _StartableContainers(Protocol):
-    """The ``client.containers`` collection, as far as ``start``
-    touches it.
-
-    One member: ``create``, returning :class:`_StartableContainer`.
-    The image is declared keyword-only because the behaviour-21 stub
-    records an explicitly passed ``image=`` into its kwargs dict, and
-    the SDK's ``create`` also accepts it as a keyword (it re-sets
-    ``kwargs['image']`` itself —
-    ``.venv/lib/python3.11/site-packages/docker/models/containers.py:932``),
-    so the pure function's output unpacks against both.
-    """
-
-    def create(self, **kwargs: object) -> _StartableContainer:
-        """Create (do not start) the container the kwargs describe."""
+    def stop(self, **kwargs: object) -> None:
+        """Stop the container; the SDK's ``Container.stop(**kwargs)``."""
         ...
 
 
-class _StartableClient(Protocol):
-    """The minimal client shape ``start`` (behaviour 21) calls through.
+class _BackendContainers(Protocol):
+    """The ``client.containers`` collection, as far as ``start`` and
+    ``stop`` touch it.
 
-    Kept to exactly what the call pair touches — a ``containers``
-    collection, nothing more — **not** a speculative full client
-    interface: behaviours 22-26 will force any further members when
-    they land.  ``containers`` is a plain attribute member (not a
-    property), matching how both a real ``docker.DockerClient`` and
-    the behaviour-21 recording stub carry it — set in ``__init__``.
+    Two members: ``create`` (behaviour 21) and ``get`` (behaviour 22),
+    both returning :class:`_BackendContainer`.  The image is declared
+    keyword-only because the behaviour-21 stub records an explicitly
+    passed ``image=`` into its kwargs dict, and the SDK's ``create``
+    also accepts it as a keyword (it re-sets ``kwargs['image']``
+    itself —
+    ``.venv/lib/python3.11/site-packages/docker/models/containers.py:
+    932``), so the pure function's output unpacks against both.
     """
 
-    #: The container collection; the only attribute the call pair reads.
-    containers: _StartableContainers
+    def create(self, **kwargs: object) -> _BackendContainer:
+        """Create (do not start) the container the kwargs describe."""
+        ...
+
+    def get(self, container_id: str) -> _BackendContainer:
+        """Fetch one container by id or name; the SDK raises
+        ``NotFound`` when it is missing (``plan/third-party-docs/
+        docker/containers-list-filters.md`` §5,
+        models/containers.py:939-952)."""
+        ...
+
+
+class _BackendClient(Protocol):
+    """The minimal client shape the behaviour-21/22 call pairs call
+    through.
+
+    Kept to exactly what those call pairs touch — a ``containers``
+    collection, nothing more — **not** a speculative full client
+    interface: behaviours 23-26 will force any further members when
+    they land.  ``containers`` is a plain attribute member (not a
+    property), matching how both a real ``docker.DockerClient`` and
+    the behaviour-21/22 recording stubs carry it — set in
+    ``__init__``.
+    """
+
+    #: The container collection; the only attribute the call pairs read.
+    containers: _BackendContainers
 
 
 class DockerBackend:
@@ -571,8 +594,9 @@ class DockerBackend:
         guard test pins the constructor's *names and positions*, never
         its annotations, and both a stub and a real ``DockerClient``
         satisfy ``object``.  Behaviour 21 has since forced the one
-        minimal protocol its call pair touches (``_StartableClient``,
-        above); :meth:`start` casts through it, and any later behaviour
+        minimal protocol its call pair touches (``_BackendClient``,
+        above); :meth:`start` and :meth:`stop` cast through it, and any
+        later behaviour
         that needs a further member grows that protocol — never a
         speculative full client interface.
 
@@ -631,7 +655,7 @@ class DockerBackend:
             A :class:`ContainerHandle` identifying the started
             container.
         """
-        client = cast(_StartableClient, self.client)
+        client = cast(_BackendClient, self.client)
         try:
             container = client.containers.create(
                 **build_run_kwargs(spec, label_namespace=self.label_namespace)
@@ -649,6 +673,99 @@ class DockerBackend:
         return ContainerHandle(
             id=container.id, name=spec.name, tool=spec.tool, image=spec.image
         )
+
+    def stop(self, handle: ContainerHandle, *, timeout_s: float) -> None:
+        """Stop the identified container, or no-op when there is nothing to stop.
+
+        The whole method is the call pair (plan §5 behaviour 22):
+
+        1. ``client.containers.get(handle.id)`` — the saved single-container
+           fetch, which performs a full inspect and raises ``NotFound`` when
+           the container is missing (``plan/third-party-docs/docker/
+           containers-list-filters.md`` §5, models/containers.py:939-952);
+        2. ``stop(timeout=...)`` on the object ``get`` returned, carrying the
+           timeout in **int seconds** under the SDK's parameter name
+           ``timeout`` (``plan/third-party-docs/docker/
+           container-stop-wait.md`` §1, models/containers.py:441-453) — the
+           call blocks until the daemon reports the container stopped.
+
+        **The no-op contract (§4.3).**  A container the lookup reports
+        *missing* (``NotFound``) or *already exited* (``status ==
+        'exited'``, read through the ``status`` property — the only
+        state path the saved reference marks [READ],
+        ``plan/third-party-docs/docker/container-attrs-reload.md`` §3)
+        is a no-op: ``stop`` returns ``None`` without calling the
+        container's ``stop``.  ``FakeBackend.stop`` honours the same
+        contract (behaviour 12), and M2b's liveness sweep relies on it.
+        The catch is deliberately scoped to ``docker.errors.NotFound``
+        — **not** a blanket ``except Exception`` — because a dead daemon
+        surfaces from this call pair as a bare ``requests`` connection
+        error (``plan/third-party-docs/docker/errors.md`` §3,
+        [CORRECTED 2026-09-16]), which must route to
+        ``BackendUnavailableError`` rather than masquerade as a tidy
+        shutdown: the no-op applies to *state* (missing, exited), never
+        to *availability*.  ``NotFound`` is an ``APIError`` and hence a
+        ``requests.exceptions.HTTPError`` (errors.py:42, 92), so no
+        connection error can ever match it — the scope is
+        structurally, not accidentally, safe.
+
+        **The zero-timeout trap.**  ``timeout_s`` is converted with
+        ``round(timeout_s)`` and passed **unconditionally** — there is
+        no ``or None`` or any other falsy test.  The API layer drops
+        the parameter only on a strict ``is None`` check (``api/
+        container.py:1202-1206``), so a falsy drop of ``timeout_s=0``
+        would send no ``t`` at all and the daemon's own configured
+        ``StopTimeout`` — up to ten seconds — would apply instead of the
+        requested immediate stop, indistinguishable to the caller.
+        ``round`` (not ``int``) so a fractional ``timeout_s`` that
+        lands just below the next whole second (e.g. ``1.9999999999``)
+        is not silently truncated — the same reasoning as
+        :func:`build_run_kwargs`'s nano-CPU conversion (behaviour 17).
+
+        Every exception a call raises — except the ``NotFound`` no-op —
+        is routed through :func:`map_sdk_error` and the result is
+        raised, so no raw SDK exception escapes the seam; the mapping
+        table itself is behaviour 19's and is not re-tested here.
+
+        Args:
+            handle: The container to stop.
+            timeout_s: Seconds the daemon is allowed before it kills
+                the container; ``0`` means immediate.
+
+        Returns:
+            ``None`` — both on a performed stop and on a no-op.
+        """
+        client = cast(_BackendClient, self.client)
+        try:
+            container = client.containers.get(handle.id)
+        except docker.errors.NotFound:
+            # The container is gone — a state, not an availability
+            # failure: return without touching anything.
+            return
+        except Exception as exc:
+            # Every other failure from the lookup — a daemon refusal, a
+            # dead daemon — is routed through map_sdk_error.  A dead
+            # daemon raises a requests connection error, which the
+            # NotFound clause above cannot match, so it reaches here
+            # and surfaces as BackendUnavailableError rather than a
+            # swallowed no-op.
+            raise map_sdk_error(exc) from exc
+        try:
+            if container.status == "exited":
+                return
+            # Passed unconditionally — never `timeout_s or None` — so a
+            # real zero reaches the daemon as {'t': 0}.  See the
+            # zero-timeout trap in this method's docstring.
+            container.stop(timeout=round(timeout_s))
+        except Exception as exc:
+            # Every SDK exception (all derive from
+            # docker.errors.DockerException, an Exception) is routed
+            # through map_sdk_error and the result is raised, so no raw
+            # SDK exception escapes the seam.  KeyboardInterrupt /
+            # SystemExit are deliberately not caught: they keep their
+            # normal semantics rather than being re-labelled a backend
+            # failure.
+            raise map_sdk_error(exc) from exc
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
