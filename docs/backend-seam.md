@@ -6,22 +6,20 @@ protocol. This guide describes that seam — its data types, its naming
 and labelling rules, its error taxonomy, and the boundary that keeps
 the container runtime contained in one place.
 
-**Status: two implementations of the seam are in flight.** The data
+**Status: both implementations of the seam are shipped.** The data
 types, the helpers, the protocol declaration and the error taxonomy
-are shipped, and so is the in-memory backend — `FakeBackend`, plan
-behaviours 10–13 — the first real implementation of the
-`ContainerBackend` protocol. The Docker backend is arriving in two
-slices on the same milestone branch: **behaviours 14–19 have landed**
-as the pure translation layer —
-[`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:80)
-and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:253)
-in [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) —
-and behaviours 20–27 (the `DockerBackend` class and the
-import-linter contract) are the next pull request, not yet in the
-tree. Until that slice lands, **nothing calls the two functions**:
-the translation layer is tested directly and is not yet wired into a
-backend. The M2b tool state machine — `STOPPED`, `STARTING`,
-`LOADING`, `READY` — does not exist either. This page documents what
+are in the tree, and both protocol implementations are: the
+in-memory `FakeBackend` (plan behaviours 10–13) and the Docker
+backend, which landed in two slices on the same milestone branch —
+the pure translation layer, behaviours 14–19
+([`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)
+and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
+and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
+shell with the import-linter contract, behaviours 20–27. `isinstance(backend, ContainerBackend)`
+is `True` for both, and "the only module that imports the Docker
+SDK" is now enforced rather than hoped for. What this page does **not**
+contain is the M2b tool state machine — `STOPPED`, `STARTING`,
+`LOADING`, `READY` — which does not exist. This page documents what
 is here, and says explicitly where it stops.
 
 The design is specified in
@@ -43,11 +41,11 @@ flowchart LR
         HELPER[labels.py: managed_labels, container_name, label_selector]
         PROTO[base.py: ContainerBackend protocol, six synchronous methods]
         ERR[errors.py: the seven-member error taxonomy]
-        FAKE[fake_backend.py: FakeBackend, the first implementation, behaviours 10–13]
-        DOCKT[docker_backend.py: pure translation layer, behaviours 14–19 — build_run_kwargs and map_sdk_error, nothing calls them yet]
+        FAKE[fake_backend.py: FakeBackend, behaviours 10–13, importable with the SDK absent]
+        DOCK[docker_backend.py: DockerBackend, behaviours 20–26 — the only module that may import the Docker SDK]
+        DOCKT[docker_backend.py: build_run_kwargs and map_sdk_error, behaviours 14–19, the pure half]
     end
     subgraph future[later branches and milestones — not shipped]
-        DOCK[behaviours 20–27: the DockerBackend class, the only module that may import the Docker SDK]
         LIFE[M2b: LifecycleManager, the tool state machine]
         BLD[M5: build and BuildSpec]
     end
@@ -57,27 +55,30 @@ flowchart LR
     HELPER --> PROTO
     PROTO -->|raises| ERR
     FAKE -->|implements| PROTO
+    DOCK -->|implements| PROTO
+    DOCK -->|calls| DOCKT
     DOCKT -->|reads| TYPES
     DOCKT -->|uses| HELPER
     DOCKT -->|returns members of| ERR
-    DOCK -.->|will wrap — thin by design, plan §4.5| DOCKT
-    DOCK -.->|will implement| PROTO
     LIFE -.->|will call off the event loop| PROTO
     BLD -.->|deliberately absent from the protocol| PROTO
 ```
 
 Solid edges are shipped; dashed ones are named in the plan but not yet
-in the tree. `FakeBackend` sits inside the seam's subgraph — it is
-shipped, in-memory, and importable with the Docker SDK absent. The
-translation layer `DOCKT` is in the same subgraph — it is shipped and
-tested — but its edges are *inputs to a future backend*, not calls
-from one: no edge from a `ContainerBackend` implementation reaches
-`DOCKT`, because nothing calls those functions yet.
+in the tree. Both `FakeBackend` and `DockerBackend` sit inside the
+seam's subgraph: the fake is in-memory and importable with the Docker
+SDK absent; the Docker backend is the thin shell over its own pure
+half `DOCKT` (plan §4.5) — `start` unpacks
+[`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)'s
+output into `create`, and every method routes exceptions through
+[`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) —
+and it is the only module that may import the SDK (the fifth
+`.importlinter` contract, behaviour 27).
 
 ## What is in the tree
 
-The seam is four modules, all under `src/tool_swap/backend/`, plus
-the first implementation of the protocol:
+The seam is five modules, all under `src/tool_swap/backend/`, plus
+both implementations of the protocol:
 
 | Module | Contents |
 |---|---|
@@ -85,7 +86,7 @@ the first implementation of the protocol:
 | [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
 | [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
 | [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
-| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:80) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:253) — the pure translation layer, behaviours 14–19 |
+| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) — the pure half, behaviours 14–19 — and [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746), the thin shell over them, behaviours 20–26 |
 
 ## The data types
 
@@ -194,16 +195,23 @@ The seam's value is as much in what it refuses to do.
 - **No policy.** No TTL, no group, no eviction, no readiness. The
   backend knows whether a process exists; everything above that is
   M2b's.
-- **One runtime import, one module.**
+- **One runtime import, one module — enforced.**
   [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py)
-  is the only module under `src/` that imports the Docker SDK — its
-  three import lines are the seam's single window onto the runtime,
-  and both of its functions are pure over that import. The
-  import-linter *contract* that makes "only one module" enforced
-  rather than hoped for is behaviour 27 and is not in the tree yet;
-  the contracts that do exist, in
-  [`.importlinter`](../.importlinter), keep the config layer a leaf
-  that never imports the backend.
+  is the only module under `src/` that imports the Docker SDK. The
+  fifth contract in
+  [`.importlinter`](../.importlinter) — "The docker SDK is importable
+  from one module only" — forbids `docker` from every `tool_swap`
+  module and carves out exactly
+  `tool_swap.backend.docker_backend -> docker`
+  ([`.importlinter`](../.importlinter:39)); `lint-imports` reports
+  **5 kept, 0 broken**. The other four contracts keep the router and
+  runtime apart and the config layer a leaf that never imports the
+  backend. The mechanism has two teeth, documented in detail in
+  [The import boundary](#the-import-boundary-behaviour-27): without
+  the top-level `include_external_packages` the contract would raise
+  a configuration error rather than check anything, and its
+  `ignore_imports` carve-out is self-policing — an expression that
+  matches no real import is an error, not a silent no-op.
 
 ## Names and labels
 
@@ -243,9 +251,14 @@ under an older namespace recognisable as ours.
 
 `label_selector(namespace)` returns exactly one entry — the
 `managed-by` key for that namespace — and it is a **neutral label map,
-not a docker filter**: translating it into the SDK's filter form is a
-later behaviour's job, to be pinned against the saved docker-py
-reference.
+not a docker filter**: the translation into the SDK's
+`filters={"label": "key=value"}` form happens in
+[`list_managed`](../src/tool_swap/backend/docker_backend.py:1198)
+(behaviour 25), derived by *calling* `label_selector` with the
+resolved namespace rather than restating the entry, so the filter
+cannot drift from the map the containers were stamped with. Whether
+the daemon's selector really selects is not claimed — the SDK does no
+client-side interpretation of filters; that is deferred docker test 1.
 
 ## The `FakeBackend`
 
@@ -347,42 +360,58 @@ sweep relies on:
 | `stop` | a no-op |
 | `start`, `list_managed`, `logs` | raise a taxonomy member |
 
-`FakeBackend` honours this contract exactly, which is how a test
-reproduces a missing container: `vanish` a running handle and the
-three lenient reads behave as the table says without a daemon.
+Both implementations honour the contract exactly. `FakeBackend`
+makes it testable: `vanish` a running handle and the three lenient
+reads behave as the table says without a daemon.
+`DockerBackend` reaches it through one shared lookup
+([`_fetch_container`](../src/tool_swap/backend/docker_backend.py:798)),
+which turns only the SDK's `NotFound` into "missing" — every other
+lookup failure is routed through
+[`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)
+and raised. **The asymmetry is deliberate, and a dead daemon is never
+treated as not-found:** a missing container is *state*, an
+unreachable daemon is *availability*. Swallowing the latter would let
+M2b's liveness sweep reap containers that are alive behind an
+unreachable daemon, so `is_running`'s `False`, `inspect`'s `GONE`
+and `stop`'s no-op all apply to *state* only — a dead daemon
+surfaces [`BackendUnavailableError`](../src/tool_swap/backend/errors.py:70)
+instead. And the contract is not symmetric the other way: `logs`
+**raises** [`ContainerNotFoundError`](../src/tool_swap/backend/errors.py:106)
+for a vanished container, eagerly on the call rather than on the
+first `next()` — the one place in the slice where fake and docker
+parity means *both raise*.
 
 ## The Docker translation layer (behaviours 14–19)
 
-The first slice of the Docker backend is in the tree: two pure
-functions in
+The pure half of the Docker backend: two functions in
 [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py),
 no class, no client, no daemon round-trip. The design is plan §4.5:
 the `DockerBackend` shell is deliberately **thin**, so the
 interesting logic — every kwarg name, every error classification —
 lives in functions testable exhaustively with no daemon. That is why
-68 new unit tests exist for code that talks to Docker without Docker
-being present.
+a backend that talks to Docker is testable with Docker absent: 68
+tests for the pure layer, 78 more for the shell and the boundary
+(behaviours 20–27, documented below).
 
 Two things a reader must know before the tables:
 
-- **Nothing calls these functions yet.** The shell that would
-  consume them — the `DockerBackend` class, `from_config`, and the
-  import-linter contract that pins
-  [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py)
-  as the only module importing the SDK — is behaviours 20–27, the
-  next pull request. The seam does **not** have a working Docker
-  backend; it has the backend's pure half.
+- **The shell consumes these functions.**
+  [`DockerBackend.start`](../src/tool_swap/backend/docker_backend.py:853)
+  unpacks `build_run_kwargs`'s output into `create`, and every method
+  routes its exceptions through `map_sdk_error` — which is why the
+  shell's tests can assert equality against the pure function's
+  output rather than against a dict invented in the same diff.
 - **Nothing here was verified against a running daemon.** Every
   docker-py fact is pinned against the installed docker 7.2.0's own
   source and its own classifier, and cited in the function
   docstrings from
   [`plan/third-party-docs/docker/`](../plan/third-party-docs/docker/INDEX.md).
-  M2a runs no docker tests — see the deferred-note in the
+  M2a runs no docker tests — see the deferred note in the
   troubleshooting section below.
 
 ### `build_run_kwargs` — spec to `containers.create` kwargs
 
-[`build_run_kwargs(spec, *, label_namespace)`](../src/tool_swap/backend/docker_backend.py:80)
+[`build_run_kwargs(spec, *, label_namespace)`](../src/tool_swap/backend/docker_backend.py:102)
 reads a [`ContainerSpec`](../src/tool_swap/backend/base.py:49) and
 nothing else — no client, no daemon, no environment — and returns a
 fresh dict for `client.containers.create(**kwargs)`. The keys it
@@ -422,7 +451,7 @@ Every name is cited from
 
 ### `map_sdk_error` — SDK exception to taxonomy
 
-[`map_sdk_error(exc)`](../src/tool_swap/backend/docker_backend.py:253)
+[`map_sdk_error(exc)`](../src/tool_swap/backend/docker_backend.py:275)
 reads an exception — or anything else — and **returns** a member of
 the seven-member taxonomy for the caller to raise. Pure and total:
 it never raises, so no raw SDK exception escapes the seam, and every
@@ -488,26 +517,191 @@ These are brittle by necessity, not interfaces:
   rule in the config layer would be the better fix; it belongs there
   and is not part of this milestone.
 
+## The `DockerBackend` shell (behaviours 20–26)
+
+The second slice of the Docker backend is in the tree:
+[`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746),
+the thin shell plan §4.5 designed — six protocol methods that are
+call pairs over an injected client, each routing every exception
+through [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)
+so no raw SDK exception escapes the seam. The client protocol was
+grown one behaviour at a time — `create`, then `get`, `status`,
+`stop`, then `attrs`, then `list`, `name`, `labels`, then
+`logs` — and never invented, so it describes exactly what the seam
+touches and nothing speculative. `isinstance(backend, ContainerBackend)`
+is `True`; the pin lives in behaviour 26's tests, where the last
+protocol member lands, so no `NotImplementedError` placeholders were
+ever shipped.
+
+### The constructor is a guardrail
+
+[`DockerBackend.__init__`](../src/tool_swap/backend/docker_backend.py:756)
+takes an **already-built client** and stores exactly that object —
+identity-wise, per behaviour 20's tests. It reads no environment
+variable and no `~/.docker/config.json`;
+[`from_config`](../src/tool_swap/backend/docker_backend.py:1489)
+is the only path that builds a real one, via `docker.from_env()` —
+and `from_config` is **not exercised by the unit suite** (it would
+need a daemon). That split is what makes the whole backend
+testable with no daemon, and it is pinned by a named regression
+guard, not a convention: behaviour 20's guard test
+([`test_docker_backend_ambient_env_guard.py`](../tests/unit/backend/test_docker_backend_ambient_env_guard.py))
+poisons **six** SDK entry points — `docker.from_env`,
+`docker.DockerClient.from_env`, `docker.from_context`,
+`docker.DockerClient.from_context`, plus the
+`DockerClient.__init__` and `APIClient.__init__` constructors — and
+constructs and uses the backend under the poison. Six, not four,
+because `docker.from_env` is a module-level alias bound *at import
+time*, a distinct binding from the classmethod of the same name: a
+guard patching only one half of the pair is the under-patched
+version, and the test's in-memory decoys catch each half
+independently. The guard proves the poison live before the subject
+runs, so a silently-missed patch fails the verification step, not
+the subject. Constructing with `None` as the client raises
+`TypeError` — a programming error refused loudly rather than let
+through to an SDK call.
+
+### The six methods
+
+Each method is thin by design: the tests assert call *shape* — who
+is called, how many times, with what object — and derived equality
+against the pure layer's output, never a restated dict.
+
+| Method | The call pair | What a reader must know |
+|---|---|---|
+| [`start`](../src/tool_swap/backend/docker_backend.py:853) | `create(**build_run_kwargs(spec))`, then `start()` on the returned container, then a handle with the stub's `id` plus the spec's `name`/`tool`/`image` | **No `run` call — and none may be added.** `run(detach=True)` returns before any exit check and auto-pulls a missing image, which would stop `ImageNotFoundError` from ever surfacing. No post-start `reload()` either: M2a claims nothing about detecting an immediate death; liveness is M2b's sweep. |
+| [`stop`](../src/tool_swap/backend/docker_backend.py:907) | shared lookup, then `stop(timeout=round(timeout_s))` | Not-found and already-exited are no-ops (§4.3). The zero-timeout trap: `timeout_s` is passed **unconditionally** — the API layer drops the parameter only on a strict `is None` check, so a falsy drop of `0` would let the daemon's own `StopTimeout` apply instead of the requested immediate stop. |
+| [`is_running`](../src/tool_swap/backend/docker_backend.py:993) | shared lookup, then `status == "running"` | Only the running state is `True`; **every other state, including an unrecognised one, is `False`**. The daemon's `status` vocabulary is an *open* set — no SDK line enumerates it — so the comparison is positive, not a membership test: an unrecognised value must read `False` (the safe direction for a liveness sweep that reaps what it believes is dead), never raise or read `True`. |
+| [`inspect`](../src/tool_swap/backend/docker_backend.py:1054) | shared lookup, then `status` plus two `attrs` reads | See the [INFERRED paths](#two-attribute-paths-rest-on-the-engine-api-not-on-sdk-source) below. An unrecognised state maps to `EXITED` with a logged warning rather than raising; `exit_code` is read **only when the daemon literally reports `exited`** — a running container has not exited, and passing its `0` through would report a clean exit that never happened. |
+| [`list_managed`](../src/tool_swap/backend/docker_backend.py:1198) | `list(all=True, filters={"label": "key=value"}, ignore_removed=True)` | Stopped containers included (reconciliation must see an exited one). **`tool` comes from the `{namespace}.model` label, never parsed from the name**: the name is `prefix + tool`, and a container started under a different prefix would parse to the wrong tool — reconciliation adopts by label, so a name-derived tool would be reconciled against the wrong entry. A container carrying the managed-by label but no model label is skipped with a warning naming it by name and id — one malformed container must not deny the caller the rest. Returning `[]` for a daemon failure would read an outage as "nothing is managed", so daemon errors raise instead. |
+| [`logs`](../src/tool_swap/backend/docker_backend.py:1364) | shared lookup, then `logs(stream=True, follow=follow, tail=tail)`, reassembled by [`_iter_log_lines`](../src/tool_swap/backend/docker_backend.py:569) | The byte chunks the daemon frames are reassembled into decoded lines: the SDK yields `bytes` whose boundaries fall wherever the daemon's frames fall — routinely *inside* a line — so each chunk is split on `b"\n"` only, decoded with `errors="replace"`, and a trailing partial line is flushed at stream end rather than dropped. `follow` is passed **explicitly, never omitted**: the SDK defaults an omitted `follow` to `stream`, so omitting it would turn a `follow=False` request into a stream that follows forever. `tail` is passed verbatim, `0` included — the SDK silently resets only *invalid* values to `'all'`, which is unbounded. |
+
+`start` and every lookup-based method share
+[`_fetch_container`](../src/tool_swap/backend/docker_backend.py:798):
+`client.containers.get` — the saved single-container fetch, a full
+inspect — with `NotFound` the only failure treated as *state*
+(returns `None`); every other failure routes through
+`map_sdk_error`. The catch is deliberately scoped to
+`docker.errors.NotFound`, **not** a blanket `except Exception`: a
+dead daemon surfaces from that call as a bare `requests` connection
+error and must raise, never masquerade as an absent container.
+
+### Two attribute paths rest on the Engine API, not on SDK source
+
+`inspect`'s `exit_code` and `started_at` are read from
+`attrs["State"]["ExitCode"]` and `attrs["State"]["StartedAt"]`,
+and both keys are **[INFERRED]**, not [READ]:
+
+- `ExitCode` — the string appears **once** in the installed
+  package, and that one occurrence belongs to `exec_inspect` (an
+  *exec* result, not a container inspect);
+- `StartedAt` — **zero** matches anywhere in the installed package.
+
+So the paths rest on the Engine API's `ContainerInspect` contract,
+not on SDK source, and the deferred daemon test is what would
+confirm them. The consequence for the tests is the honest one: the
+[`inspect` tests](../tests/unit/backend/test_docker_backend_inspect.py)
+feed the stub canned attribute dicts, so they **prove only that the
+code reads the keys the fixture wrote** — they would pass unchanged
+against a wrong key name. They are anti-drift pins, worth having,
+and their docstrings say exactly what they rest on; promoting them
+to [READ] is possible only by one live-daemon inspect. The one
+exit-code route that *does* have SDK code behind it —
+`wait()["StatusCode"]` — was rejected deliberately: `wait()`
+**blocks until the container exits**, unbounded for a running
+container, and an `inspect` built on it would hang M2b's liveness
+poller on every healthy container. The stub in the tests exposes
+no `wait` member, so a blocking implementation fails loudly here
+rather than passing on a daemon the suite never runs.
+
+`list_managed`'s `image` field is [INFERRED] on the same ground:
+`attrs["Config"]["Image"]` is the Engine-API sibling of the [READ]
+`Config.Labels` read the `labels` property already performs, and no
+saved page records an SDK image property — the stub deliberately
+exposes no `image` member so an unrecorded property fails loudly
+here instead of passing on memory.
+
+### What M2a does not claim
+
+Nothing in this section was verified against a running daemon, and
+the tests say so in their own text. What the stub tests show is the
+call shape, the error routing and the not-found contract over
+synthesised responses; what they do not show — the daemon's label
+selector really selecting (deferred docker test 1), `stop`'s
+return-before-exit (deferred test 2), the `State.ExitCode` /
+`State.StartedAt` paths (one live-daemon inspect) — is recorded
+rather than papered over. The `docker` marker is registered and
+deselected by default, and no test in the tree carries it.
+
+## The import boundary (behaviour 27)
+
+The fifth contract in
+[`.importlinter`](../.importlinter:39) — *"The docker SDK is
+importable from one module only"* — is what makes
+[`docker_backend.py`](../src/tool_swap/backend/docker_backend.py)
+being the only SDK-importing module **enforced rather than hoped
+for**. `lint-imports` reports **5 kept, 0 broken**; a test runs the
+tool and asserts the summary line, and shape-pinning tests parse
+the shipped file so the contract cannot drift silently.
+
+Two mechanism facts are worth knowing, because both are load-bearing
+and neither is obvious:
+
+- **The contract needs `include_external_packages` or it checks
+  nothing.** A `forbidden` contract naming an external module
+  (`docker`, not a subpackage — import-linter rejects those) is
+  only legal when the top-level session sets
+  [`include_external_packages = true`](../.importlinter:5)
+  (import-linter 2.13, `contracts/forbidden.py`): without it the
+  external module is not in the graph at all, so the contract would
+  have nothing to check — and `check()` refuses to run, raising a
+  `ValueError` about the *configuration* rather than passing
+  vacuously. The session option is pinned by a test for exactly
+  that reason — a config that names an external module without the
+  option is the broken version of behaviour 27.
+- **The `ignore_imports` carve-out is self-policing.** The
+  permitted edge is carved out with
+  [`ignore_imports = tool_swap.backend.docker_backend -> docker`](../.importlinter:44).
+  import-linter's `unmatched_ignore_imports_alerting` defaults to
+  `error`: an expression matching **no real import** is an error at
+  check time, not a silent no-op — so a rename that orphans the
+  carve-out breaks `lint-imports` rather than quietly enforcing
+  nothing. And dropping the line makes the contract break on the
+  real, permitted edge — the non-vacuity test proves that
+  differential in memory, without writing anything under `src/`.
+
+The behavioural half of the boundary: `base`, `labels` and
+`fake_backend` must import — and `FakeBackend()` must construct —
+with the SDK blocked from the import system
+([`test_docker_sdk_boundary.py`](../tests/unit/test_docker_sdk_boundary.py)).
+The blocker is a `sys.meta_path` finder, not a `sys.modules`
+deletion — deleting the already-loaded `docker*` entries is not
+enough, because a fresh import would simply find the SDK again on
+the path. The fake stays usable in an environment with no SDK
+installed at all, which is what it exists for.
+
 ## Troubleshooting: container start failures
 
 Each failure the backend can report is one of the seven classes in
 [`errors.py`](../src/tool_swap/backend/errors.py), and each carries
 its remedy in the string that M2b surfaces in `/status`. The table
-below is keyed by the class name; the middle column states how
-[`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:253)
-reaches it — which SDK condition, and by what signal, because for
-several of the seven the decision is made on the daemon's *text*, not
-on the SDK's class:
+is keyed by the class name; "it means" states how
+[`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)
+reaches the class — which SDK condition, and by what signal, because
+for several of the seven the decision is made on the daemon's
+*text*, not on the SDK's class — and "surfaces from" names the
+method(s) a caller meets it in, because every taxonomy member is now
+reachable from a named method and condition:
 
-| Error class | It means — and what produces it | Remedy, as shipped in the class |
-|---|---|---|
-| [`BackendUnavailableError`](../src/tool_swap/backend/errors.py:70) | the container daemon is unreachable — either a bare `requests` connection error from an operational call, or the `DockerException` "Error while fetching server API version: …" from client construction (the two dead-daemon hierarchies of [`errors.md`](../plan/third-party-docs/docker/errors.md) §3) | check that the daemon is running and reachable, and that `DOCKER_HOST` names the daemon tool-swap is configured to use |
-| [`ImageNotFoundError`](../src/tool_swap/backend/errors.py:79) | the image reference does not exist — a 404 whose daemon text carries one of the image fragments, whatever class the SDK chose: the SDK string-matches the daemon's message and degrades an `ImageNotFound` to a plain `NotFound` when the wording stops matching, so the text, not the class, decides ([`errors.md`](../plan/third-party-docs/docker/errors.md) §2) | build the image with `tswap build <tool>`* |
-| [`ContainerNameConflictError`](../src/tool_swap/backend/errors.py:88) | the container name is already taken — a 409 whose daemon text is the name-conflict phrase, quoted around the name; any other 409 is a refused start | free the name with `tswap down`* |
-| [`ContainerStartError`](../src/tool_swap/backend/errors.py:97) | the daemon refused the start for another reason — any other `APIError`, including a GPU refusal whose text does not match the heuristic | read the underlying error text in the message |
-| [`ContainerNotFoundError`](../src/tool_swap/backend/errors.py:106) | the container was removed out of band, outside tool-swap's control — any 404 whose daemon text carries no image fragment | start the tool again |
-| [`GpuUnavailableError`](../src/tool_swap/backend/errors.py:115) | a GPU device request could not be satisfied — **a message heuristic, not a stable interface**: an `APIError` whose text matches `nvidia` or `gpu`, case-insensitively (the SDK has no GPU exception class); the daemon's real wording is unverified, plan §7 item 12 | install or repair the NVIDIA container toolkit |
-| [`BackendError`](../src/tool_swap/backend/errors.py:24) | fallback for an unrecognised runtime exception — any other SDK exception (an unrelated `DockerException` included) or a non-exception input at the seam, the original text always preserved | inspect the underlying error text; report it if it does not match a known error |
+| Error class | It means — and what produces it | Surfaces from | Remedy, as shipped in the class |
+|---|---|---|---|
+| [`BackendUnavailableError`](../src/tool_swap/backend/errors.py:70) | the container daemon is unreachable — either a bare `requests` connection error from an operational call, or the `DockerException` "Error while fetching server API version: …" from client construction (the two dead-daemon hierarchies of [`errors.md`](../plan/third-party-docs/docker/errors.md) §3) | **all six methods** — a dead daemon during any call routes through the shared lookup or the method's own catch; never read as a missing container | check that the daemon is running and reachable, and that `DOCKER_HOST` names the daemon tool-swap is configured to use |
+| [`ImageNotFoundError`](../src/tool_swap/backend/errors.py:79) | the image reference does not exist — a 404 whose daemon text carries one of the image fragments, whatever class the SDK chose: the SDK string-matches the daemon's message and degrades an `ImageNotFound` to a plain `NotFound` when the wording stops matching, so the text, not the class, decides ([`errors.md`](../plan/third-party-docs/docker/errors.md) §2) | `start` (the `create` call) | build the image with `tswap build <tool>`* |
+| [`ContainerNameConflictError`](../src/tool_swap/backend/errors.py:88) | the container name is already taken — a 409 whose daemon text is the name-conflict phrase, quoted around the name; any other 409 is a refused start | `start` (the `create` call) | free the name with `tswap down`* |
+| [`ContainerStartError`](../src/tool_swap/backend/errors.py:97) | the daemon refused the start for another reason — any other `APIError`, including a GPU refusal whose text does not match the heuristic | `start` (the `create` or `start` call) | read the underlying error text in the message |
+| [`ContainerNotFoundError`](../src/tool_swap/backend/errors.py:106) | the container was removed out of band, outside tool-swap's control — any 404 whose daemon text carries no image fragment | `logs` — raised **eagerly on the call** for a vanished container, not on the first `next()`; the three lenient methods instead treat the same 404 as *state* (`False` / `GONE` / no-op) and do not raise it | start the tool again |
+| [`GpuUnavailableError`](../src/tool_swap/backend/errors.py:115) | a GPU device request could not be satisfied — **a message heuristic, not a stable interface**: an `APIError` whose text matches `nvidia` or `gpu`, case-insensitively (the SDK has no GPU exception class); the daemon's real wording is unverified, plan §7 item 12 | `start` (a device request refused at `create` time) | install or repair the NVIDIA container toolkit |
+| [`BackendError`](../src/tool_swap/backend/errors.py:24) | fallback for an unrecognised runtime exception — any other SDK exception (an unrelated `DockerException` included) or a non-exception input at the seam, the original text always preserved | any of the six (the mapping's last branch) | inspect the underlying error text; report it if it does not match a known error |
 
 \* **Forward reference.** `tswap build` and `tswap down` are quoted
 from the plan's CLI design (plan §4.3) and do not ship yet; the CLI
@@ -520,17 +714,20 @@ Two honest limits on the table:
   here.** M2a runs no daemon tests: the `docker` marker is
   registered and deselected by default through `addopts`, and no
   test in the tree carries it. The mapping itself is in the tree —
-  [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:253),
+  [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275),
   behaviour 19 — and it is verified against the installed SDK's own
   source and its own classifier, but only over **synthesised
   exception instances**, never against a running daemon; the
   daemon-text branches in particular (the 404 re-classification, the
   name-conflict phrase, the GPU heuristic) encode wording the
-  repository has not been able to observe. The only code that
-  *raises* these classes today is
-  [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), and
-  it raises three
-  of the seven for unit tests without a daemon:
+  repository has not been able to observe. The two implementations
+  *raise* different subsets today:
+  [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
+  routes every SDK exception through the mapping, so all seven are
+  reachable from it — its unit tests drive the methods with stub
+  clients that raise those synthesised instances;
+  [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77)
+  raises three of the seven for unit tests without a daemon:
   [`ContainerStartError`](../src/tool_swap/backend/errors.py:97)
   (`FAIL_TO_START` scripted on a tool name),
   [`ContainerNameConflictError`](../src/tool_swap/backend/errors.py:88)
@@ -544,12 +741,14 @@ Two honest limits on the table:
   planned, not yet in the tree; when they land they will be marked
   `docker` and will run **only** against a disposable daemon named by
   the environment variable `TSWAP_TEST_DOCKER_HOST`, skipping rather
-  than touching the ambient daemon when it is unset. The DinD harness,
-  the `TSWAP_TEST_DOCKER_HOST` fixture and the loud-skip summary hook
-  all belong to the follow-up issue that plan §7 item 7 calls for,
-  which is not yet filed. Until that exists, `make test` — whose
-  default `-m 'not docker and not gpu and not slow'` deselects the
-  `docker` marker — exercises the seam through `FakeBackend` only.
+  than touching the ambient daemon when it is unset.
+  `TSWAP_TEST_DOCKER_HOST` appears in **no source or test file
+  today** — it is named here and in the plan as the future switch.
+  The DinD harness, the fixture and the loud-skip summary hook all
+  belong to the follow-up issue that plan §7 item 7 calls for, which
+  is not yet filed. Until that exists, `make test` — whose default
+  `-m 'not docker and not gpu and not slow'` deselects the `docker`
+  marker — verifies the Docker backend through the stub client only.
 
 ## Where to go deeper
 

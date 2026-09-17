@@ -161,6 +161,14 @@ that matters here, which is **purity**:
 | **A — the pure translation layer** | 14–19 | `build_run_kwargs` and `map_sdk_error`. No client, no daemon, no `DockerBackend` class. Every behaviour is a pure function over a `ContainerSpec` or an exception instance, exhaustively table-testable. |
 | **B — the thin shell and the boundary** | 20–27 | The `DockerBackend` methods, which need a stub client, and the import-linter contract. Each method is thin *because* A landed first: a stub asserting "called once with the pure function's output" is all there is to check. |
 
+**Two pull requests need two branches, and that was nearly missed.** Pull request A was opened
+from `feature/m2a-docker-backend`, so that branch **is** #12's head: continuing to push
+behaviours 20–27 onto it would have silently absorbed them into the open pull request and
+destroyed the very split this section records. Pull request B therefore lands on
+**`feature/m2a-docker-backend-shell`**, stacked on A's tip (`99144b2`) and based on it rather
+than on `main`, so its diff shows only behaviours 20–27. `feature/m2a-docker-backend` stays at
+`99144b2`. When A merges, B's base moves to `main`.
+
 The boundary is not arbitrary. §4.5's design makes the shell thin precisely so the
 interesting logic is pure, and A is exactly that logic. A reviewer of A needs no knowledge of
 the SDK's call surface, only of its kwarg *names* — which are cited from
@@ -192,6 +200,18 @@ Preparatory commits outside the red/green cycle, touching no `src/` or `tests/` 
 `d220c42` (this split), `ea18a0d` (the §3 re-verification) and `f887061` (the create+start
 decision).
 
+**Pull request [#12](https://github.com/iar3-r8/tool-swap/pull/12)** — open. Head `99144b2`,
+18 commits, 14 files, +3434 −68. Documentation commit `99144b2` precedes it, as behaviour 28
+requires. The push used the `.roo/mcp.json` token through a one-shot `http.extraheader`, for
+the reason §0.2 records.
+
+**Behaviour 28's documentation for this slice is `99144b2`**, which also corrected
+`docker_backend.py`'s module docstring: it claimed the import-linter contract already made
+this the only SDK-importing module, but `.importlinter` carries four contracts and none
+covers `docker`. That enforcement is behaviour 27 and is not yet in the tree — a docstring
+asserting an enforcement that does not exist is the same defect as a stale document, and it
+is exactly what behaviour 27 will make true.
+
 **One red step was corrected, and the correction is visible as its own commit.** Behaviour
 19's original red asserted that a non-exception input is chained as `__cause__`. The coder
 implemented the function, got 20 of 21 tests passing, and **refused to edit the failing one**,
@@ -216,6 +236,89 @@ ships, and the absence of any config rule for size strings is recorded as §7 it
 Behaviour 17's `cpus` conversion was the sharpest: the SDK has **no `cpus` kwarg**, and
 `nano_cpus` is an `int` in units of 1e-9 CPUs. A multiplier invented from memory there is a
 1e9 error that no unit test would have revealed.
+
+#### Pull request B — behaviours 20–27, complete
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 20 — the ambient-environment guard | `d32652c` | `1df1438` | 1454 passed |
+| 21 — `start` | `2bbac43`, corrected `af7ab37` | `773e03b` | 1461 passed |
+| 22 — `stop` | `e779f4d` | `3779832` | 1471 passed |
+| 23 — `is_running` on a vanished container | `c42f11b` | `c783c29` | 1482 passed |
+| 24 — `inspect` | `a356cbc` | `b3c488e` | 1493 passed |
+| 25 — `list_managed` | `d02b32f` | `f785a42` | 1502 passed |
+| 26 — `logs` + the protocol-completeness pin | `3c69352`, corrected `e0b551b` | `9c4b573` | 1515 passed |
+| 27 — the import-linter contract | `39867a8`, pins updated `c9e8add` | `6589577` | 1524 passed |
+
+**All eight behaviours are complete**, each with its own red and green commit. Suite at the
+branch tip: **1524 passed, 2 skipped**, from the re-measured 1378 at the merge base;
+`make lint` clean with mypy strict over 38 source files; `lint-imports` reports **5 kept, 0
+broken**. `isinstance(backend, ContainerBackend)` is `True` — `DockerBackend` satisfies the
+seam's protocol, and behaviour 27 makes "the ONLY file that talks to Docker" enforced rather
+than hoped for.
+
+**The client protocol was grown one behaviour at a time, never invented.** Behaviour 20
+declined to introduce §4.5's `DockerClientLike` at all, leaving its shape to be forced by the
+methods; behaviour 21 added `create` and the container's `id`/`start`; 22 added `get`,
+`status` and `stop`; 24 added `attrs`; 25 added `list`, `name` and `labels`; 26 added the
+container's `logs`. Nothing speculative was ever declared, so the protocol describes exactly
+what the seam touches.
+
+**Three red steps were corrected, and each correction is its own commit** — the pattern that
+makes this slice's history worth reading:
+
+1. **Behaviour 21's stub was internally contradictory.** Its `create` bound `image` to a named
+   parameter, so the central derived-equality assertion could not hold for any
+   implementation, and `_RecordingContainer` relied on `__post_init__` without carrying
+   `@dataclass`. The coder got 4 of 8 passing and **refused to edit the tests**, escalating
+   instead. Both defects were confirmed by AST inspection before the argument was granted.
+   The fix also removed `test_start_satisfies_the_container_backend_protocol`, which had
+   forced five `NotImplementedError` placeholders into behaviour 21 — five behaviours' surface
+   in one cycle — and moved the completeness pin to behaviour 26, where the last member
+   actually arrives.
+2. **Behaviour 26's chunk fixture dropped every log's final segment**, so the default case
+   yielded no chunks at all and the rejoining fixture lost the one chunk that makes it
+   discriminate. Again the coder escalated rather than edited. Then the *corrected* fixture
+   caught a real bug in the implementation — `rsplit(b"\n", 1)` unpacked unconditionally,
+   which raises for a chunk containing no newline, the common case for any line longer than a
+   frame. **The fixture paid for itself twice.**
+3. **Behaviour 27 broke two of M1's anti-drift pins**, which asserted exactly four contracts
+   and `4 kept, 0 broken`. Neither was buggy: both accurately described a four-contract
+   repository, and an exact-set pin is *meant* to fail when a contract is added so that
+   someone looks. They were updated to five, kept exact rather than weakened to a subset
+   check, and the contract's name is now imported from one source rather than copied.
+
+**Every correction went back to the qna-tester as its own red step; the coder edited no test
+at any point.** Three escalations, three upheld.
+
+**Pull request [#13](https://github.com/iar3-r8/tool-swap/pull/13)** — open, head `d6c262d`,
+24 commits, 13 files. **Based on `feature/m2a-docker-backend` rather than `main`**, so its
+diff carries only behaviours 20–27; when #12 merges, retarget it to `main`.
+`mergeable_state: clean`. Documentation commit `7bbe2d3` precedes it, as behaviour 28 requires.
+
+**#13 reports no CI checks, and that is the stacking's one real cost.**
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) triggers on `pull_request` **only
+for `branches: [main]`**, so a pull request based on another branch runs nothing — the
+absence is configuration, not failure, and a reviewer should not read it as red. The suite was
+verified locally at the branch tip instead: **1524 passed, 2 skipped**, `make lint` clean,
+`lint-imports` 5 kept 0 broken. **Retargeting #13 to `main` after #12 merges is what triggers
+its CI run**, and that should happen before it is approved. The alternative — widening the
+workflow's branch filter — is a CI change this task deliberately did not make.
+
+**M2a's behaviour ledger is complete.** All 28 behaviours have shipped across five pull
+requests: #9 (1–2), #10 (3–9), #11 (10–13), #12 (14–19) and #13 (20–27), with behaviour 28's
+documentation split across the last four. M2b is next: the `LifecycleManager`, the readiness
+probe and reconciliation, with §6 listing what it needs from this seam — including the
+config → `ContainerSpec` builder that still has no owner.
+
+**What the tests deliberately do not claim.** §3's discipline held throughout: every
+third-party fact cites a saved page, and the honest gaps are marked rather than papered over.
+`State.ExitCode` and `State.StartedAt` are `[INFERRED]` — the first has one occurrence in the
+installed package and it belongs to `exec_inspect`, the second none at all — so behaviour 24's
+canned-dict tests prove only that the code reads the keys the fixture wrote, and say so.
+`GpuUnavailableError`'s message heuristic (§7 item 12), the daemon's label-filter selection
+(deferred docker test 1), `stop`'s return-before-exit (deferred test 2) and
+`CancellableStream`'s quiet truncation are all recorded and none is asserted. **No daemon ran.**
 
 **Two commitments this branch makes explicitly, because both are easy to overstate:**
 

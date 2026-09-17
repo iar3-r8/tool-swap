@@ -14,6 +14,11 @@ existing pair:
 M0's file, ``tests/unit/test_imports.py``, keeps behaviour-7 ownership; this
 file imports nothing from it and copies the one helper it needs.
 
+The exact-set pin also carries behaviour 27's fifth contract name, imported
+from ``tests/unit/test_docker_sdk_boundary.py`` (its red-step test) so the
+name has a single source; the ``N kept, 0 broken`` summary line is owned
+by that file, not this one.
+
 Tests follow AAA structure (Arrange, Act, Assert) and are isolated — they
 discover the repo root from their own file location.
 """
@@ -28,19 +33,23 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.test_docker_sdk_boundary import DOCKER_CONTRACT_NAME
+
 ROOT = Path(__file__).resolve().parents[2]  # repo root
 SRC_ROOT = ROOT / "src"
 IMPORTLINTER_CONFIG = ROOT / ".importlinter"
 
-# The four contract names that ``.importlinter`` must carry exactly — M0's
-# two (quoted verbatim from the shipped file) plus behaviour 26's two
-# (plans/m1-configuration.md, item 3, verbatim).
+# The five contract names that ``.importlinter`` must carry exactly — M0's
+# two (quoted verbatim from the shipped file), behaviour 26's two
+# (plans/m1-configuration.md, item 3, verbatim) and behaviour 27's one,
+# imported from its own red-step test so the name has a single source.
 _EXPECTED_CONTRACTS = frozenset(
     {
         "Router and runtime are strictly separate",
         "Router and runtime are strictly separate (reverse)",
         "The config layer is a leaf",
         "The schema compiler does not depend on the pydantic config models",
+        DOCKER_CONTRACT_NAME,
     }
 )
 
@@ -130,19 +139,21 @@ def _module_set(section: configparser.SectionProxy, option: str) -> set[str]:
 
 
 def test_the_expected_contract_names_are_exactly_the_shipped_ones() -> None:
-    """The contract names in .importlinter are exactly the four pinned ones.
+    """The contract names in .importlinter are exactly the five pinned ones.
 
     Arrange: parse the shipped ``.importlinter``.
     Act: collect the ``name`` value of every contract section.
-    Assert: the SET of names equals the four-name literal — M0's two plus
-    behaviour 26's two. Prints missing and unexpected names separately.
+    Assert: the SET of names equals the five-name pin — M0's two,
+    behaviour 26's two and behaviour 27's one (the docker name imported
+    from its red-step test). Prints missing and unexpected names
+    separately.
     """
     parser = _parse_importlinter()
     shipped = set(_contract_names(parser).values())
     missing = _EXPECTED_CONTRACTS - shipped
     unexpected = shipped - _EXPECTED_CONTRACTS
     assert not missing and not unexpected, (
-        f".importlinter contract names do not equal the expected four.\n"
+        f".importlinter contract names do not equal the expected five.\n"
         f"Missing: {sorted(missing)}\n"
         f"Unexpected: {sorted(unexpected)}\n"
         f"Shipped: {sorted(shipped)}"
@@ -214,15 +225,22 @@ def test_the_schema_compiler_contract_forbids_the_pydantic_models() -> None:
 
 
 def test_lint_imports_reports_every_contract_kept() -> None:
-    """lint-imports keeps all four contracts and reports ``4 kept``.
+    """lint-imports exits 0 and names every contract this file pins.
 
     Arrange: locate the lint-imports binary (the M0 helper idiom).
     Act: run ``lint-imports --config .importlinter`` with ``PYTHONPATH=src``
     in the repo root.
-    Assert: exit 0, each of the four contract names appears in the output,
-    and the tool's own summary line reads ``4 kept, 0 broken`` — so a
-    silently-dropped contract fails here even if the name check were
-    relaxed.
+    Assert: exit 0 and each of the five contract names appears in the
+    output, so a silently-dropped contract fails here even if the name
+    check on the config file were relaxed.
+
+    This file deliberately does NOT assert the ``N kept, 0 broken``
+    summary line: behaviour 27's pin
+    (``tests/unit/test_docker_sdk_boundary.py``) owns the exact
+    five-contract total and asserts ``5 kept, 0 broken``.  Two tests
+    asserting the same summary line would be two places to update for
+    one change, so the count has a single owner; a sixth contract
+    still fails the suite, via that file's exact-set and summary pins.
     """
     env = {**os.environ, "PYTHONPATH": str(SRC_ROOT)}
     result = subprocess.run(
@@ -243,10 +261,6 @@ def test_lint_imports_reports_every_contract_kept() -> None:
             f"Contract {name!r} is not named in the lint-imports output.\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
-    assert "4 kept, 0 broken" in combined, (
-        f"Expected the summary line to read '4 kept, 0 broken'.\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
-    )
 
 
 def test_the_cli_actually_imports_the_config_layer() -> None:
