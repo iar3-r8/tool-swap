@@ -7,6 +7,14 @@
 - `APIClient.wait` — `api/container.py:1315`
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26.
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree — **no correction needed**.
+All four line citations resolved exactly: `Container.stop` at models/containers.py:441 with
+the docstring's *"Timeout in seconds … Default: 10"* at :446–447; `APIClient.stop(self,
+container, timeout=None)` at api/container.py:1187 with the `if timeout is None` branch at
+:1202–1204 and `conn_timeout += timeout` at :1209–1210; `Container.wait` at :508; and
+`APIClient.wait(self, container, timeout=None, condition=None)` at api/container.py:1315
+with the `StatusCode` docstring at :1328–1330 and the `InvalidVersion` guard at :1341–1345.
+The model-docstring-vs-code disagreement over the default (§1) is real and still present.
 
 ---
 
@@ -50,7 +58,13 @@ is none). The method:
 The only way to get an explicit exit code is `container.wait()` (below) or
 re-reading `attrs['State']['ExitCode']` after `reload()`.
 
-### Interaction with restart policies **[INFERRED — flagged]**
+### Interaction with restart policies **[INFERRED — flagged, and still inferred]**
+
+Re-confirmed 2026-09-16 that this remains **[INFERRED]**: `grep` for
+`RestartPolicy` over the container files finds it only as a *create/update*
+kwarg (`api/container.py:1303–1309`, `restart_policy` in
+`RUN_HOST_CONFIG_KWARGS` at models/containers.py:1107) — **nothing in `stop`
+references it**. No SDK line can be cited, so the tag stays.
 
 docker-py says nothing in `stop` about restart policies. Docker Engine
 semantics (from the daemon side, not the SDK) are that `stop` on a container

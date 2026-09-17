@@ -11,7 +11,8 @@ trigger: always_on
 
 ## Documentation guidelines
 
-- Google style docstrings for all functions and classes
+- A docstring explains what the code pins and why it could fail — never how the decision was reached. Decisions and rationale belong in the commit message and the plan: both are permanent, searchable, and already required.
+- Keep docstrings short. A test docstring is normally one to three lines; one approaching the length of the code it documents is narrating the decision — move the narrative to the commit message or the plan.
 - Minimal inline comments - only explain non-obvious logic or technical constraints
 - Never document a flag or command from memory; confirm against the code first
 
@@ -24,6 +25,7 @@ trigger: always_on
 - Write tests that are easily testable with well-structured functions and classes
 - Prefer pure functions where possible and avoid side effects unless necessary
 - Use dependency injection for better testability
+- Test-facing strings (assertion messages, `pytest.fail` text, skip reasons) are read by a developer debugging a failure, not by the pipeline. They state what is missing and where — never process vocabulary such as "RED step", "GREEN step", or behaviour numbers used as workflow markers.
 
 ## Additional Guidelines
 

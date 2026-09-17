@@ -146,6 +146,192 @@ docker-py reference — `containers-run-create.md`, `errors.md`, `gpu-device-req
 `container-logs.md`, `container-stop-wait.md`, `containers-list-filters.md` and
 `container-attrs-reload.md`. Behaviours 14–26 are unblocked, on their own branch.
 
+### 0.1.2 Fourth split — behaviours 14–27 land as two pull requests, cut at purity
+
+**Branch `feature/m2a-docker-backend` carries behaviours 14–27**, cut from the merged tip of
+`feature/m2a-fake-backend` (`e1ec272`, pull request #11). Baseline re-measured at that tip
+rather than trusted: **1378 passed, 2 skipped**.
+
+Fourteen behaviours in one pull request is not reviewable — the same judgement §0.1 and
+§0.1.1 already made twice — so this branch ships **two pull requests**, cut at the boundary
+that matters here, which is **purity**:
+
+| Pull request | Behaviours | What makes it one slice |
+|---|---|---|
+| **A — the pure translation layer** | 14–19 | `build_run_kwargs` and `map_sdk_error`. No client, no daemon, no `DockerBackend` class. Every behaviour is a pure function over a `ContainerSpec` or an exception instance, exhaustively table-testable. |
+| **B — the thin shell and the boundary** | 20–27 | The `DockerBackend` methods, which need a stub client, and the import-linter contract. Each method is thin *because* A landed first: a stub asserting "called once with the pure function's output" is all there is to check. |
+
+**Two pull requests need two branches, and that was nearly missed.** Pull request A was opened
+from `feature/m2a-docker-backend`, so that branch **is** #12's head: continuing to push
+behaviours 20–27 onto it would have silently absorbed them into the open pull request and
+destroyed the very split this section records. Pull request B therefore lands on
+**`feature/m2a-docker-backend-shell`**, stacked on A's tip (`99144b2`) and based on it rather
+than on `main`, so its diff shows only behaviours 20–27. `feature/m2a-docker-backend` stays at
+`99144b2`. When A merges, B's base moves to `main`.
+
+The boundary is not arbitrary. §4.5's design makes the shell thin precisely so the
+interesting logic is pure, and A is exactly that logic. A reviewer of A needs no knowledge of
+the SDK's call surface, only of its kwarg *names* — which are cited from
+`plan/third-party-docs/docker/` — while a reviewer of B checks call-shape and error contracts
+against an injected stub. Landing A first also means B's tests can assert equality against
+`build_run_kwargs(spec)` output that is already reviewed and merged, rather than against a
+dict invented in the same diff.
+
+**Behaviour 28's documentation is split to match**, as it was for the previous two slices:
+each pull request documents what it delivered, extending `docs/backend-seam.md` rather than
+duplicating it.
+
+#### Pull request A — behaviours 14–19, complete
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 14 — `build_run_kwargs` core translation | `594e2b1` | `ff30006` | 1393 passed |
+| 15 — mounts → `volumes` | `506892d` | `8e6190e` | 1398 passed |
+| 16 — GPU device requests | `02c48db` | `e00b8e9` | 1405 passed |
+| 17 — resource limits | `0fc0862` | `b693e45` | 1417 passed |
+| 18 — port publication | `be929eb` | `cf74380` | 1425 passed |
+| 19 — `map_sdk_error` | `622d355`, corrected `557f994` | `cba735b` | 1446 passed |
+
+**All six behaviours are complete**, each with its own red and green commit. Suite at this
+point: **1446 passed, 2 skipped**, from the re-measured 1378 at the merge base; `make lint`
+clean with mypy strict over 38 source files.
+
+Preparatory commits outside the red/green cycle, touching no `src/` or `tests/` file:
+`d220c42` (this split), `ea18a0d` (the §3 re-verification) and `f887061` (the create+start
+decision).
+
+**Pull request [#12](https://github.com/iar3-r8/tool-swap/pull/12)** — open. Head `99144b2`,
+18 commits, 14 files, +3434 −68. Documentation commit `99144b2` precedes it, as behaviour 28
+requires. The push used the `.roo/mcp.json` token through a one-shot `http.extraheader`, for
+the reason §0.2 records.
+
+**Behaviour 28's documentation for this slice is `99144b2`**, which also corrected
+`docker_backend.py`'s module docstring: it claimed the import-linter contract already made
+this the only SDK-importing module, but `.importlinter` carries four contracts and none
+covers `docker`. That enforcement is behaviour 27 and is not yet in the tree — a docstring
+asserting an enforcement that does not exist is the same defect as a stale document, and it
+is exactly what behaviour 27 will make true.
+
+**One red step was corrected, and the correction is visible as its own commit.** Behaviour
+19's original red asserted that a non-exception input is chained as `__cause__`. The coder
+implemented the function, got 20 of 21 tests passing, and **refused to edit the failing one**,
+escalating instead — which is the behaviour this pipeline exists to produce. The argument was
+granted only after being checked directly: CPython's `__cause__` setter raises `TypeError`
+for a non-`BaseException`, and the one workaround — a `__cause__` property on a subclass —
+makes `traceback.format_exception` die with
+`AttributeError: 'str' object has no attribute '__traceback__'`. An implementation satisfying
+the assertion would have produced an error object that crashes the interpreter's own traceback
+machinery when printed. The qna-tester corrected the assertion to `__cause__ is None` in
+`557f994`, kept the neighbouring text-preservation assertion so the test is not vacuous, and
+left `__cause__` chaining asserted for all fifteen genuine-exception rows. **Narrowed, not
+weakened** — and the original red step's totality contract had already earned its place by
+catching a real `TypeError` in the coder's first draft.
+
+**Three facts the plan asserted loosely were pinned from the installed SDK, and two were
+wrong.** Behaviour 14's "detached start" implied `run(detach=True)`, which hides an immediate
+crash and auto-pulls a missing image; the start path is now `create` + `start` (`f887061`).
+Behaviour 17's error clause demanded a `ValueError` for an unparseable size string, which the
+SDK already raises as a `DockerException` naming the accepted suffixes — so no size parser
+ships, and the absence of any config rule for size strings is recorded as §7 item 11.
+Behaviour 17's `cpus` conversion was the sharpest: the SDK has **no `cpus` kwarg**, and
+`nano_cpus` is an `int` in units of 1e-9 CPUs. A multiplier invented from memory there is a
+1e9 error that no unit test would have revealed.
+
+#### Pull request B — behaviours 20–27, complete
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 20 — the ambient-environment guard | `d32652c` | `1df1438` | 1454 passed |
+| 21 — `start` | `2bbac43`, corrected `af7ab37` | `773e03b` | 1461 passed |
+| 22 — `stop` | `e779f4d` | `3779832` | 1471 passed |
+| 23 — `is_running` on a vanished container | `c42f11b` | `c783c29` | 1482 passed |
+| 24 — `inspect` | `a356cbc` | `b3c488e` | 1493 passed |
+| 25 — `list_managed` | `d02b32f` | `f785a42` | 1502 passed |
+| 26 — `logs` + the protocol-completeness pin | `3c69352`, corrected `e0b551b` | `9c4b573` | 1515 passed |
+| 27 — the import-linter contract | `39867a8`, pins updated `c9e8add` | `6589577` | 1524 passed |
+
+**All eight behaviours are complete**, each with its own red and green commit. Suite at the
+branch tip: **1524 passed, 2 skipped**, from the re-measured 1378 at the merge base;
+`make lint` clean with mypy strict over 38 source files; `lint-imports` reports **5 kept, 0
+broken**. `isinstance(backend, ContainerBackend)` is `True` — `DockerBackend` satisfies the
+seam's protocol, and behaviour 27 makes "the ONLY file that talks to Docker" enforced rather
+than hoped for.
+
+**The client protocol was grown one behaviour at a time, never invented.** Behaviour 20
+declined to introduce §4.5's `DockerClientLike` at all, leaving its shape to be forced by the
+methods; behaviour 21 added `create` and the container's `id`/`start`; 22 added `get`,
+`status` and `stop`; 24 added `attrs`; 25 added `list`, `name` and `labels`; 26 added the
+container's `logs`. Nothing speculative was ever declared, so the protocol describes exactly
+what the seam touches.
+
+**Three red steps were corrected, and each correction is its own commit** — the pattern that
+makes this slice's history worth reading:
+
+1. **Behaviour 21's stub was internally contradictory.** Its `create` bound `image` to a named
+   parameter, so the central derived-equality assertion could not hold for any
+   implementation, and `_RecordingContainer` relied on `__post_init__` without carrying
+   `@dataclass`. The coder got 4 of 8 passing and **refused to edit the tests**, escalating
+   instead. Both defects were confirmed by AST inspection before the argument was granted.
+   The fix also removed `test_start_satisfies_the_container_backend_protocol`, which had
+   forced five `NotImplementedError` placeholders into behaviour 21 — five behaviours' surface
+   in one cycle — and moved the completeness pin to behaviour 26, where the last member
+   actually arrives.
+2. **Behaviour 26's chunk fixture dropped every log's final segment**, so the default case
+   yielded no chunks at all and the rejoining fixture lost the one chunk that makes it
+   discriminate. Again the coder escalated rather than edited. Then the *corrected* fixture
+   caught a real bug in the implementation — `rsplit(b"\n", 1)` unpacked unconditionally,
+   which raises for a chunk containing no newline, the common case for any line longer than a
+   frame. **The fixture paid for itself twice.**
+3. **Behaviour 27 broke two of M1's anti-drift pins**, which asserted exactly four contracts
+   and `4 kept, 0 broken`. Neither was buggy: both accurately described a four-contract
+   repository, and an exact-set pin is *meant* to fail when a contract is added so that
+   someone looks. They were updated to five, kept exact rather than weakened to a subset
+   check, and the contract's name is now imported from one source rather than copied.
+
+**Every correction went back to the qna-tester as its own red step; the coder edited no test
+at any point.** Three escalations, three upheld.
+
+**Pull request [#13](https://github.com/iar3-r8/tool-swap/pull/13)** — open, head `d6c262d`,
+24 commits, 13 files. **Based on `feature/m2a-docker-backend` rather than `main`**, so its
+diff carries only behaviours 20–27; when #12 merges, retarget it to `main`.
+`mergeable_state: clean`. Documentation commit `7bbe2d3` precedes it, as behaviour 28 requires.
+
+**#13 reports no CI checks, and that is the stacking's one real cost.**
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) triggers on `pull_request` **only
+for `branches: [main]`**, so a pull request based on another branch runs nothing — the
+absence is configuration, not failure, and a reviewer should not read it as red. The suite was
+verified locally at the branch tip instead: **1524 passed, 2 skipped**, `make lint` clean,
+`lint-imports` 5 kept 0 broken. **Retargeting #13 to `main` after #12 merges is what triggers
+its CI run**, and that should happen before it is approved. The alternative — widening the
+workflow's branch filter — is a CI change this task deliberately did not make.
+
+**M2a's behaviour ledger is complete.** All 28 behaviours have shipped across five pull
+requests: #9 (1–2), #10 (3–9), #11 (10–13), #12 (14–19) and #13 (20–27), with behaviour 28's
+documentation split across the last four. M2b is next: the `LifecycleManager`, the readiness
+probe and reconciliation, with §6 listing what it needs from this seam — including the
+config → `ContainerSpec` builder that still has no owner.
+
+**What the tests deliberately do not claim.** §3's discipline held throughout: every
+third-party fact cites a saved page, and the honest gaps are marked rather than papered over.
+`State.ExitCode` and `State.StartedAt` are `[INFERRED]` — the first has one occurrence in the
+installed package and it belongs to `exec_inspect`, the second none at all — so behaviour 24's
+canned-dict tests prove only that the code reads the keys the fixture wrote, and say so.
+`GpuUnavailableError`'s message heuristic (§7 item 12), the daemon's label-filter selection
+(deferred docker test 1), `stop`'s return-before-exit (deferred test 2) and
+`CancellableStream`'s quiet truncation are all recorded and none is asserted. **No daemon ran.**
+
+**Two commitments this branch makes explicitly, because both are easy to overstate:**
+
+- **No daemon verification is claimed.** M2a runs no docker tests. The `docker` marker is
+  registered and deselected by default through `addopts`, no test carries it, and
+  `TSWAP_TEST_DOCKER_HOST` appears in no source or test file. Behaviours 22 and 25 state in
+  their own text what they do *not* show; §7 item 7's three deferred daemon tests, and the
+  DinD harness they need, remain unfiled and are not this branch's work.
+- **Every test for behaviours 14–26 cites the saved page** that justifies each third-party
+  fact it asserts. §3 explains why: an invented signature produces a passing test, a matching
+  shim, and a broken integration with a green suite. Behaviour 7's reworked red step is the
+  precedent.
+
 ---
 
 ## 0.2 Pull request — opened as [#10](https://github.com/iar3-r8/tool-swap/pull/10)
@@ -947,9 +1133,31 @@ the concatenation can produce an illegal name.
 
 ### 14. `build_run_kwargs` — core translation
 
+**Amended before the red step: the start path is `create` + `start`, not `run(detach=True)`,
+so the kwargs carry no `detach` key.** The original text said "detached start", which implies
+`run`. Two properties of `run` found while re-verifying the saved reference against the
+installed docker 7.2.0 argue against it, and
+[issue #3](https://github.com/iar3-r8/tool-swap/issues/3)'s Scope line says
+"**create**/start/stop/inspect":
+
+1. **`run(detach=True)` returns before any exit check**
+   ([`models/containers.py:876`](../.venv/lib/python3.11/site-packages/docker/models/containers.py:876)),
+   so a container that starts and dies immediately is indistinguishable from one that started
+   cleanly, and `ContainerError` never fires on the detached path.
+2. **`run` auto-pulls a missing image** (`:879–882`), so `ImageNotFound` may never surface —
+   yet behaviour 21's edge case requires exactly that error.
+
+**The image must therefore pre-exist**, and a missing one is an honest `ImageNotFoundError`
+rather than a silent multi-gigabyte pull inside what the caller believes is a start. Confirmed
+by the user before this behaviour's red step. `detach` is a `run`-only kwarg, so it is simply
+absent from the output; **whether an immediate death is detected is not claimed by M2a at
+all** — no `reload()` follows the start, since that would put state-polling logic in a shell
+§4.5 wants thin, and liveness belongs to M2b's sweep.
+
 - **Inputs:** a minimal `ContainerSpec` (tool, name, image, env, labels, network).
-- **Outputs:** a kwargs dict carrying image, name, detached start, environment, the full
-  `managed_labels` set, and the network — key names taken from the saved reference.
+- **Outputs:** a kwargs dict carrying image, name, environment, the full `managed_labels` set,
+  and the network — key names taken from the saved reference. **No `detach` key**, per the
+  amendment above.
 - **Edge cases:** empty env and empty labels; a spec with `network=None` must omit the network
   key rather than pass `None`.
 - **Error behaviour:** a spec with an empty image raises `ValueError` before any SDK call.
@@ -993,8 +1201,37 @@ the concatenation can produce an illegal name.
 - **Edge cases:** `cpus` is a float in the config but the SDK's quota field may be an integer
   in different units — the conversion is pinned by the saved reference and snapshotted;
   a `memory` string with an unknown suffix.
-- **Error behaviour:** an unparseable size string raises `ValueError` naming the field and the
-  accepted forms.
+- **Error behaviour — amended during the red step; the original clause was wrong.** The
+  original text required an unparseable size string to raise `ValueError` naming the field and
+  the accepted forms. **`build_run_kwargs` raises nothing for a size string**, for two reasons
+  established from the installed docker 7.2.0 rather than assumed:
+
+  1. **The SDK already parses these strings and already produces that message.**
+     `HostConfig.__init__` calls `parse_bytes` on `mem_limit` and on a string `shm_size`, and
+     `parse_bytes` raises with *"should specify the units. The postfix should be one of the
+     `b` `k` `m` `g` characters"* — which is the "names the accepted forms" contract the clause
+     asked for, owned by the layer that also owns the suffix table. Note it is a
+     `DockerException`, **not** a `ValueError`, so the original clause could not have been
+     satisfied by passing the string through.
+  2. **A local form-checker would be a second parser**, and would have to re-list the SDK's
+     suffix table from `docker/constants.py` to do it — free to drift from the real one. That
+     is the duplication §4.2 removed for mounts, in a new place.
+
+  **Config validation cannot own this either**: searched, and `src/tool_swap/config/` has no
+  size-string rule at all — `schema.py` types `memory` as `str | None` and `shm_size` as `str`
+  with no pattern and no validator. So unlike mounts, there is nothing to defer to. **A
+  `TSWAP-C5xx` rule for size strings would be the better fix and belongs to the config layer**
+  (recorded as §7 item 11). Until it exists, an authored `"16zz"` reaches the daemon call and
+  fails there with the SDK's own message.
+
+  The behaviour therefore **passes size strings through verbatim**, and the red step pins that
+  rather than a `ValueError`.
+- **`cpus` conversion, pinned from source:** the SDK has **no `cpus` kwarg**. `cpus=4.0`
+  becomes `nano_cpus=4_000_000_000` — *"CPU quota in units of 1e-9 CPUs"*, an **int**, which
+  `HostConfig` type-checks. The `cpu_quota`/`cpu_period` pair is the alternative mechanism and
+  is **not** emitted: it would need a period value nothing in this plan pins, and emitting both
+  mechanisms for one limit is the double-selection mistake behaviour 16 avoided for
+  `driver` versus `runtime`. The red step pins both keys absent.
 - **Files:** `src/tool_swap/backend/docker_backend.py`.
 - **Verified:** snapshot. Pure.
 
@@ -1039,9 +1276,15 @@ the concatenation can produce an illegal name.
 
 ### 21. `DockerBackend.start`
 
+**The call pair is `client.containers.create(**build_run_kwargs(spec))` then `.start()` on the
+returned container object** — see behaviour 14's amendment for why `run(detach=True)` was
+rejected. The image must pre-exist; nothing here pulls.
+
 - **Inputs:** a `ContainerSpec` and a stub client recording its calls.
-- **Outputs:** exactly one create/run call whose kwargs equal `build_run_kwargs(spec)`; a
-  `ContainerHandle` carrying the id the stub returned plus the spec's name, tool and image.
+- **Outputs:** exactly one `create` call whose kwargs equal `build_run_kwargs(spec)`, followed
+  by exactly one `start` call on the object it returned; a `ContainerHandle` carrying the id
+  the stub returned plus the spec's name, tool and image. **No `run` call is made**, and a
+  test pins that, since `run` is the path that would reintroduce the auto-pull.
 - **Edge cases:** the stub raising image-not-found surfaces `ImageNotFoundError` via
   behaviour 19; a name conflict surfaces `ContainerNameConflictError`.
 - **Error behaviour:** every SDK exception passes through `map_sdk_error`; no raw SDK
@@ -1232,3 +1475,20 @@ knows whether a process exists; everything above that is M2b's.
     `backend.container_prefix` reaches behaviour 7 unjudged, which is why that behaviour's
     `ValueError` names the prefix. **A `TSWAP-C5xx` rule for `container_prefix` would be the
     better fix and belongs to the config layer, not to M2a.** Not filed by this task.
+11. **No config rule validates a size string either — found during behaviour 17.**
+    `defaults.shm_size` and `memory` are typed as plain strings by
+    [`schema.py`](../src/tool_swap/config/schema.py:150) with no pattern and no validator, so
+    an authored `"16zz"` passes validation, passes `build_run_kwargs` untouched (behaviour
+    17's amended error clause) and fails only at the daemon call, with the SDK's message
+    rather than a `TSWAP-C5xx` one naming the file and line. **A config rule is the right fix
+    and belongs to the config layer, not to M2a** — the same shape of gap as item 10, and the
+    reason behaviour 17 ships no size parser of its own. Not filed by this task.
+12. **The daemon's wording for a refused GPU device request is unknown — found during
+    behaviour 19.** `GpuUnavailableError` is reached by matching `"nvidia"` or `"gpu"` in an
+    `APIError`'s message, because the SDK has no GPU exception class and the type carries no
+    other signal. No saved page records the daemon's actual text, the installed source does
+    not contain it, and this environment has no daemon and no NVIDIA toolkit to observe one.
+    **The heuristic is therefore untested against reality**, and the deferred daemon tests of
+    item 7 are where it would be confirmed. If it proves wrong, the failure mode is mild —
+    a GPU refusal surfaces as `ContainerStartError` with the daemon's text intact, so the
+    operator still sees the real message, only with a less specific remedy.

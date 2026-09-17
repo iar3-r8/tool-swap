@@ -5,6 +5,14 @@
 - `class DeviceRequest(DictType)` — line 166, `__init__` at line 187
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26.
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree — **no correction needed**.
+`class DeviceRequest(DictType)` is at types/containers.py:166 and `__init__` at :187, as
+cited. Every default and every `ValueError` type-check re-read at :194–213; the five
+PascalCase wire keys at :215–221; the snake/Pascal dual spellings at :188–192. The
+`count` vs `device_ids` docstring constraint is at :176–177 and is still **not** enforced in
+code. The export was additionally confirmed: `DeviceRequest` is named in
+`types/__init__.py:1`, so `docker.types.DeviceRequest` resolves — and the import-path
+caution in §2 holds (`grep -rn "class DeviceRequest"` matches only types/containers.py).
 
 ---
 

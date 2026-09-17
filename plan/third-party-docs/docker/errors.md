@@ -4,6 +4,9 @@
 `.venv/lib/python3.11/site-packages/docker/errors.py` (whole file, 210 lines).
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26.
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree. The hierarchy and the 404
+mapping in §1–§2 resolved **unchanged**, line for line. §3 was **corrected** — it overstated
+the claim. See the **[CORRECTED 2026-09-16]** block there.
 
 ---
 
@@ -95,10 +98,39 @@ alone would then miss the case.
 
 ## 3. What is NOT in `docker.errors`
 
-There is **no** `DockerUnavailableError`, `ConnectionError` subclass, or
-"daemon not running" exception in `docker.errors` **[READ]**. An unreachable
-daemon surfaces as a **`requests` exception** (e.g. `requests.exceptions.
-ConnectionError` from the underlying `requests` session, wrapped by the
-transport layer) — **not** as a `DockerException`. Behaviours that catch
-"daemon down" must catch the `requests` hierarchy (or `OSError`) explicitly.
-This was verified by reading the full file (210 lines, no other classes).
+There is **no** `DockerUnavailableError`, no `ConnectionError` subclass, and no
+"daemon not running" exception **class** in `docker.errors` **[READ]** —
+verified by reading the full file (210 lines; the complete class list is §1).
+
+### [CORRECTED 2026-09-16] — a dead daemon is *sometimes* a `DockerException`
+
+This section previously concluded that an unreachable daemon surfaces as a
+`requests` exception "**not** as a `DockerException`". **That is wrong as an
+unconditional claim, and the distinction is load-bearing for behaviour 19's
+`map_sdk_error` and behaviour 23's "daemon-unreachable is not not-running".**
+Which of the two you get depends on **where** the connection fails:
+
+| Where the daemon is found dead | What propagates | Read at |
+| --- | --- | --- |
+| **During client construction**, when `version` is `None` or `'auto'` — `APIClient.__init__` calls `_retrieve_server_version()`, which wraps **`except Exception`** and re-raises | **`DockerException`** — *"Error while fetching server API version: …"*, with the `requests` error as `__cause__` | `api/client.py:203–207`, `:221–232` |
+| **On any later API call** (`create`, `stop`, `logs`, `list`, …) — these go through `self._post`/`self._get`, and a connection failure raises out of `requests` with no docker-py wrapper | a **`requests.exceptions.ConnectionError`** (a subclass of `requests.exceptions.RequestException`, itself an `OSError`) | `api/client.py:272–277` only converts **`HTTPError`** (i.e. a *response* with a non-2xx status), so a connection failure is never converted |
+
+So **`_raise_for_status` cannot produce a daemon-down error at all** — it needs
+an HTTP response to have arrived, and there is none. `create_api_error_from_http_exception`
+(errors.py:22–39) likewise starts from `e.response`.
+
+**Consequence for the backend's error mapping [READ]:** `map_sdk_error` must
+handle **both** hierarchies to map `BackendUnavailableError` reliably —
+`DockerException` whose `__cause__` is a connection error (the construction
+path, which for us is `from_config`'s), and the bare `requests` exception
+(every operational call). Catching only `DockerException` misses the common
+case; catching only `requests` misses the construction case. Note also that
+`APIError` **is** a `requests.exceptions.HTTPError` (§1), so an over-broad
+`except requests.exceptions.RequestException` will swallow ordinary 4xx/5xx
+API errors too — order the handlers so `APIError` is matched first.
+
+One further wrinkle worth pinning **[READ]**: because `APIClient.__init__`
+performs a live version handshake whenever `version` is `None`/`'auto'`
+(`api/client.py:203–207`), **constructing a client is itself a daemon
+round-trip** unless an explicit `version` string is passed. See
+[`client-construction-and-env.md`](client-construction-and-env.md).

@@ -6,6 +6,12 @@
 - `ContainerCollection.get` — `models/containers.py:939`
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26.
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree — the **[READ]** facts
+resolved unchanged (`Model.__init__` at resource.py:7–17, `reload` at :42–48, `status` at
+containers.py:60–67, `health` at :69–76, `name` at :28–34, `labels` at :46–58, `ports` at
+:78–83, `id`/`short_id` at resource.py:28–40). The **[INFERRED]** exit-code/start-time
+fields remain **[INFERRED]** and were re-confirmed as unciteable from SDK source; §3.1 now
+states exactly how far the evidence goes, because **behaviour 24 depends on it**.
 
 ---
 
@@ -80,6 +86,47 @@ exact keys, per this repository's no-guessing rule.**
 Other fields in the same `State` dict the Engine API defines (not SDK
 documented, **[INFERRED]**): `Running`, `Paused`, `Restarting`,
 `Dead`, `Pid`, `ErrorMessage`, `FinishedAt`.
+
+## 3.1 Exactly how far the evidence goes — read before writing behaviour 24
+
+Added 2026-09-16, because behaviour 24 reads **state, exit code and start
+time** from these paths and its tests must claim no more than is established.
+**No Docker daemon was used, and none will be in M2a** — so this is the
+ceiling, not a step toward one.
+
+| Fact behaviour 24 needs | Status | What backs it |
+| --- | --- | --- |
+| `attrs` is the raw inspect dict, cached, refreshed only by `reload()` | **[READ]** | `Model.__init__` resource.py:7–17; `reload` :42–48; `Container` docstring containers.py:20–26 |
+| **State** is readable as `container.status` | **[READ]** | containers.py:60–67 — returns `attrs['State']['Status']`, with a legacy branch for `attrs['State']` being a bare string |
+| The *string values* `status` can take (`running`, `exited`, `created`, `paused`, `restarting`, `removing`, `dead`) | **[INFERRED]** | The SDK docstring names only *"`running`, or `exited`"* (containers.py:63) **as examples**. The full set is Engine-contract, and `containers.list`'s `status` filter names four (`restarting`, `running`, `paused`, `exited` — containers.py:976–977). **No SDK line enumerates all of them** |
+| **Exit code** at `attrs['State']['ExitCode']` | **[INFERRED]** | Re-confirmed by grep over the whole installed package: the **only** `ExitCode` match is `exec_inspect`'s at containers.py:222, which is an **exec** result, not a container inspect. The SDK never reads a container's `State.ExitCode` |
+| **Start time** at `attrs['State']['StartedAt']` | **[INFERRED]** | Re-confirmed by grep over the whole installed package: **zero** matches for `StartedAt` in any file. Nothing in the SDK references it at all |
+| Exit code via `wait()['StatusCode']` | **[READ]** | The key is named in the `wait` docstring (containers.py:520–521, api/container.py:1329–1330) **and** consumed by the SDK's own `run` at containers.py:897 — this is the one exit-code path with SDK code behind it |
+
+**What this means for behaviour 24's tests, concretely.** The stub client
+returns canned attribute dicts, so the test author *chooses* the keys — which
+means a test can pass while the real key name is wrong, and that is precisely
+the failure this repository's no-guessing rule exists to prevent. Therefore:
+
+1. **`ContainerState` mapping from `container.status` may be asserted as a
+   contract** — the property and its `attrs['State']['Status']` path are
+   `[READ]`. The *set* of input strings mapped is `[INFERRED]`, which is an
+   argument for behaviour 24's "unknown state string maps to `EXITED` with a
+   logged warning" edge case being the load-bearing one: it is what makes an
+   incomplete string set safe rather than a crash.
+2. **`State.ExitCode` and `State.StartedAt` must be treated as an assumption
+   the test *documents*, not a fact it *proves*.** A test asserting
+   "`inspect` reads `attrs['State']['ExitCode']`" proves only that our code
+   reads the key our fixture wrote. It is still worth having — it pins our
+   side against silent change — but its docstring must say it rests on the
+   Engine API contract and cite this section, not claim SDK authority.
+3. **Prefer `wait()['StatusCode']` wherever the exit code is needed at a
+   moment the code controls**, since that key is `[READ]`. Reserve
+   `attrs['State']['ExitCode']` for reading persistent state after `reload()`,
+   where no `wait()` is available.
+4. **The remaining gap is closable only by one live inspect**, which is
+   deferred with §7 item 7's three daemon tests. Until then, no document in
+   this directory may promote these two field names to `[READ]`.
 
 ## 4. Consequence for the backend seam
 

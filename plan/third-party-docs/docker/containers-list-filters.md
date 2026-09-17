@@ -7,6 +7,9 @@
 - `Container.labels` property — line 47
 
 **Captured:** 2026-09-14, for M2a behaviours 14–26 (reaping by label).
+**Re-verified:** 2026-09-16 against the same installed 7.2.0 tree. The signature, the `all`
+parameter, the filter-key table and the `sparse`/`ignore_removed` semantics all resolved
+**unchanged**. One garbled sentence in §4 was repaired — see **[CORRECTED 2026-09-16]**.
 
 ---
 
@@ -65,16 +68,35 @@ what a bare `"key"` matches, is daemon behaviour, not SDK behaviour.
 
 ## 4. `sparse` / `ignore_removed` — relevant to reaping races **[READ]**
 
-- `sparse=True` (line 994–997): *"Do not inspect containers. Returns partial
-  information, but guaranteed not to block. Use `Container.reload` on resulting
-  objects to retrieve all attributes."* With `sparse=True` the `labels`
-  property raises `DockerException` until `reload()` is called (line 54–58).
-  concurrently-removed container bites:
-- `ignore_removed=False` (default): if a container vanished between the list
-  call and its inspect, `NotFound` is **raised** (line 1021–1023).
-  `ignore_removed=True` swallows it: *"Set to `True` if race conditions are
-  likely."* A reaper that lists and then acts must set `ignore_removed=True`
-  or catch `NotFound` — this is the documented remedy.
+**[CORRECTED 2026-09-16]** The first bullet previously ended in the dangling
+fragment *"concurrently-removed container bites:"*, which left the relationship
+between the two options unstated. The facts themselves were correct and are
+re-verified; the text is repaired and the trade-off made explicit.
+
+The two options govern the **same** per-item inspect loop (lines 1013–1024),
+which is what makes them a single decision rather than two:
+
+- **`sparse=True`** (docstring lines 994–997): *"Do not inspect containers.
+  Returns partial information, but guaranteed not to block. Use
+  `Container.reload` on resulting objects to retrieve all attributes."* It
+  skips the loop entirely (line 1013–1014), so **no `NotFound` can be raised**
+  — but the returned objects carry only the list payload, and the `labels`
+  property then **raises `DockerException`** until `reload()` is called
+  (models/containers.py:54–58, *"Label data is not available for sparse
+  objects"*).
+- **`ignore_removed`** (default `False`) only matters on the **non-sparse**
+  path: if a container vanished between the list call and its inspect,
+  `NotFound` is **raised** (lines 1021–1023); `ignore_removed=True` swallows it
+  and omits the container. Docstring: *"Set to `True` if race conditions are
+  likely. Has no effect if `sparse=True`."*
+
+**Consequence for behaviour 25 [READ]:** `list_managed` recovers `tool` from a
+**label**, so it needs label data — which rules out bare `sparse=True` (the
+labels would raise) and makes the non-sparse path plus
+**`ignore_removed=True`** the right call. That combination is also the
+documented remedy for the reaping race. The alternative —
+`sparse=True` plus a `reload()` per container — costs the same inspects and
+reintroduces `NotFound` one call later.
 
 ## 5. Getting one container by name **[READ]**
 
