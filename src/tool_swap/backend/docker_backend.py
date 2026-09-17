@@ -29,14 +29,18 @@ against a running daemon.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import docker
 import docker.errors
 import requests.exceptions
 from docker.types import DeviceRequest
 
-from tool_swap.backend.base import ContainerSpec, MountSpec
+from tool_swap.backend.base import (
+    ContainerHandle,
+    ContainerSpec,
+    MountSpec,
+)
 from tool_swap.backend.errors import (
     BackendError,
     BackendUnavailableError,
@@ -489,6 +493,58 @@ def text_of(value: object) -> str:
     return str(value)
 
 
+class _StartableContainer(Protocol):
+    """The object ``containers.create`` returns, as far as ``start``
+    touches it.
+
+    A real object is a ``docker.models.containers.Container`` — ``id``
+    the runtime id, ``start`` a method
+    (``plan/third-party-docs/docker/containers-run-create.md`` §4);
+    the behaviour-21 recording stub carries exactly these two members
+    and nothing else, so this is also the widest shape the stub allows.
+    """
+
+    #: The runtime id ``create`` reports for the container.
+    id: str
+
+    def start(self, **kwargs: object) -> None:
+        """Start the container; the SDK's ``Container.start(**kwargs)``."""
+        ...
+
+
+class _StartableContainers(Protocol):
+    """The ``client.containers`` collection, as far as ``start``
+    touches it.
+
+    One member: ``create``, returning :class:`_StartableContainer`.
+    The image is declared keyword-only because the behaviour-21 stub
+    records an explicitly passed ``image=`` into its kwargs dict, and
+    the SDK's ``create`` also accepts it as a keyword (it re-sets
+    ``kwargs['image']`` itself —
+    ``.venv/lib/python3.11/site-packages/docker/models/containers.py:932``),
+    so the pure function's output unpacks against both.
+    """
+
+    def create(self, **kwargs: object) -> _StartableContainer:
+        """Create (do not start) the container the kwargs describe."""
+        ...
+
+
+class _StartableClient(Protocol):
+    """The minimal client shape ``start`` (behaviour 21) calls through.
+
+    Kept to exactly what the call pair touches — a ``containers``
+    collection, nothing more — **not** a speculative full client
+    interface: behaviours 22-26 will force any further members when
+    they land.  ``containers`` is a plain attribute member (not a
+    property), matching how both a real ``docker.DockerClient`` and
+    the behaviour-21 recording stub carry it — set in ``__init__``.
+    """
+
+    #: The container collection; the only attribute the call pair reads.
+    containers: _StartableContainers
+
+
 class DockerBackend:
     """The thin shell over :func:`build_run_kwargs` / :func:`map_sdk_error`.
 
@@ -511,11 +567,14 @@ class DockerBackend:
         convenience default that would construct a client here.
 
         The ``client`` parameter is typed ``object`` on purpose: no
-        ``DockerClientLike`` protocol is introduced by behaviour 20 — its
-        guard test pins the constructor's *names and positions*, never its
-        annotations, and the protocol the seam actually needs will be forced
-        by the shapes behaviours 21-26 pin.  Both a stub and a real
-        ``DockerClient`` satisfy ``object``.
+        client protocol is in the constructor's signature, because the
+        guard test pins the constructor's *names and positions*, never
+        its annotations, and both a stub and a real ``DockerClient``
+        satisfy ``object``.  Behaviour 21 has since forced the one
+        minimal protocol its call pair touches (``_StartableClient``,
+        above); :meth:`start` casts through it, and any later behaviour
+        that needs a further member grows that protocol — never a
+        speculative full client interface.
 
         Args:
             client: The already-built Docker client (or a test stand-in).
@@ -536,6 +595,60 @@ class DockerBackend:
         self.client = client
         self.label_namespace = label_namespace
         self.container_prefix = container_prefix
+
+    def start(self, spec: ContainerSpec) -> ContainerHandle:
+        """Start the container described by ``spec`` and return its handle.
+
+        The whole method is the amended call pair (plan §5 behaviour
+        21, amended — see behaviour 14's amendment for the why):
+
+        1. ``client.containers.create(**build_run_kwargs(spec, ...))``;
+        2. ``start()`` on the container object ``create`` returned;
+        3. a :class:`ContainerHandle` carrying that container's ``id``
+           plus the spec's ``name``, ``tool`` and ``image``.
+
+        **No ``run`` call — and none may be added.**
+        ``run(detach=True)`` returns before any exit check, so a
+        container that dies immediately is indistinguishable from a
+        clean start, and it auto-pulls a missing image, which would
+        stop ``ImageNotFoundError`` from ever surfacing — the edge case
+        this seam exists to keep honest
+        (``plan/third-party-docs/docker/containers-run-create.md`` §1).
+        No post-start ``reload()`` either: M2a claims nothing about
+        detecting an immediate death; liveness is M2b's sweep (plan §5
+        behaviour 14, amended).
+
+        Every exception a call raises is routed through
+        :func:`map_sdk_error` and the result is raised, so no raw SDK
+        exception escapes the seam (plan §5 behaviour 21, error
+        behaviour).  The mapping table itself is behaviour 19's and is
+        not re-tested by this method.
+
+        Args:
+            spec: The fully resolved container spec to start.
+
+        Returns:
+            A :class:`ContainerHandle` identifying the started
+            container.
+        """
+        client = cast(_StartableClient, self.client)
+        try:
+            container = client.containers.create(
+                **build_run_kwargs(spec, label_namespace=self.label_namespace)
+            )
+            container.start()
+        except Exception as exc:
+            # Every SDK exception (all derive from
+            # docker.errors.DockerException, an Exception) is routed
+            # through map_sdk_error and the result is raised, so no raw
+            # SDK exception escapes the seam.  KeyboardInterrupt /
+            # SystemExit are deliberately not caught: they keep their
+            # normal semantics rather than being re-labelled a backend
+            # failure.
+            raise map_sdk_error(exc) from exc
+        return ContainerHandle(
+            id=container.id, name=spec.name, tool=spec.tool, image=spec.image
+        )
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
