@@ -291,6 +291,17 @@ makes this slice's history worth reading:
 **Every correction went back to the qna-tester as its own red step; the coder edited no test
 at any point.** Three escalations, three upheld.
 
+**Pull request [#13](https://github.com/iar3-r8/tool-swap/pull/13)** — open, head `3554a81`,
+23 commits, 13 files, +8171 −127. **Based on `feature/m2a-docker-backend` rather than `main`**,
+so its diff carries only behaviours 20–27; when #12 merges, retarget it to `main`.
+Documentation commit `7bbe2d3` precedes it, as behaviour 28 requires.
+
+**M2a's behaviour ledger is complete.** All 28 behaviours have shipped across five pull
+requests: #9 (1–2), #10 (3–9), #11 (10–13), #12 (14–19) and #13 (20–27), with behaviour 28's
+documentation split across the last four. M2b is next: the `LifecycleManager`, the readiness
+probe and reconciliation, with §6 listing what it needs from this seam — including the
+config → `ContainerSpec` builder that still has no owner.
+
 **What the tests deliberately do not claim.** §3's discipline held throughout: every
 third-party fact cites a saved page, and the honest gaps are marked rather than papered over.
 `State.ExitCode` and `State.StartedAt` are `[INFERRED]` — the first has one occurrence in the
