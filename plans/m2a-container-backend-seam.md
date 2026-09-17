@@ -161,6 +161,14 @@ that matters here, which is **purity**:
 | **A — the pure translation layer** | 14–19 | `build_run_kwargs` and `map_sdk_error`. No client, no daemon, no `DockerBackend` class. Every behaviour is a pure function over a `ContainerSpec` or an exception instance, exhaustively table-testable. |
 | **B — the thin shell and the boundary** | 20–27 | The `DockerBackend` methods, which need a stub client, and the import-linter contract. Each method is thin *because* A landed first: a stub asserting "called once with the pure function's output" is all there is to check. |
 
+**Two pull requests need two branches, and that was nearly missed.** Pull request A was opened
+from `feature/m2a-docker-backend`, so that branch **is** #12's head: continuing to push
+behaviours 20–27 onto it would have silently absorbed them into the open pull request and
+destroyed the very split this section records. Pull request B therefore lands on
+**`feature/m2a-docker-backend-shell`**, stacked on A's tip (`99144b2`) and based on it rather
+than on `main`, so its diff shows only behaviours 20–27. `feature/m2a-docker-backend` stays at
+`99144b2`. When A merges, B's base moves to `main`.
+
 The boundary is not arbitrary. §4.5's design makes the shell thin precisely so the
 interesting logic is pure, and A is exactly that logic. A reviewer of A needs no knowledge of
 the SDK's call surface, only of its kwarg *names* — which are cited from
