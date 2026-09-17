@@ -46,7 +46,16 @@ protocol in ``src/tool_swap/backend/base.py``, behaviour 8) must:
    (behaviour 13), and the parity test at the bottom of this file
    pins that this is the one place in the slice where parity means
    *both raise* — a copy-paste of the previous no-op parity test
-   would assert the wrong contract here.
+   would assert the wrong contract here.  The raise is **eager, on
+   the call, not on first iteration**: the not-found tests wrap
+   *the call* in ``pytest.raises`` and never call ``next()``, so a
+   plain generator-function body — where everything runs on the
+   first ``next()`` — would surface the error only during
+   iteration and fail them with ``DID NOT RAISE``.  Eager is the
+   contract: a caller asking for the log of a container that is not
+   there must know on the call, and ``FakeBackend.logs`` is eager
+   for the same reason (its snapshot note: a lazy generator would
+   read the buffer after the call returned).
 
 **The newline contract is ours, not an SDK fact.**  The SDK hands
 over raw bytes and says nothing about line framing (saved page §2:
@@ -362,11 +371,15 @@ def _chunks(log: bytes, chunk_at: tuple[int, ...]) -> list[bytes]:
             span must not crash the stub).
 
     Returns:
-        The chunks, in order; ``[]`` for an empty range.
+        The chunks, in order; ``[]`` for an empty range.  The last
+        segment always runs to ``len(log)`` — without the terminal
+        cut, everything after the last recorded offset (with the
+        default ``(0,)`` that is the whole log) would be dropped
+        silently.
     """
     if not log:
         return []
-    cuts = [0] + [offset for offset in chunk_at if 0 < offset < len(log)]
+    cuts = [0] + [offset for offset in chunk_at if 0 < offset < len(log)] + [len(log)]
     return [log[cuts[i] : cuts[i + 1]] for i in range(len(cuts) - 1)]
 
 
@@ -945,6 +958,11 @@ def test_logs_missing_container_raises_container_not_found() -> None:
     Assert: ``ContainerNotFoundError``, not a
     ``docker.errors.DockerException``; the lookup happened once,
     for the handle's id.
+
+    The ``pytest.raises`` wraps **the call**, not a ``next()``: the
+    raise must be eager (module docstring, item 3), and a
+    generator-function body would defer it to the first iteration
+    and fail this test with ``DID NOT RAISE``.
     """
     error = _vanished_container_404()
     stub = _RecordingClient(container=None, get_error=error)
