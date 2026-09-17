@@ -56,7 +56,7 @@ from tool_swap.backend.errors import (
     GpuUnavailableError,
     ImageNotFoundError,
 )
-from tool_swap.backend.labels import managed_labels
+from tool_swap.backend.labels import label_selector, managed_labels
 
 if TYPE_CHECKING:
     # Annotation-only: ``from_config``'s parameter is the only use, and
@@ -571,38 +571,50 @@ def _state_started_at(attrs: Mapping[str, object]) -> str | None:
 
 
 class _BackendContainer(Protocol):
-    """The object ``containers.create`` / ``containers.get`` returns,
-    as far as ``start`` (behaviour 21), ``stop`` (behaviour 22),
-    ``is_running`` (behaviour 23) and ``inspect`` (behaviour 24)
+    """The object ``containers.create`` / ``containers.get`` /
+    ``containers.list`` returns, as far as ``start`` (behaviour 21),
+    ``stop`` (behaviour 22), ``is_running`` (behaviour 23),
+    ``inspect`` (behaviour 24) and ``list_managed`` (behaviour 25)
     touch it.
 
     A real object is a ``docker.models.containers.Container`` —
-    ``id`` the runtime id, ``status`` the state property
+    ``id`` the runtime id, ``name`` the daemon's name with its
+    leading slash stripped (``container-attrs-reload.md`` §3,
+    containers.py:28-34), ``status`` the state property
     (``running``, ``exited``, …;
     ``plan/third-party-docs/docker/container-attrs-reload.md`` §3),
     ``attrs`` the raw inspect dict (``container-attrs-reload.md`` §1,
     [READ]: the raw dict the daemon's inspect returned, cached and
-    refreshed only by ``reload()``), ``start`` and ``stop`` methods
-    (``plan/third-party-docs/docker/containers-run-create.md`` §4;
-    ``plan/third-party-docs/docker/container-stop-wait.md`` §1,
-    models/containers.py:441-453); the behaviour-21/22/23/24 recording
-    stubs carry exactly the members each path uses, so this is also
-    the widest shape any stub allows.
+    refreshed only by ``reload()``), ``labels`` the container's label
+    map read from ``attrs['Config']['Labels']`` (``container-attrs-
+    reload.md`` §3, containers.py:47-58), and ``start`` and ``stop``
+    methods (``plan/third-party-docs/docker/containers-run-create.md``
+    §4; ``plan/third-party-docs/docker/container-stop-wait.md`` §1,
+    models/containers.py:441-453); the behaviour-21/22/23/24/25
+    recording stubs carry exactly the members each path uses, so this
+    is also the widest shape any stub allows.
     """
 
     #: The runtime id the container is known by.
     id: str
+
+    #: The daemon's name, leading slash stripped (containers.py:28-34).
+    name: str
 
     #: The state the daemon reports (``running``, ``exited``, …).
     status: str
 
     #: The raw inspect dict the daemon returned.  A nested mapping of
     #: unknown shape — the Engine API's ``ContainerInspect`` — whose
-    #: only members this module reads are the ``State`` sub-mapping's
+    #: members this module reads are the ``State`` sub-mapping's
     #: ``ExitCode`` and ``StartedAt`` (both **[INFERRED]** — see
-    #: :meth:`DockerBackend.inspect`), so it is typed honestly as a
-    #: mapping of unknown value type rather than a pinned schema.
+    #: :meth:`DockerBackend.inspect`) and ``Config.Image`` (see
+    #: :meth:`DockerBackend.list_managed`), so it is typed honestly as
+    #: a mapping of unknown value type rather than a pinned schema.
     attrs: Mapping[str, object]
+
+    #: The container's label map (``attrs['Config']['Labels']``).
+    labels: dict[str, str]
 
     def start(self, **kwargs: object) -> None:
         """Start the container; the SDK's ``Container.start(**kwargs)``."""
@@ -615,15 +627,16 @@ class _BackendContainer(Protocol):
 
 class _BackendContainers(Protocol):
     """The ``client.containers`` collection, as far as ``start``,
-    ``stop``, ``is_running`` and ``inspect`` touch it.
+    ``stop``, ``is_running``, ``inspect`` and ``list_managed`` touch
+    it.
 
-    Two members: ``create`` (behaviour 21) and ``get`` (behaviours
-    22-24),
-    both returning :class:`_BackendContainer`.  The image is declared
-    keyword-only because the behaviour-21 stub records an explicitly
-    passed ``image=`` into its kwargs dict, and the SDK's ``create``
-    also accepts it as a keyword (it re-sets ``kwargs['image']``
-    itself —
+    Three members: ``create`` (behaviour 21), ``get`` (behaviours
+    22-24) and ``list`` (behaviour 25), the first two returning a
+    :class:`_BackendContainer` and ``list`` a list of them.  The image
+    is declared keyword-only because the behaviour-21 stub records an
+    explicitly passed ``image=`` into its kwargs dict, and the SDK's
+    ``create`` also accepts it as a keyword (it re-sets
+    ``kwargs['image']`` itself —
     ``.venv/lib/python3.11/site-packages/docker/models/containers.py:
     932``), so the pure function's output unpacks against both.
     """
@@ -637,6 +650,13 @@ class _BackendContainers(Protocol):
         ``NotFound`` when it is missing (``plan/third-party-docs/
         docker/containers-list-filters.md`` §5,
         models/containers.py:939-952)."""
+        ...
+
+    def list(self, **kwargs: object) -> list[_BackendContainer]:
+        """List containers; the SDK's ``ContainerCollection.list``
+        (``plan/third-party-docs/docker/containers-list-filters.md``
+        §1: ``list(all=False, before=None, filters=None, limit=-1,
+        since=None, sparse=False, ignore_removed=False)``)."""
         ...
 
 
@@ -1108,6 +1128,172 @@ class DockerBackend:
             exit_code=exit_code,
             started_at=started_at,
         )
+
+    def list_managed(self) -> list[ContainerHandle]:
+        """Every managed container, stopped ones included.
+
+        The whole method is the behaviour-25 read (plan §5 behaviour
+        25; §6 item 5): one ``client.containers.list`` call with the
+        pinned shape, then one :class:`ContainerHandle` per container
+        that carries our labels.
+
+        **The pinned call shape**
+        (``plan/third-party-docs/docker/containers-list-filters.md``):
+
+        1. ``all=True`` as a **parameter** — only running containers
+           are shown by default (§2, lines 27-34), and there is
+           **no** ``all=`` in the label-filter dict, so a filter key
+           cannot substitute; reconciliation must see an exited
+           container (§6 item 5), which is the edge only this
+           parameter covers;
+        2. ``filters={"label": "key=value"}`` — the one-entry map of
+           :func:`label_selector` (behaviour 7) translated into the
+           ``label`` filter's ``"key=value"`` string form (§3, line
+           47 — one of the three accepted forms, and the one the
+           docstring's own example uses).  The entry is derived by
+           *calling* ``label_selector`` with the resolved namespace,
+           never restated, so the filter cannot drift from the map
+           the containers were stamped with;
+        3. ``ignore_removed=True`` — the documented remedy for a
+           container vanishing between the list call and its per-item
+           inspect (§4, lines 87-91);
+        4. **no ``sparse``** — ``sparse=True`` skips the per-item
+           inspect and the ``labels`` property then raises (§4, lines
+           79-99), which would defeat the behaviour: ``tool`` is
+           recovered from a label.
+
+        **Not claimed here:** whether the daemon's label selector
+        really selects.  The SDK performs no client-side
+        interpretation of ``filters`` (§3, lines 65-67) — the daemon
+        is the authority, and that half is deferred docker test 1
+        (plan §5 behaviour 25).  This method passes the filter; the
+        daemon decides what it matches.
+
+        **``tool`` from the label, never from the name.**  The
+        handle's ``tool`` is read from the ``{namespace}.model``
+        label — the same namespace-derived key
+        :func:`managed_labels` stamps (``labels.py``;
+        plan/08_REPO_LAYOUT.md §2) — because the name is
+        ``prefix + tool`` (behaviour 7) and a container started under
+        a different prefix would parse to the wrong tool:
+        reconciliation adopts by label (§6 item 5), so a name-derived
+        tool would be reconciled against the wrong entry.  The name
+        itself is reported verbatim — the SDK's own
+        ``attrs['Name'].lstrip('/')`` derivation (container-attrs-
+        reload.md §3, containers.py:28-34) — as a field, not a
+        source.
+
+        **Ours only, the rest skipped.**  A container is ours when
+        every :func:`label_selector` entry matches its labels; a
+        foreign container is skipped **silently** — the warning is
+        reserved for the next case.  A container that is ours but
+        carries no model label (or an empty one) is skipped with a
+        logged warning naming it by name and id, and the surviving
+        containers are still returned: one malformed container must
+        not deny the caller the rest (§6 item 5: reconciliation
+        adopts by label at boot, so a crash here takes out
+        boot-time reconciliation, and a silent skip would make an
+        unadoptable container invisible in production).
+
+        **Daemon errors are routed, not swallowed.**  Every exception
+        the call or the reads raise is routed through
+        :func:`map_sdk_error` and the result is raised, so no raw SDK
+        exception escapes the seam: a dead daemon surfaces
+        ``BackendUnavailableError`` (behaviour 19) and a daemon
+        refusal its own taxonomy member — returning ``[]`` for either
+        would read an outage as "nothing is managed", and
+        reconciliation would then adopt nothing and reap live
+        containers.  ``KeyboardInterrupt`` / ``SystemExit`` are
+        deliberately not caught.  The mapping table itself is
+        behaviour 19's and is not re-tested here.
+
+        The handle's ``id`` (``attrs['Id']`` — resource.py:28-40) and
+        ``name`` are **[READ]** SDK derivations (container-attrs-
+        reload.md §3); the handle's ``image`` is read from
+        ``attrs['Config']['Image']`` — **[INFERRED]**, the
+        Engine-API sibling of the [READ] ``Config.Labels`` read the
+        ``labels`` property just performed (containers-list-filters.
+        md §3; container-attrs-reload.md §3): no saved page records
+        an SDK image property, so the read rests on the Engine API
+        contract, not SDK source, and the red-step stub deliberately
+        exposes no ``image`` member so an unrecorded property fails
+        loudly here instead of passing on memory.
+
+        Returns:
+            A :class:`ContainerHandle` per managed container the
+            daemon lists, stopped ones included; ``[]`` when none
+            match — a *filtered* empty, the call still carrying the
+            pinned filter.
+
+        Raises:
+            BackendError: a taxonomy member routed through
+                :func:`map_sdk_error`, for every daemon failure —
+                the mapping table itself is behaviour 19's and is
+                not re-tested here.
+        """
+        client = cast(_BackendClient, self.client)
+        # The one selector entry in the label filter's "key=value"
+        # string form (containers-list-filters.md §3).  The unpack
+        # makes a changed entry count fail loudly rather than
+        # silently change the pinned call shape.
+        selector = label_selector(self.label_namespace)
+        (label_filter,) = [f"{key}={value}" for key, value in selector.items()]
+        try:
+            containers = client.containers.list(
+                all=True, filters={"label": label_filter}, ignore_removed=True
+            )
+            handles: list[ContainerHandle] = []
+            for container in containers:
+                labels = container.labels
+                # Ours only when every selector entry matches — a
+                # foreign container is skipped silently: the warning
+                # below is reserved for one of ours that is malformed.
+                if not all(labels.get(key) == value for key, value in selector.items()):
+                    continue
+                # The model label — the same namespace-derived key
+                # managed_labels stamps (labels.py; plan/08_REPO_
+                # LAYOUT.md §2): derived from the namespace here,
+                # never a restated string, and never parsed from the
+                # name.
+                tool = labels.get(f"{self.label_namespace}.model")
+                if not tool:
+                    # Ours but malformed: warn, naming the container
+                    # by name and id, and skip — one broken container
+                    # must not deny the caller the rest (§6 item 5).
+                    logger.warning(
+                        "container %s (%s) carries the managed-by label but "
+                        "no model label; skipping it",
+                        container.name,
+                        container.id,
+                    )
+                    continue
+                # The image: **[INFERRED]** — attrs['Config']['Image'],
+                # the Engine-API sibling of the [READ] Config.Labels
+                # the labels read above already required (containers-
+                # list-filters.md §3; container-attrs-reload.md §3);
+                # no saved page records an SDK image property.  A
+                # shape the daemon never returns falls through to the
+                # map_sdk_error route below, never a silent default.
+                config = cast(Mapping[str, object], container.attrs["Config"])
+                handles.append(
+                    ContainerHandle(
+                        id=container.id,
+                        name=container.name,
+                        tool=tool,
+                        image=str(config["Image"]),
+                    )
+                )
+            return handles
+        except Exception as exc:
+            # Every SDK exception (all derive from
+            # docker.errors.DockerException, an Exception) is routed
+            # through map_sdk_error and the result is raised, so no
+            # raw SDK exception escapes the seam and no outage reads
+            # as an empty fleet.  KeyboardInterrupt / SystemExit are
+            # deliberately not caught: they keep their normal
+            # semantics rather than being re-labelled a backend
+            # failure.
+            raise map_sdk_error(exc) from exc
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
