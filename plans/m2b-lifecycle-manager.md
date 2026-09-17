@@ -51,6 +51,29 @@ construction: the backend is `FakeBackend`, the probe is `FakeProbe`, and time i
 
 ---
 
+## 0.2 Progress ledger — the durable loop state
+
+Updated as each behaviour completes, so the loop survives a context reset. The branch for
+slice A is **`feature/m2b-spec-builder`**, renamed from `feature/m2b-lifecycle-manager`
+per [§2.2](#22-is-featurem2b-lifecycle-manager-the-right-name-for-slice-a) before anything
+was pushed; the milestone name is kept for pull-request titles.
+
+Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2 skipped**,
+`make lint` clean with mypy strict over 38 source files, `lint-imports` 5 kept, 0 broken.
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
+| 2 | `ParsedMount` → `MountSpec` | | | |
+| 3 | Resource, env and port passthrough | | | |
+| 4 | The builder's two guards | | | |
+
+Plan commit: `76de92e`. Behaviour 1's green step corrected this plan's `container_port`
+claim (see behaviour 1's outputs); no test was weakened to reach green, and no red step
+has been amended into its green.
+
+---
+
 ## 1. Design
 
 ### 1.1 The tool state machine — six states, eleven edges
@@ -375,7 +398,18 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
   `container_name(cfg.container_prefix, tool)`, `image` as given, `network` from
   `cfg.network`, and the four values M2a's behaviours 4, 6 and 7 deliberately refuse to
   default — `gpu_runtime` and `container_port` passed into the spec, `label_namespace` and
-  `container_prefix` consumed here — all taken from `BackendConfig`.
+  `container_prefix` consumed here.
+  **Corrected during behaviour 1's green step:** only three of those four come from
+  `BackendConfig`. `container_port` comes from `ResolvedTool.values`, because
+  `BackendConfig` has **no `container_port` field** — its fields are `type`, `network`,
+  `container_prefix`, `label_namespace`, `gpu_runtime`, `orphans`, `port_range` and
+  `registry_prefix` — and `container_port` is a tool-level default carried in
+  [`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:54) at `8000`. The original
+  wording conflated "the values M2a refuses to default" (a `ContainerSpec` property:
+  `gpu_runtime` and `container_port` are required keyword-only fields) with "the values
+  the `backend:` block owns" (a `BackendConfig` property). The tester raised it before
+  writing the red step rather than resolving it silently, and behaviour 3's own inputs
+  list already had `container_port` under `values`, so the two entries now agree.
 - **Edge cases:** the four backend-named keys are **also present in
   `ResolvedTool.values`**, always carrying the *built-in* value, because the `backend:`
   block is not a resolver layer ([§6.3](#63-the-backend-block-is-not-a-resolver-layer)). A
