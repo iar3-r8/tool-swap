@@ -18,8 +18,10 @@ table-testable with no client and no daemon.
 The thin shell itself — :class:`DockerBackend` — is behaviour 20: a
 constructor that takes an **already-built** client and never reads
 the ambient environment, plus a ``from_config`` classmethod that is
-the only path permitted to build a real one (behaviours 21-27 add
-the protocol methods and the import-linter contract on top).
+the only path permitted to build a real one.  Behaviours 21-23 have
+since added the ``start``, ``stop`` and ``is_running`` protocol
+methods; behaviours 24-27 add the rest and the import-linter
+contract.
 
 Boundary: this module is the only ``tool_swap`` module that imports
 the Docker SDK; the import-linter contract that enforces that is
@@ -495,8 +497,8 @@ def text_of(value: object) -> str:
 
 class _BackendContainer(Protocol):
     """The object ``containers.create`` / ``containers.get`` returns,
-    as far as ``start`` (behaviour 21) and ``stop`` (behaviour 22)
-    touch it.
+    as far as ``start`` (behaviour 21), ``stop`` (behaviour 22) and
+    ``is_running`` (behaviour 23) touch it.
 
     A real object is a ``docker.models.containers.Container`` —
     ``id`` the runtime id, ``status`` the state property
@@ -505,9 +507,9 @@ class _BackendContainer(Protocol):
     ``start`` and ``stop`` methods
     (``plan/third-party-docs/docker/containers-run-create.md`` §4;
     ``plan/third-party-docs/docker/container-stop-wait.md`` §1,
-    models/containers.py:441-453); the behaviour-21/22 recording stubs
-    carry exactly the members each path uses, so this is also the
-    widest shape either stub allows.
+    models/containers.py:441-453); the behaviour-21/22/23 recording
+    stubs carry exactly the members each path uses, so this is also
+    the widest shape any stub allows.
     """
 
     #: The runtime id the container is known by.
@@ -526,10 +528,11 @@ class _BackendContainer(Protocol):
 
 
 class _BackendContainers(Protocol):
-    """The ``client.containers`` collection, as far as ``start`` and
-    ``stop`` touch it.
+    """The ``client.containers`` collection, as far as ``start``,
+    ``stop`` and ``is_running`` touch it.
 
-    Two members: ``create`` (behaviour 21) and ``get`` (behaviour 22),
+    Two members: ``create`` (behaviour 21) and ``get`` (behaviours
+    22-23),
     both returning :class:`_BackendContainer`.  The image is declared
     keyword-only because the behaviour-21 stub records an explicitly
     passed ``image=`` into its kwargs dict, and the SDK's ``create``
@@ -552,15 +555,15 @@ class _BackendContainers(Protocol):
 
 
 class _BackendClient(Protocol):
-    """The minimal client shape the behaviour-21/22 call pairs call
+    """The minimal client shape the behaviour-21/22/23 call pairs call
     through.
 
     Kept to exactly what those call pairs touch — a ``containers``
     collection, nothing more — **not** a speculative full client
-    interface: behaviours 23-26 will force any further members when
+    interface: behaviours 24-26 will force any further members when
     they land.  ``containers`` is a plain attribute member (not a
     property), matching how both a real ``docker.DockerClient`` and
-    the behaviour-21/22 recording stubs carry it — set in
+    the behaviour-21/22/23 recording stubs carry it — set in
     ``__init__``.
     """
 
@@ -595,10 +598,10 @@ class DockerBackend:
         its annotations, and both a stub and a real ``DockerClient``
         satisfy ``object``.  Behaviour 21 has since forced the one
         minimal protocol its call pair touches (``_BackendClient``,
-        above); :meth:`start` and :meth:`stop` cast through it, and any
-        later behaviour
-        that needs a further member grows that protocol — never a
-        speculative full client interface.
+        above); :meth:`start`, :meth:`stop` and :meth:`is_running`
+        cast through it, and any later behaviour that needs a further
+        member grows that protocol — never a speculative full client
+        interface.
 
         Args:
             client: The already-built Docker client (or a test stand-in).
@@ -619,6 +622,61 @@ class DockerBackend:
         self.client = client
         self.label_namespace = label_namespace
         self.container_prefix = container_prefix
+
+    def _fetch_container(self, container_id: str) -> _BackendContainer | None:
+        """Look one container up by id, classifying the lookup's failures.
+
+        Shared by :meth:`stop` (behaviour 22) and :meth:`is_running`
+        (behaviour 23): both look the container up by its runtime id
+        through ``client.containers.get`` — the saved single-container
+        fetch, a full inspect that reports a missing container by
+        raising ``NotFound`` (``plan/third-party-docs/docker/
+        containers-list-filters.md`` §5,
+        models/containers.py:939-952).
+
+        A missing container is *state*, not an availability failure:
+        this returns ``None`` and the caller gives it the no-op's
+        shape — ``stop``'s early return, ``is_running``'s ``False`` —
+        rather than raising.  The catch is deliberately scoped to
+        ``docker.errors.NotFound``, **not** a blanket
+        ``except Exception``: a dead daemon surfaces from this call as
+        a bare ``requests`` connection error (``plan/
+        third-party-docs/docker/errors.md`` §3, [CORRECTED
+        2026-09-16]) and a daemon refusal as an ``APIError``, and both
+        must route through :func:`map_sdk_error` and be raised rather
+        than masquerade as an absent container — the no-op applies to
+        *state*, never to *availability*.  ``NotFound`` is an
+        ``APIError`` and hence a ``requests.exceptions.HTTPError``
+        (errors.py:42, 92), so no connection error can ever match it —
+        the scope is structurally, not accidentally, safe.
+
+        Args:
+            container_id: The runtime id to look up.
+
+        Returns:
+            The container object the daemon returned, or ``None``
+            when the lookup reports the container missing.
+
+        Raises:
+            BackendError: a taxonomy member routed through
+                :func:`map_sdk_error`, for every lookup failure that
+                is not ``NotFound``.
+        """
+        client = cast(_BackendClient, self.client)
+        try:
+            return client.containers.get(container_id)
+        except docker.errors.NotFound:
+            # The container is gone — a state, not an availability
+            # failure: the caller decides the no-op's shape.
+            return None
+        except Exception as exc:
+            # Every other failure from the lookup — a daemon refusal, a
+            # dead daemon — is routed through map_sdk_error.  A dead
+            # daemon raises a requests connection error, which the
+            # NotFound clause above cannot match, so it reaches here
+            # and surfaces as BackendUnavailableError rather than a
+            # swallowed no-op.
+            raise map_sdk_error(exc) from exc
 
     def start(self, spec: ContainerSpec) -> ContainerHandle:
         """Start the container described by ``spec`` and return its handle.
@@ -679,15 +737,20 @@ class DockerBackend:
 
         The whole method is the call pair (plan §5 behaviour 22):
 
-        1. ``client.containers.get(handle.id)`` — the saved single-container
-           fetch, which performs a full inspect and raises ``NotFound`` when
-           the container is missing (``plan/third-party-docs/docker/
-           containers-list-filters.md`` §5, models/containers.py:939-952);
-        2. ``stop(timeout=...)`` on the object ``get`` returned, carrying the
-           timeout in **int seconds** under the SDK's parameter name
-           ``timeout`` (``plan/third-party-docs/docker/
-           container-stop-wait.md`` §1, models/containers.py:441-453) — the
-           call blocks until the daemon reports the container stopped.
+        1. the shared lookup :meth:`_fetch_container` for
+           ``handle.id`` — ``client.containers.get``, the saved
+           single-container fetch, which performs a full inspect,
+           reports a missing container as ``None`` rather than raising,
+           and routes every other lookup failure through
+           :func:`map_sdk_error` (``plan/third-party-docs/docker/
+           containers-list-filters.md`` §5,
+           models/containers.py:939-952);
+        2. ``stop(timeout=...)`` on the object the lookup returned,
+           carrying the timeout in **int seconds** under the SDK's
+           parameter name ``timeout`` (``plan/third-party-docs/docker/
+           container-stop-wait.md`` §1, models/containers.py:441-453)
+           — the call blocks until the daemon reports the container
+           stopped.
 
         **The no-op contract (§4.3).**  A container the lookup reports
         *missing* (``NotFound``) or *already exited* (``status ==
@@ -697,17 +760,15 @@ class DockerBackend:
         is a no-op: ``stop`` returns ``None`` without calling the
         container's ``stop``.  ``FakeBackend.stop`` honours the same
         contract (behaviour 12), and M2b's liveness sweep relies on it.
-        The catch is deliberately scoped to ``docker.errors.NotFound``
-        — **not** a blanket ``except Exception`` — because a dead daemon
-        surfaces from this call pair as a bare ``requests`` connection
-        error (``plan/third-party-docs/docker/errors.md`` §3,
-        [CORRECTED 2026-09-16]), which must route to
-        ``BackendUnavailableError`` rather than masquerade as a tidy
-        shutdown: the no-op applies to *state* (missing, exited), never
-        to *availability*.  ``NotFound`` is an ``APIError`` and hence a
-        ``requests.exceptions.HTTPError`` (errors.py:42, 92), so no
-        connection error can ever match it — the scope is
-        structurally, not accidentally, safe.
+        The ``NotFound`` no-op lives in the shared lookup
+        :meth:`_fetch_container`, whose docstring carries the full
+        reasoning: the catch is scoped to ``docker.errors.NotFound``,
+        **not** a blanket ``except Exception``, so a dead daemon (a
+        bare ``requests`` connection error,
+        ``plan/third-party-docs/docker/errors.md`` §3, [CORRECTED
+        2026-09-16]) routes to ``BackendUnavailableError`` rather than
+        masquerade as a tidy shutdown: the no-op applies to *state*
+        (missing, exited), never to *availability*.
 
         **The zero-timeout trap.**  ``timeout_s`` is converted with
         ``round(timeout_s)`` and passed **unconditionally** — there is
@@ -735,21 +796,11 @@ class DockerBackend:
         Returns:
             ``None`` — both on a performed stop and on a no-op.
         """
-        client = cast(_BackendClient, self.client)
-        try:
-            container = client.containers.get(handle.id)
-        except docker.errors.NotFound:
+        container = self._fetch_container(handle.id)
+        if container is None:
             # The container is gone — a state, not an availability
             # failure: return without touching anything.
             return
-        except Exception as exc:
-            # Every other failure from the lookup — a daemon refusal, a
-            # dead daemon — is routed through map_sdk_error.  A dead
-            # daemon raises a requests connection error, which the
-            # NotFound clause above cannot match, so it reaches here
-            # and surfaces as BackendUnavailableError rather than a
-            # swallowed no-op.
-            raise map_sdk_error(exc) from exc
         try:
             if container.status == "exited":
                 return
@@ -766,6 +817,67 @@ class DockerBackend:
             # normal semantics rather than being re-labelled a backend
             # failure.
             raise map_sdk_error(exc) from exc
+
+    def is_running(self, handle: ContainerHandle) -> bool:
+        """Whether the container is running; ``False`` if it is gone.
+
+        The same lookup :meth:`stop` (behaviour 22) performs, with a
+        different answer (plan §5 behaviour 23; §4.3 contract
+        decision):
+
+        1. the shared lookup :meth:`_fetch_container` for
+           ``handle.id`` — ``client.containers.get``, the saved
+           single-container fetch (``plan/third-party-docs/docker/
+           containers-list-filters.md`` §5,
+           models/containers.py:939-952);
+        2. read ``container.status`` — the one state property the saved
+           reference marks [READ] (``plan/third-party-docs/docker/
+           container-attrs-reload.md`` §3, containers.py:59-67) — and
+           report whether it is the running state.
+
+        **Only the running state is ``True``; everything else,
+        including a state string nobody has enumerated, is ``False``.**
+        The daemon's ``status`` vocabulary is an *open* set — no SDK
+        line enumerates it (container-attrs-reload.md §3.1) — so the
+        comparison is positive, ``status == "running"``, rather than a
+        membership test against a list of known non-running states.
+        An unrecognised value therefore reads ``False`` instead of
+        raising or reading ``True``: the safe direction, since M2b's
+        liveness sweep reaps what it believes is dead and must not reap
+        a container it cannot read, nor turn a daemon vocabulary change
+        into a watchdog traceback (plan §6 item 4).  Do not "tidy" this
+        into a known-states list.
+
+        **The not-found contract (§4.3).**  A container the lookup
+        reports missing is ``False`` without raising: "``is_running``
+        swallows not-found and returns ``False`` … Every other method
+        raises."  The no-op is scoped to *state* (missing,
+        non-running), never to *availability*: a dead daemon or a
+        daemon refusal during the lookup is already raised by
+        :meth:`_fetch_container` through :func:`map_sdk_error`, so a
+        temporary outage cannot read as "every container is dead".
+        ``FakeBackend.is_running`` honours the same contract
+        (behaviour 12).
+
+        Args:
+            handle: The container to check.
+
+        Returns:
+            ``True`` only while the daemon reports the container in the
+            running state; ``False`` when it is in any other state or
+            has vanished.
+        """
+        container = self._fetch_container(handle.id)
+        if container is None:
+            # Vanished: a state, not an availability failure — the
+            # §4.3 not-found contract, the same shape as stop's no-op.
+            return False
+        # Positive comparison against the running state — not a
+        # membership test against known non-running states — because
+        # the status vocabulary is an open set (container-attrs-reload.
+        # md §3.1): an unrecognised value must read False, never raise
+        # or read True.
+        return container.status == "running"
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
