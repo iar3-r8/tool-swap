@@ -2,6 +2,7 @@
 root_packages =
     tool_swap
     tool_swap_runtime
+include_external_packages = true
 
 [importlinter:contract:1]
 name = Router and runtime are strictly separate
@@ -34,3 +35,10 @@ source_modules =
     tool_swap.schema
 forbidden_modules =
     tool_swap.config.schema
+
+[importlinter:contract:5]
+name = The docker SDK is importable from one module only
+type = forbidden
+source_modules = tool_swap
+forbidden_modules = docker
+ignore_imports = tool_swap.backend.docker_backend -> docker
