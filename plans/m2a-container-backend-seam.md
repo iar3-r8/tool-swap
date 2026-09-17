@@ -229,6 +229,69 @@ Behaviour 17's `cpus` conversion was the sharpest: the SDK has **no `cpus` kwarg
 `nano_cpus` is an `int` in units of 1e-9 CPUs. A multiplier invented from memory there is a
 1e9 error that no unit test would have revealed.
 
+#### Pull request B — behaviours 20–27, complete
+
+| Behaviour | Red | Green | Suite at green |
+|---|---|---|---|
+| 20 — the ambient-environment guard | `d32652c` | `1df1438` | 1454 passed |
+| 21 — `start` | `2bbac43`, corrected `af7ab37` | `773e03b` | 1461 passed |
+| 22 — `stop` | `e779f4d` | `3779832` | 1471 passed |
+| 23 — `is_running` on a vanished container | `c42f11b` | `c783c29` | 1482 passed |
+| 24 — `inspect` | `a356cbc` | `b3c488e` | 1493 passed |
+| 25 — `list_managed` | `d02b32f` | `f785a42` | 1502 passed |
+| 26 — `logs` + the protocol-completeness pin | `3c69352`, corrected `e0b551b` | `9c4b573` | 1515 passed |
+| 27 — the import-linter contract | `39867a8`, pins updated `c9e8add` | `6589577` | 1524 passed |
+
+**All eight behaviours are complete**, each with its own red and green commit. Suite at the
+branch tip: **1524 passed, 2 skipped**, from the re-measured 1378 at the merge base;
+`make lint` clean with mypy strict over 38 source files; `lint-imports` reports **5 kept, 0
+broken**. `isinstance(backend, ContainerBackend)` is `True` — `DockerBackend` satisfies the
+seam's protocol, and behaviour 27 makes "the ONLY file that talks to Docker" enforced rather
+than hoped for.
+
+**The client protocol was grown one behaviour at a time, never invented.** Behaviour 20
+declined to introduce §4.5's `DockerClientLike` at all, leaving its shape to be forced by the
+methods; behaviour 21 added `create` and the container's `id`/`start`; 22 added `get`,
+`status` and `stop`; 24 added `attrs`; 25 added `list`, `name` and `labels`; 26 added the
+container's `logs`. Nothing speculative was ever declared, so the protocol describes exactly
+what the seam touches.
+
+**Three red steps were corrected, and each correction is its own commit** — the pattern that
+makes this slice's history worth reading:
+
+1. **Behaviour 21's stub was internally contradictory.** Its `create` bound `image` to a named
+   parameter, so the central derived-equality assertion could not hold for any
+   implementation, and `_RecordingContainer` relied on `__post_init__` without carrying
+   `@dataclass`. The coder got 4 of 8 passing and **refused to edit the tests**, escalating
+   instead. Both defects were confirmed by AST inspection before the argument was granted.
+   The fix also removed `test_start_satisfies_the_container_backend_protocol`, which had
+   forced five `NotImplementedError` placeholders into behaviour 21 — five behaviours' surface
+   in one cycle — and moved the completeness pin to behaviour 26, where the last member
+   actually arrives.
+2. **Behaviour 26's chunk fixture dropped every log's final segment**, so the default case
+   yielded no chunks at all and the rejoining fixture lost the one chunk that makes it
+   discriminate. Again the coder escalated rather than edited. Then the *corrected* fixture
+   caught a real bug in the implementation — `rsplit(b"\n", 1)` unpacked unconditionally,
+   which raises for a chunk containing no newline, the common case for any line longer than a
+   frame. **The fixture paid for itself twice.**
+3. **Behaviour 27 broke two of M1's anti-drift pins**, which asserted exactly four contracts
+   and `4 kept, 0 broken`. Neither was buggy: both accurately described a four-contract
+   repository, and an exact-set pin is *meant* to fail when a contract is added so that
+   someone looks. They were updated to five, kept exact rather than weakened to a subset
+   check, and the contract's name is now imported from one source rather than copied.
+
+**Every correction went back to the qna-tester as its own red step; the coder edited no test
+at any point.** Three escalations, three upheld.
+
+**What the tests deliberately do not claim.** §3's discipline held throughout: every
+third-party fact cites a saved page, and the honest gaps are marked rather than papered over.
+`State.ExitCode` and `State.StartedAt` are `[INFERRED]` — the first has one occurrence in the
+installed package and it belongs to `exec_inspect`, the second none at all — so behaviour 24's
+canned-dict tests prove only that the code reads the keys the fixture wrote, and say so.
+`GpuUnavailableError`'s message heuristic (§7 item 12), the daemon's label-filter selection
+(deferred docker test 1), `stop`'s return-before-exit (deferred test 2) and
+`CancellableStream`'s quiet truncation are all recorded and none is asserted. **No daemon ran.**
+
 **Two commitments this branch makes explicitly, because both are easy to overstate:**
 
 - **No daemon verification is claimed.** M2a runs no docker tests. The `docker` marker is
