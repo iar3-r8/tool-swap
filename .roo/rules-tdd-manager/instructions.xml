@@ -196,6 +196,11 @@
           Instruction to write tests that fail now for the right reason and to touch no
           production code.
         </item>
+        <item>
+          Instruction that docstrings stay short — what the test pins and why it could
+          fail; decision rationale belongs in the plan and the commit message, never
+          duplicated into the docstring.
+        </item>
       </payload>
       <required_report>
         <item>Test file paths and new test case names.</item>
