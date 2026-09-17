@@ -32,7 +32,7 @@ against a running daemon.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 import docker
@@ -570,12 +570,63 @@ def _state_started_at(attrs: Mapping[str, object]) -> str | None:
     return None
 
 
+def _iter_log_lines(stream: Iterator[bytes]) -> Iterator[str]:
+    """Reassemble the daemon's byte chunks into decoded log lines.
+
+    The SDK's log stream yields chunks of ``bytes`` whose boundaries
+    fall wherever the daemon's frames fall — routinely **inside** a
+    line (``plan/third-party-docs/docker/container-logs.md`` §2,
+    [READ]: "one or more log frames after header stripping") — so
+    decoding and splitting each chunk independently would fragment
+    every line a boundary touches.  The buffer therefore accumulates
+    the bytes of the incomplete trailing line: on every chunk the
+    buffer is split on ``b"\\n"`` only, every fragment except the last
+    is a complete line and is decoded with ``errors="replace"`` and
+    yielded (one bad byte becomes U+FFFD and the stream continues),
+    and the last fragment — with no terminator yet — stays in the
+    buffer for the next chunk.  A chunk that leaves the buffer with
+    no newline at all — the common first chunk for any line longer
+    than a frame — yields nothing and keeps the whole buffer.
+    When the stream ends, the remainder
+    is yielded as the final line if it is non-empty: the last line of
+    a live log routinely has no terminator yet, and a viewer that
+    silently drops it swallows exactly the line the operator most
+    wants — a silent data-loss bug by this repository's own KISS
+    rule.
+
+    The split is on ``b"\\n"`` only — never ``splitlines``: the
+    daemon's framing is a fact the saved references never claim, and
+    CRLF or lone-``"\\r"`` handling would be a second line concept
+    the seam does not need.  The newline contract itself is ours,
+    not an SDK fact (same page §2: the caller must ``.decode(...)``
+    explicitly) — see :meth:`DockerBackend.logs`.
+
+    Args:
+        stream: The daemon's byte-chunk stream, as returned by
+            ``container.logs(stream=True, ...)``.
+
+    Yields:
+        One decoded line per item, each without its trailing newline;
+        a trailing partial line, if any, as the final item.
+    """
+    buffer = b""
+    for chunk in stream:
+        buffer += chunk
+        if b"\n" not in buffer:
+            continue
+        complete, buffer = buffer.rsplit(b"\n", 1)
+        for line in complete.split(b"\n"):
+            yield line.decode("utf-8", errors="replace")
+    if buffer:
+        yield buffer.decode("utf-8", errors="replace")
+
+
 class _BackendContainer(Protocol):
     """The object ``containers.create`` / ``containers.get`` /
     ``containers.list`` returns, as far as ``start`` (behaviour 21),
     ``stop`` (behaviour 22), ``is_running`` (behaviour 23),
-    ``inspect`` (behaviour 24) and ``list_managed`` (behaviour 25)
-    touch it.
+    ``inspect`` (behaviour 24), ``list_managed`` (behaviour 25) and
+    ``logs`` (behaviour 26) touch it.
 
     A real object is a ``docker.models.containers.Container`` —
     ``id`` the runtime id, ``name`` the daemon's name with its
@@ -622,6 +673,25 @@ class _BackendContainer(Protocol):
 
     def stop(self, **kwargs: object) -> None:
         """Stop the container; the SDK's ``Container.stop(**kwargs)``."""
+        ...
+
+    def logs(self, stream: bool, *, follow: bool, tail: int) -> Iterator[bytes]:
+        """The container's log stream; the SDK's ``Container.logs``.
+
+        ``Container.logs(**kwargs)`` forwards every kwarg to
+        ``client.api.logs`` (``plan/third-party-docs/docker/
+        container-logs.md`` §1, models/containers.py:294); the streaming
+        form (``stream=True``) yields chunks of ``bytes`` — one or more
+        log frames after header stripping, never decoded by the SDK
+        (same page §2, [READ]).  A real object is a ``CancellableStream``
+        (same page §2, types/daemon.py:8) — an iterator that also
+        exposes ``close()`` to abort an open follow early — but the
+        seam's contract is iteration only, so this protocol member is
+        the iterator half, honestly typed as an iterator over byte
+        chunks.  The behaviour-26 recording stub returns a plain
+        ``Iterator[bytes]`` for the same reason: it carries no
+        ``close()`` because the seam never closes.
+        """
         ...
 
 
@@ -1294,6 +1364,130 @@ class DockerBackend:
             # semantics rather than being re-labelled a backend
             # failure.
             raise map_sdk_error(exc) from exc
+
+    def logs(
+        self, handle: ContainerHandle, *, follow: bool, tail: int
+    ) -> Iterator[str]:
+        """Log lines of the container, reassembled and decoded.
+
+        The whole method is the behaviour-26 read (plan §5 behaviour
+        26; §4.3 contract decision):
+
+        1. the shared lookup :meth:`_fetch_container` for ``handle.id``
+           — ``client.containers.get``, the saved single-container
+           fetch (``plan/third-party-docs/docker/
+           containers-list-filters.md`` §5,
+           models/containers.py:939-952);
+        2. ``container.logs(stream=True, follow=follow, tail=tail)`` —
+           the pinned call shape below;
+        3. the byte chunks the call returns, reassembled into lines by
+           :func:`_iter_log_lines`.
+
+        **The pinned call shape.**  ``stream`` is always ``True``:
+        only the streaming form yields the chunks the seam
+        reassembles into lines — the non-streaming form returns the
+        whole log as one ``bytes`` blob, and nothing is left to rejoin
+        (``plan/third-party-docs/docker/container-logs.md`` §2,
+        [READ]).  ``follow`` is passed **explicitly, never omitted**:
+        the SDK's ``follow`` defaults to ``None`` and ``if follow is
+        None: follow = stream`` (same page §1, kwarg table), so an
+        omitted ``follow`` with ``stream=True`` would turn a
+        ``follow=False`` request into a stream that follows forever.
+        ``tail`` is passed through **verbatim, ``0`` included** — no
+        falsy test: the SDK treats ``0`` as valid while silently
+        resetting only *invalid* values (< 0, non-int) to ``'all'``
+        (same page §1, lines 860-861), and ``'all'`` is unbounded
+        (same page §3) — the same trap class behaviour 22 pinned for
+        ``timeout_s=0``.  No ``stdout`` / ``stderr`` / ``timestamps``
+        / ``since`` / ``until`` — their defaults (``True`` / ``True``
+        / ``False`` / ``None`` / ``None``, same page §1 kwarg table)
+        are what the seam wants.
+
+        **The line contract is ours, not an SDK fact.**  The SDK hands
+        over raw ``bytes`` and says nothing about line framing (same
+        page §2, [READ]: "the caller must ``.decode(...)``
+        explicitly") — so :func:`_iter_log_lines` splits on ``b"\\n"``
+        only, yields each line stripped of its trailing newline,
+        decodes with ``errors="replace"`` so one bad byte cannot kill
+        the stream, and flushes a trailing partial line at the end of
+        the stream rather than dropping it.
+
+        **The not-found contract (§4.3) inverts here.**  ``is_running``
+        (behaviour 23), ``inspect`` (24) and ``stop`` (22) are the
+        only methods the not-found no-op is granted; "every other
+        method raises", and ``logs`` is one of the others.  A
+        container the lookup reports *missing* therefore raises
+        :class:`ContainerNotFoundError` — **raised eagerly, on the
+        call, not on the first ``next()``**: asking for the log of a
+        container that is not there is a caller error to be answered,
+        not a state to be absorbed, and ``FakeBackend.logs`` honours
+        the same contract (behaviour 13) — the one place in the slice
+        where fake/docker parity means *both raise*.  An empty
+        iterator instead would read an out-of-band removal as "an
+        empty log", the exact behaviour §4.3 forbids for ``logs``.
+        The no-op applies to *state* (missing) for the three lenient
+        methods, never to *availability*: a dead daemon or a daemon
+        refusal during the lookup is already raised by
+        :meth:`_fetch_container` through :func:`map_sdk_error` —
+        ``BackendUnavailableError`` for a dead daemon (behaviour 19) —
+        and ``logs`` lets it through rather than reading the outage
+        as "the container is missing".
+
+        **A follow stream can end quietly — recorded, not fixed.**
+        The saved page §2 ([CORRECTED 2026-09-16]; ``CancellableStream``
+        lives at ``types/daemon.py:8``, not ``utils/socket.py``)
+        records that ``__next__`` converts ``ProtocolError`` **and**
+        ``OSError`` into ``StopIteration`` (``types/daemon.py:27-33``,
+        [READ]): a follow stream broken by a dying daemon **ends
+        quietly**, and a truncated log is indistinguishable from a
+        complete one.  This method adds no retry, sentinel or error
+        detection for it — the hazard is unobservable without a
+        daemon (no daemon runs in M2a's test environment), and
+        "logs survive a stop" is M7's requirement (plan §1).  M7's
+        log collector inherits the hazard from this API; see
+        ``plan/third-party-docs/docker/container-logs.md`` §2.
+
+        Args:
+            handle: The container to read the log of.
+            follow: Whether to follow the log past its current end;
+                passed to the daemon verbatim, always explicit.
+            tail: How many trailing lines the daemon should return,
+                passed verbatim — ``0`` included.
+
+        Returns:
+            An iterator over the log, one decoded line per item, each
+            without its trailing newline.
+
+        Raises:
+            ContainerNotFoundError: the lookup reports the container
+                missing — raised on the call, before any line is
+                yielded (§4.3: every method other than ``is_running``,
+                ``inspect`` and ``stop`` raises).
+            BackendError: a taxonomy member routed through
+                :func:`map_sdk_error`, for every lookup failure that
+                is not ``NotFound`` — the mapping table itself is
+                behaviour 19's and is not re-tested here.
+        """
+        container = self._fetch_container(handle.id)
+        if container is None:
+            # Vanished: the §4.3 not-found contract, inverted for
+            # logs — every method other than is_running / inspect /
+            # stop raises.  Raised eagerly, on the call: a missing
+            # container is a caller error to be answered, not an
+            # empty log to be absorbed, and FakeBackend.logs raises
+            # the same member for the same input (behaviour 13).
+            raise ContainerNotFoundError(
+                f"Container {handle.id} not found — its log cannot be read"
+            )
+        # The lookup's non-NotFound failures already raised in
+        # _fetch_container (a dead daemon surfaces as
+        # BackendUnavailableError there), so this branch is reached
+        # only for a live daemon and a present container.  The stream
+        # is opened on the call — not deferred to the first next() —
+        # so a refusal surfaces where the caller holds the call, not
+        # part-way through a half-read log.
+        stream = container.logs(stream=True, follow=follow, tail=tail)
+        return _iter_log_lines(stream)
 
     @classmethod
     def from_config(cls, cfg: BackendConfig) -> DockerBackend:
