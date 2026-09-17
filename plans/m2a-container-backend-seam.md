@@ -291,10 +291,19 @@ makes this slice's history worth reading:
 **Every correction went back to the qna-tester as its own red step; the coder edited no test
 at any point.** Three escalations, three upheld.
 
-**Pull request [#13](https://github.com/iar3-r8/tool-swap/pull/13)** — open, head `3554a81`,
-23 commits, 13 files, +8171 −127. **Based on `feature/m2a-docker-backend` rather than `main`**,
-so its diff carries only behaviours 20–27; when #12 merges, retarget it to `main`.
-Documentation commit `7bbe2d3` precedes it, as behaviour 28 requires.
+**Pull request [#13](https://github.com/iar3-r8/tool-swap/pull/13)** — open, head `d6c262d`,
+24 commits, 13 files. **Based on `feature/m2a-docker-backend` rather than `main`**, so its
+diff carries only behaviours 20–27; when #12 merges, retarget it to `main`.
+`mergeable_state: clean`. Documentation commit `7bbe2d3` precedes it, as behaviour 28 requires.
+
+**#13 reports no CI checks, and that is the stacking's one real cost.**
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) triggers on `pull_request` **only
+for `branches: [main]`**, so a pull request based on another branch runs nothing — the
+absence is configuration, not failure, and a reviewer should not read it as red. The suite was
+verified locally at the branch tip instead: **1524 passed, 2 skipped**, `make lint` clean,
+`lint-imports` 5 kept 0 broken. **Retargeting #13 to `main` after #12 merges is what triggers
+its CI run**, and that should happen before it is approved. The alternative — widening the
+workflow's branch filter — is a CI change this task deliberately did not make.
 
 **M2a's behaviour ledger is complete.** All 28 behaviours have shipped across five pull
 requests: #9 (1–2), #10 (3–9), #11 (10–13), #12 (14–19) and #13 (20–27), with behaviour 28's
