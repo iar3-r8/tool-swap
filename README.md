@@ -107,7 +107,7 @@ tool-swap/
 │   │   ├── schema/             # JSON Schema compilation, tool definitions
 │   │   ├── registry/           # Tool registry, model definitions
 │   │   ├── scheduler/          # Dispatch, batching, occupancy accounting
-│   │   ├── lifecycle/          # Container lifecycle (spec builder shipped; state machine later)
+│   │   ├── lifecycle/          # Container lifecycle (spec builder and tool state machine shipped)
 │   │   ├── backend/            # Pluggable container backends (Docker, fake)
 │   │   ├── preflight/          # Deployment gate: checks, runner, report
 │   │   │   └── checks/         # Static, build, boot, readiness, contract checks

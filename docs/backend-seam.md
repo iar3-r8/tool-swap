@@ -58,11 +58,12 @@ flowchart LR
         DOCK[docker_backend.py: DockerBackend, behaviours 20–26 — the only module that may import the Docker SDK]
         DOCKT[docker_backend.py: build_run_kwargs and map_sdk_error, behaviours 14–19, the pure half]
     end
-    subgraph lifc[lifecycle — M2b slice A, the layer above the seam]
+    subgraph lifc[lifecycle — M2b slices A and B, the layer above the seam]
         SPEC[spec_builder.py: build_container_spec, the config → ContainerSpec conversion]
+        STATES[states.py: ToolState, ModelRuntimeState, the ten-edge transition table]
     end
     subgraph future[later branches and milestones — not shipped]
-        LIFE[M2b: LifecycleManager, the tool state machine]
+        LIFE[M2b slice D: LifecycleManager, the driver of the state machine]
         BLD[M5: build and BuildSpec]
     end
     VAL -->|ParsedMount| SPEC
@@ -90,13 +91,17 @@ half `DOCKT` (plan §4.5) — `start` unpacks
 output into `create`, and every method routes exceptions through
 [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) —
 and it is the only module that may import the SDK (the fifth
-`.importlinter` contract, behaviour 27). `SPEC` sits in its own
-subgraph because it is M2b's layer **above** the seam, not a seam
-module: it produces the `ContainerSpec` the seam consumes, from
+`.importlinter` contract, behaviour 27). `SPEC` and `STATES` sit in
+their own subgraph because both are M2b's layer **above** the seam,
+not seam modules: `SPEC` produces the `ContainerSpec` the seam
+consumes, from
 [`parse_mount`](../src/tool_swap/config/validate.py:2488)'s
 `ParsedMount`, and
 [its page](spec-builder.md) documents the conversion and the two
-refusals that keep it honest.
+refusals that keep it honest; `STATES` is the slice B tool state
+machine, whose ten edges decide *when* a container should exist,
+and [its page](tool-state-machine.md) documents the table, the
+runtime-state holder and the logging contract.
 
 ## The data types
 
@@ -140,10 +145,15 @@ hashable, and M2b keys its bookkeeping by them.
 
 Exactly four members — `created`, `running`, `exited`, `gone` — and
 they describe one thing only: **whether a process exists**. This is
-deliberately not the M2b tool state machine. `STARTING`, `LOADING` and
-`READY` are readiness concepts owned by M2b's health probe, which does
-not exist yet, and a test pins the four-member set so the two state
-machines cannot blur together.
+deliberately not the M2b tool state machine, which ships in slice B
+([`ToolState`](../src/tool_swap/lifecycle/states.py:35), six
+members, documented on
+[its own page](tool-state-machine.md)): `STARTING`, `LOADING` and
+`READY` are readiness concepts that a container can be `running`
+while its tool is still not serving. The health probe that answers
+them arrives in slice C. A test pins the four-member set, a second
+pins the six-member set, and the two value sets are asserted
+disjoint, so the two state machines cannot blur together.
 
 ### `ContainerStatus`
 
@@ -712,12 +722,12 @@ are the numbered entries of the plan's ledger — the unit of work
 each test cycle implements and pins. `isinstance(backend,
 ContainerBackend)` is `True` for both, and "the only module that
 imports the Docker SDK" is now enforced rather than hoped for. The
-layer **above** the seam — the config to `ContainerSpec` builder,
-M2b slice A — is [documented on its own page](spec-builder.md), and
-what this page does **not** contain is the M2b tool state machine —
-`STOPPED`, `STARTING`, `LOADING`, `READY` — which does not exist.
-This page documents what is here, and says explicitly where it
-stops.
+layer **above** the seam is documented on its own pages: the config
+to `ContainerSpec` builder in [spec-builder.md](spec-builder.md), and
+the tool state machine — `STOPPED`, `STARTING`, `LOADING`, `READY`,
+`STOPPING`, `FAILED` — in
+[tool-state-machine.md](tool-state-machine.md). This page documents
+what is here, and says explicitly where it stops.
 
 The design is specified in
 [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
@@ -801,6 +811,10 @@ Two honest limits on the table:
   `ContainerSpec` builder (M2b slice A): how each spec field is
   assembled, the `BackendConfig`-not-`values` trap, the mount
   conversion and its refusals, and the two guards.
+- [`docs/tool-state-machine.md`](tool-state-machine.md) — the tool
+  state machine (M2b slice B): the six states, the ten-edge table and
+  its two deliberate absences, `ModelRuntimeState`'s field
+  arithmetic, and the validate-first-log-second contract.
 - [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md) —
   the design decisions behind every type and rule on this page, with
   the per-behaviour ledger (§5) and what M2b will need from the seam

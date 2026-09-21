@@ -61,12 +61,50 @@ was pushed; the milestone name is kept for pull-request titles.
 Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2 skipped**,
 `make lint` clean with mypy strict over 38 source files, `lint-imports` 5 kept, 0 broken.
 
+**Slice A** — `feature/m2b-spec-builder`:
+
 | # | Behaviour | Red | Green | Suite at green |
 |---|---|---|---|---|
 | 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
 | 2 | `ParsedMount` → `MountSpec` | `03b3b00` | `c979b2a` | 1546 passed, 2 skipped |
 | 3 | Resource, env and port passthrough | `d6a2d99` | `325bb3d` | 1555 passed, 2 skipped |
 | 4 | The builder's two guards | `ada2dea` | `7478dc9` | 1570 passed, 2 skipped |
+
+**Slice B** — `feature/m2b-state-machine`, stacked on slice A's tip `af00e89`:
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 5 | `ToolState` — six members | `9d10ee2` | `b070cc2` | 1579 passed, 2 skipped |
+| 6 | `ModelRuntimeState` — seven fields | `7ce868b` | `87a1cef` | 1586 passed, 2 skipped |
+| 7 | The transition table | `a5a6dfe` | `d5e1079` | 1661 passed, 2 skipped |
+| 8 | Transitions are logged | `1a6b4ff` | `ac5c39c` | 1698 passed, 2 skipped |
+
+**Slice B is complete and shipped as
+[#15](https://github.com/iar3-r8/tool-swap/pull/15)**, stacked on #14 and based on
+`feature/m2b-spec-builder` rather than `main`, so its diff shows only behaviours 5–8.
+Head `2ed0859`, documentation commit `2ed0859` preceding the pull request.
+
+**#15 runs no CI until it is retargeted to `main`**, which happens when #14 merges. The
+workflow triggers on `branches: [main]` only, so the absence of a check is configuration
+rather than failure — and retargeting is what makes CI run, so it should happen before
+approval rather than after.
+
+**Slice C branches from `2ed0859`**, for the reason §2.1 records: #15's head *is*
+`feature/m2b-state-machine`, so continuing to commit there would absorb slice C into the
+open pull request.
+
+Two tests in slice B assert an *absence* and therefore pass before their feature exists,
+which would normally make them worthless as red steps. Both were checked by injecting the
+mistake they target rather than trusting the green result: moving the log call above the
+legality check turns all 37 cases in
+[`test_transition_logging.py`](../tests/unit/lifecycle/test_transition_logging.py) red,
+including the 26 that assert a refused transition leaves no record. The same technique
+verified slice A's two guards.
+
+Two plan errors were found by subtasks checking this document against the source rather
+than trusting it, and both are corrected above: §6.10's field arithmetic (`2a832e9`), and
+behaviour 6's claim that the dataclass rejects an inconsistent handle, which contradicted
+its own error-behaviour line.
 
 **Slice A is complete and shipped as
 [#14](https://github.com/iar3-r8/tool-swap/pull/14)**, open against `main`. Head
@@ -79,7 +117,7 @@ reason M2a §0.2 records: `GITHUB_TOKEN` is set-but-empty in this dev container,
 only credential helper is VS Code's interactive one, terminal prompts are disabled and
 there is no `gh` CLI. The token is written into no config file.
 
-**Slice B branches from `6d17990`, not from `main`.** Pull request #14's head *is*
+**Slice B branches from slice A's tip, not from `main`.** Pull request #14's head *is*
 `feature/m2b-spec-builder`, so continuing to commit there would absorb slice B into the
 open pull request and destroy the split — the mistake M2a's §0.1.2 nearly made. Slice B
 is stacked, and a stacked pull request runs no CI until it is retargeted to `main` on its
@@ -100,7 +138,7 @@ has been amended into its green.
 
 ## 1. Design
 
-### 1.1 The tool state machine — six states, eleven edges
+### 1.1 The tool state machine — six states, ten edges
 
 Transcribed from [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md:183) §4. This is
 **not** `ContainerState`, which has four members and answers only "does a process
@@ -134,6 +172,16 @@ stateDiagram-v2
 | `STOPPING` | `STOPPED` | the backend `stop` returned |
 | `FAILED` | `STARTING` | `ensure_ready` retries |
 | `FAILED` | `STOPPED` | manual reset |
+
+**Ten edges, and the count matters** because behaviour 7's test is arithmetic: ten legal
+pairs and twenty-six illegal ones out of thirty-six. This section said "eleven" until
+behaviour 7's red step was delegated, when the table was counted and found to hold ten
+rows. The miscount came from the diagram above, which carries eleven arrows — but
+`[*] --> STOPPED` is mermaid's **initial pseudo-state marker**, not a transition: it says
+a tool begins life `STOPPED`, which is an initial condition rather than something the
+transition function can be asked to perform. Counting it would have made the test expect
+eleven legal pairs and twenty-five illegal, and the missing pair would have been
+whichever one the implementer happened to add.
 
 Everything else is illegal and raises. **There is no edge into `READY` that bypasses the
 probe**, which is why reconciliation adopts a container by walking
@@ -539,8 +587,15 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 - **Edge cases:** it is **mutable** (`plan/06` §9's sketch is a plain `@dataclass`,
   unfrozen), unlike every M2a type — the manager updates it in place, and freezing it
   would mean reallocating on every request completion. `handle` is `None` exactly when no
-  container exists, which the state machine must keep consistent: a test asserts
-  `STOPPED` with a non-`None` handle is rejected.
+  container exists, and **that invariant belongs to the transitions, not to this class.**
+  This line previously said a test asserts `STOPPED` with a non-`None` handle "is
+  rejected", which contradicted the *"Error behaviour: n/a — a data holder"* line below
+  it, and the enforcement would have been illusory: the manager mutates these objects in
+  place, so a `__post_init__` check would pass construction and the invariant could break
+  immediately afterwards. A half-enforced invariant is worse than an unenforced one,
+  because the next reader trusts it. The shipped test therefore pins that construction
+  **stores what it is given**, and is named for that, so it fails if someone later adds
+  the validator this line used to imply. Behaviours 7 and 8 own the consistency.
 - **Error behaviour:** n/a — a data holder.
 - **Files:** `src/tool_swap/lifecycle/states.py`.
 - **Verified:** construction and default test, plus the field-set pin recording that
@@ -551,11 +606,11 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 7. The transition table, and illegal transitions raise
 
 - **Inputs:** a from-state and a to-state.
-- **Outputs:** a pure predicate over the eleven edges of
-  [§1.1](#11-the-tool-state-machine--six-states-eleven-edges), plus an `apply` that
+- **Outputs:** a pure predicate over the ten edges of
+  [§1.1](#11-the-tool-state-machine--six-states-ten-edges), plus an `apply` that
   returns the new state.
-- **Edge cases:** the test is **exhaustive over all 36 ordered pairs** — eleven legal,
-  twenty-five illegal — because a table with a missing edge and a table with a spurious
+- **Edge cases:** the test is **exhaustive over all 36 ordered pairs** — ten legal,
+  twenty-six illegal — because a table with a missing edge and a table with a spurious
   one are both silently wrong under any sampled test. Self-transitions are illegal
   (`READY → READY` must not silently re-ready a tool); `STARTING → STOPPED` is illegal and
   the test notes it as M6's `vram_unavailable` path rather than an oversight.
@@ -891,7 +946,7 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
   container is started**: the journal shows zero `start` calls, which is the property that
   makes adoption adoption rather than a restart.
 - **Edge cases:** adoption **goes through the probe progression** rather than assigning
-  `READY` directly ([§1.1](#11-the-tool-state-machine--six-states-eleven-edges)) — a
+  `READY` directly ([§1.1](#11-the-tool-state-machine--six-states-ten-edges)) — a
   container that is running but not ready must end `LOADING` or `FAILED`, never `READY`,
   because a router that adopts a still-loading container as ready proxies into a 503. An
   adopted container that fails its probe ends `FAILED` and is **not** stopped: it may be
@@ -944,7 +999,7 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 - **Outputs:** Google-style module docstrings for `spec_builder.py`, `states.py`,
   `probes.py`, `manager.py` and `reconcile.py`, each stating the module's responsibility
   and its boundary; a `docs/lifecycle.md` with the **mermaid state diagram** of
-  [§1.1](#11-the-tool-state-machine--six-states-eleven-edges); a troubleshooting section
+  [§1.1](#11-the-tool-state-machine--six-states-ten-edges); a troubleshooting section
   covering container start failures, probe timeouts and reconciliation edge cases; and the
   docker-testing note, which must say plainly that **M2b runs no daemon tests** and name
   `TSWAP_TEST_DOCKER_HOST` as the future switch.
@@ -1204,7 +1259,7 @@ extension. It genuinely solves behaviours 7–8.
 
 **It is not planned in**, for three reasons: D-B forbids a new package in M2b; it depends
 on `six`, adding a transitive dependency to a project with six declared ones; and the
-machine here is six states and eleven edges, so a dict of legal transitions is smaller than
+machine here is six states and ten edges, so a dict of legal transitions is smaller than
 the adapter layer would be. Recorded rather than left unmentioned, so a later reviewer sees
 the reuse question was asked and answered. **No behaviour in this plan needs a package
 beyond the declared set.**
@@ -1240,11 +1295,24 @@ and set the precedent.
 
 ### 6.10 `plan/06` §9's `ModelRuntimeState` is shipped incomplete, by decision
 
-Behaviour 6 ships seven of the sketch's thirteen fields. The six omitted (`group`, `ttl`,
-`keep_warm`, `evict_cost`, `queued`, `vram_gb`, `consecutive_failures`) belong to features
-M2b does not have, and a field no behaviour reads is a field whose semantics are guessed.
-The field-set pin makes the omission visible. **If M3 or M6 needs one of them, adding it is
-a behaviour with a test, not a quiet edit.**
+**Corrected during behaviour 6's red step**, where the qna-tester checked this paragraph
+against the source instead of taking it on trust. It read "seven of the sketch's thirteen
+fields. The six omitted", and both numbers were wrong: the sketch has **twelve** fields,
+and the list that followed named **seven**, not six. Verified by counting
+[`plan/06` §9](../plan/06_LIFECYCLE_TTL_AND_SCHEDULING.md:396).
+
+The arithmetic never worked because the relationship is not a subset. Of the sketch's
+twelve fields M2b **keeps five** — `name` renamed to `tool`, `state` retyped from
+`ModelState` to `ToolState`, plus `last_used`, `became_ready_at` and `inflight` — and
+**defers seven**: `group`, `queued`, `keep_warm`, `ttl`, `evict_cost`, `vram_gb`,
+`consecutive_failures`. It then **adds two the sketch never had**: `handle`, because
+something must hold the `ContainerHandle` the backend returns, and `last_error`, because
+`FAILED` carries a reason. Five kept plus two added is the seven M2b ships.
+
+The seven deferred fields belong to features M2b does not have, and a field no behaviour
+reads is a field whose semantics are guessed. The field-set pin makes the omission
+visible. **If M3 or M6 needs one of them, adding it is a behaviour with a test, not a
+quiet edit.**
 
 ### 6.11 `FakeProbe` models no transport failure
 
