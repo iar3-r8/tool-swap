@@ -1,8 +1,8 @@
-"""Pins build_container_spec (m2b plan \u00a73): the core assembly (behaviour 1)
-and the ParsedMount \u2192 MountSpec conversion (behaviour 2): entry order,
-the mode \u2192 read_only normalisation, duplicate targets, and the raise
-paths. The import is deferred to call time so a missing module fails per
-test, not at collection."""
+"""Pins build_container_spec (m2b plan \u00a73): the core assembly (behaviour 1),
+the ParsedMount \u2192 MountSpec conversion (behaviour 2), and the resource,
+environment and port passthrough (behaviour 3): env coercion, device order,
+verbatim resource values, and the expose_host_port forms. The import is
+deferred to call time so a missing module fails per test, not at collection."""
 
 from __future__ import annotations
 
@@ -355,3 +355,195 @@ def test_relative_mount_without_config_dir_raises() -> None:
         builder(resolved, _backend_config(), IMAGE)
     # Assert
     assert TOOL in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 3 \u2014 resource, environment and port passthrough
+# (m2b plan \u00a73.3, \u00a76.4)
+# ---------------------------------------------------------------------------
+
+# A host port distinct from the fixture container_port (8080) and from the
+# built-in container_port (8000), so a published_port copied from either
+# source would differ from the authored value.
+_HOST_PORT: Final[int] = 8001
+
+
+def _resolved_tool_resourced() -> ResolvedTool:
+    """A resolved tool whose env, devices, cpus, memory and shm_size all
+    carry authored, non-default values; a builder that forgets any of the
+    five would surface a ContainerSpec default where the value is
+    expected."""
+    return resolve_tool(
+        TOOL,
+        inline={
+            "container_port": 8080,
+            "env": {"MODE": "fast", "WORKERS": 4, "RATIO": 0.5},
+            "devices": [2, 0],
+            "cpus": 4.0,
+            "memory": "16g",
+            "shm_size": "2g",
+        },
+    )
+
+
+def _assert_resourced(resolved: ResolvedTool) -> None:
+    """Fail if a field regressed to its built-in default, which would make
+    the passthrough assertion for that field vacuous."""
+    authored = {
+        "env": {"MODE": "fast", "WORKERS": 4, "RATIO": 0.5},
+        "devices": [2, 0],
+        "cpus": 4.0,
+        "memory": "16g",
+        "shm_size": "2g",
+    }
+    for key, expected in authored.items():
+        assert resolved.values[key] == expected, (
+            f"fixture values carry {key!r} = {resolved.values[key]!r}, not "
+            f"the authored {expected!r}"
+        )
+
+
+def _resolved_tool_exposed(value: bool | int | None) -> ResolvedTool:
+    """A resolved tool whose only authored divergence from the built-ins is
+    expose_host_port."""
+    return resolve_tool(
+        TOOL,
+        inline={"container_port": 8080, "expose_host_port": value},
+    )
+
+
+def test_env_non_string_values_are_coerced_to_str() -> None:
+    """Non-string env values arrive as str, the schema typing the dict as
+    dict[str, Any]: a builder that drops env or forwards a typed value
+    would publish a container that cannot read them."""
+    # Arrange
+    resolved = _resolved_tool_resourced()
+    _assert_resourced(resolved)
+    env = resolved.values["env"]
+    assert isinstance(env, dict)
+    assert env["WORKERS"] == 4
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert spec.env == {"MODE": "fast", "WORKERS": "4", "RATIO": "0.5"}
+    assert all(isinstance(value, str) for value in spec.env.values())
+
+
+def test_devices_pass_through_in_authored_order_as_tuple() -> None:
+    """devices reaches the spec as a tuple of ints in authored order \u2014
+    a sorted() conversion or a missing field would reorder [2, 0] or leave
+    the ContainerSpec default ()."""
+    # Arrange
+    resolved = _resolved_tool_resourced()
+    _assert_resourced(resolved)
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert isinstance(spec.devices, tuple)
+    assert spec.devices == (2, 0)
+
+
+def test_cpus_memory_and_shm_size_pass_through_verbatim() -> None:
+    """cpus, memory and shm_size reach the spec exactly as authored, with
+    no parsing or unit conversion: a builder that forgets any of the three
+    would surface the ContainerSpec None default."""
+    # Arrange
+    resolved = _resolved_tool_resourced()
+    _assert_resourced(resolved)
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert spec.cpus == 4.0
+    assert spec.memory == "16g"
+    assert spec.shm_size == "2g"
+
+
+def test_builtin_shm_size_reaches_the_spec_not_the_none_default() -> None:
+    """The built-in shm_size '1g' reaches the spec, not the ContainerSpec
+    None default: the field is non-optional in config but optional in the
+    spec, so a builder that never reads it would yield None."""
+    # Arrange
+    resolved = _resolved_tool()
+    assert resolved.values["shm_size"] == "1g"
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert spec.shm_size == "1g"
+
+
+def test_expose_host_port_int_publishes_that_host_port() -> None:
+    """An int expose_host_port publishes exactly that host port, read from
+    values \u2014 never copied from container_port or allocated from
+    port_range."""
+    # Arrange
+    resolved = _resolved_tool_exposed(_HOST_PORT)
+    assert resolved.values["expose_host_port"] == _HOST_PORT
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert spec.published_port == _HOST_PORT
+    assert spec.published_port != spec.container_port
+
+
+@pytest.mark.parametrize(
+    "expose",
+    [
+        pytest.param(False, id="false"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_expose_host_port_false_and_null_publish_nothing(expose: bool | None) -> None:
+    """False and null expose_host_port both publish nothing: published_port
+    is None while the container port is still set \u2014 null follows the
+    schema's convention that an authored null takes the benign default, so a
+    builder that raises on it or publishes something breaks valid config."""
+    # Arrange
+    resolved = _resolved_tool_exposed(expose)
+    assert resolved.values["expose_host_port"] is expose
+    # Act
+    builder = _build_container_spec()
+    spec = builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    assert spec.published_port is None
+    assert spec.container_port == 8080
+
+
+def test_expose_host_port_true_raises_naming_the_missing_allocator() -> None:
+    """True means "publish" with no port named and no allocator exists
+    (plan \u00a76.4): the builder raises a ValueError naming the gap, not
+    an invented allocation policy."""
+    # Arrange
+    resolved = _resolved_tool_exposed(True)
+    assert resolved.values["expose_host_port"] is True
+    # Act
+    builder = _build_container_spec()
+    with pytest.raises(ValueError) as excinfo:
+        builder(resolved, _backend_config(), IMAGE)
+    # Assert
+    message = str(excinfo.value)
+    assert TOOL in message
+    assert "expose_host_port" in message
+    assert "port_range" in message
+
+
+def test_expose_host_port_true_and_one_are_not_interchangeable() -> None:
+    """The boolean True and the integer 1 are equal in Python, but must
+    behave completely differently: 1 publishes port 1, True raises \u2014
+    a naive isinstance(v, int) check cannot tell them apart."""
+    # Arrange
+    resolved_one = _resolved_tool_exposed(1)
+    resolved_true = _resolved_tool_exposed(True)
+    assert resolved_one.values["expose_host_port"] == 1
+    assert resolved_true.values["expose_host_port"] is True
+    # Act
+    builder = _build_container_spec()
+    spec_one = builder(resolved_one, _backend_config(), IMAGE)
+    with pytest.raises(ValueError):
+        builder(resolved_true, _backend_config(), IMAGE)
+    # Assert
+    assert spec_one.published_port == 1
