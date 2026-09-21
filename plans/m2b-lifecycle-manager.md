@@ -76,8 +76,19 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 |---|---|---|---|---|
 | 5 | `ToolState` — six members | `9d10ee2` | `b070cc2` | 1579 passed, 2 skipped |
 | 6 | `ModelRuntimeState` — seven fields | `7ce868b` | `87a1cef` | 1586 passed, 2 skipped |
-| 7 | The transition table | | | |
-| 8 | Transitions are logged | | | |
+| 7 | The transition table | `a5a6dfe` | `d5e1079` | 1661 passed, 2 skipped |
+| 8 | Transitions are logged | `1a6b4ff` | `ac5c39c` | 1698 passed, 2 skipped |
+
+**Slice B's implementation is complete.** Remaining: documentation, then the stacked
+pull request.
+
+Two tests in slice B assert an *absence* and therefore pass before their feature exists,
+which would normally make them worthless as red steps. Both were checked by injecting the
+mistake they target rather than trusting the green result: moving the log call above the
+legality check turns all 37 cases in
+[`test_transition_logging.py`](../tests/unit/lifecycle/test_transition_logging.py) red,
+including the 26 that assert a refused transition leaves no record. The same technique
+verified slice A's two guards.
 
 Two plan errors were found by subtasks checking this document against the source rather
 than trusting it, and both are corrected above: §6.10's field arithmetic (`2a832e9`), and
