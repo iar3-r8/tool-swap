@@ -17,10 +17,12 @@ and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
 and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
 shell with the import-linter contract, behaviours 20–27. `isinstance(backend, ContainerBackend)`
 is `True` for both, and "the only module that imports the Docker
-SDK" is now enforced rather than hoped for. What this page does **not**
-contain is the M2b tool state machine — `STOPPED`, `STARTING`,
-`LOADING`, `READY` — which does not exist. This page documents what
-is here, and says explicitly where it stops.
+SDK" is now enforced rather than hoped for. The layer **above** the
+seam — the config to `ContainerSpec` builder, M2b slice A — is
+[documented on its own page](spec-builder.md), and what this page
+does **not** contain is the M2b tool state machine — `STOPPED`,
+`STARTING`, `LOADING`, `READY` — which does not exist. This page
+documents what is here, and says explicitly where it stops.
 
 The design is specified in
 [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
@@ -45,11 +47,15 @@ flowchart LR
         DOCK[docker_backend.py: DockerBackend, behaviours 20–26 — the only module that may import the Docker SDK]
         DOCKT[docker_backend.py: build_run_kwargs and map_sdk_error, behaviours 14–19, the pure half]
     end
+    subgraph lifc[lifecycle — M2b slice A, the layer above the seam]
+        SPEC[spec_builder.py: build_container_spec, the config → ContainerSpec conversion]
+    end
     subgraph future[later branches and milestones — not shipped]
         LIFE[M2b: LifecycleManager, the tool state machine]
         BLD[M5: build and BuildSpec]
     end
-    VAL -. "ParsedMount, consumed by the config-to-spec builder (not shipped)" .-> TYPES
+    VAL -->|ParsedMount| SPEC
+    SPEC -->|produces| TYPES
     DEF -. "resolved values, passed in by callers" .-> HELPER
     TYPES --> PROTO
     HELPER --> PROTO
@@ -73,7 +79,13 @@ half `DOCKT` (plan §4.5) — `start` unpacks
 output into `create`, and every method routes exceptions through
 [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) —
 and it is the only module that may import the SDK (the fifth
-`.importlinter` contract, behaviour 27).
+`.importlinter` contract, behaviour 27). `SPEC` sits in its own
+subgraph because it is M2b's layer **above** the seam, not a seam
+module: it produces the `ContainerSpec` the seam consumes, from
+[`parse_mount`](../src/tool_swap/config/validate.py:2488)'s
+`ParsedMount`, and
+[its page](spec-builder.md) documents the conversion and the two
+refusals that keep it honest.
 
 ## What is in the tree
 
@@ -184,9 +196,15 @@ The seam's value is as much in what it refuses to do.
   re-doing any of them in the backend is exactly the duplication the
   seam was amended to prevent. A source-level guard test walks
   `src/tool_swap/backend/` on every run and fails if a second parser
-  appears. The single `ParsedMount` → `MountSpec` conversion happens in
-  the config-to-spec builder, which does not ship on this branch — so
-  there is currently no conversion in the tree at all.
+  appears — and since M2b slice A, a second guard walks
+  `src/tool_swap/lifecycle/` for the same reason. The single
+  `ParsedMount` → `MountSpec` conversion happens in the
+  config-to-spec builder,
+  [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19),
+  which **does ship** — it is in the tree, it has no caller yet
+  (the `LifecycleManager` is M2b slice D), and
+  [its page](spec-builder.md) documents the conversion, the
+  resolution base and the two source-level guards.
 - **No configured default is re-stated.** `gpu_runtime`,
   `container_port`, `label_namespace` and `container_prefix` all live
   in [`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:20);
@@ -752,6 +770,10 @@ Two honest limits on the table:
 
 ## Where to go deeper
 
+- [`docs/spec-builder.md`](spec-builder.md) — the config to
+  `ContainerSpec` builder (M2b slice A): how each spec field is
+  assembled, the `BackendConfig`-not-`values` trap, the mount
+  conversion and its refusals, and the two guards.
 - [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md) —
   the design decisions behind every type and rule on this page, with
   the per-behaviour ledger (§5) and what M2b will need from the seam
