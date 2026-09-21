@@ -116,7 +116,7 @@ has been amended into its green.
 
 ## 1. Design
 
-### 1.1 The tool state machine — six states, eleven edges
+### 1.1 The tool state machine — six states, ten edges
 
 Transcribed from [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md:183) §4. This is
 **not** `ContainerState`, which has four members and answers only "does a process
@@ -150,6 +150,16 @@ stateDiagram-v2
 | `STOPPING` | `STOPPED` | the backend `stop` returned |
 | `FAILED` | `STARTING` | `ensure_ready` retries |
 | `FAILED` | `STOPPED` | manual reset |
+
+**Ten edges, and the count matters** because behaviour 7's test is arithmetic: ten legal
+pairs and twenty-six illegal ones out of thirty-six. This section said "eleven" until
+behaviour 7's red step was delegated, when the table was counted and found to hold ten
+rows. The miscount came from the diagram above, which carries eleven arrows — but
+`[*] --> STOPPED` is mermaid's **initial pseudo-state marker**, not a transition: it says
+a tool begins life `STOPPED`, which is an initial condition rather than something the
+transition function can be asked to perform. Counting it would have made the test expect
+eleven legal pairs and twenty-five illegal, and the missing pair would have been
+whichever one the implementer happened to add.
 
 Everything else is illegal and raises. **There is no edge into `READY` that bypasses the
 probe**, which is why reconciliation adopts a container by walking
@@ -574,11 +584,11 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 7. The transition table, and illegal transitions raise
 
 - **Inputs:** a from-state and a to-state.
-- **Outputs:** a pure predicate over the eleven edges of
-  [§1.1](#11-the-tool-state-machine--six-states-eleven-edges), plus an `apply` that
+- **Outputs:** a pure predicate over the ten edges of
+  [§1.1](#11-the-tool-state-machine--six-states-ten-edges), plus an `apply` that
   returns the new state.
-- **Edge cases:** the test is **exhaustive over all 36 ordered pairs** — eleven legal,
-  twenty-five illegal — because a table with a missing edge and a table with a spurious
+- **Edge cases:** the test is **exhaustive over all 36 ordered pairs** — ten legal,
+  twenty-six illegal — because a table with a missing edge and a table with a spurious
   one are both silently wrong under any sampled test. Self-transitions are illegal
   (`READY → READY` must not silently re-ready a tool); `STARTING → STOPPED` is illegal and
   the test notes it as M6's `vram_unavailable` path rather than an oversight.
@@ -914,7 +924,7 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
   container is started**: the journal shows zero `start` calls, which is the property that
   makes adoption adoption rather than a restart.
 - **Edge cases:** adoption **goes through the probe progression** rather than assigning
-  `READY` directly ([§1.1](#11-the-tool-state-machine--six-states-eleven-edges)) — a
+  `READY` directly ([§1.1](#11-the-tool-state-machine--six-states-ten-edges)) — a
   container that is running but not ready must end `LOADING` or `FAILED`, never `READY`,
   because a router that adopts a still-loading container as ready proxies into a 503. An
   adopted container that fails its probe ends `FAILED` and is **not** stopped: it may be
@@ -967,7 +977,7 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 - **Outputs:** Google-style module docstrings for `spec_builder.py`, `states.py`,
   `probes.py`, `manager.py` and `reconcile.py`, each stating the module's responsibility
   and its boundary; a `docs/lifecycle.md` with the **mermaid state diagram** of
-  [§1.1](#11-the-tool-state-machine--six-states-eleven-edges); a troubleshooting section
+  [§1.1](#11-the-tool-state-machine--six-states-ten-edges); a troubleshooting section
   covering container start failures, probe timeouts and reconciliation edge cases; and the
   docker-testing note, which must say plainly that **M2b runs no daemon tests** and name
   `TSWAP_TEST_DOCKER_HOST` as the future switch.
@@ -1227,7 +1237,7 @@ extension. It genuinely solves behaviours 7–8.
 
 **It is not planned in**, for three reasons: D-B forbids a new package in M2b; it depends
 on `six`, adding a transitive dependency to a project with six declared ones; and the
-machine here is six states and eleven edges, so a dict of legal transitions is smaller than
+machine here is six states and ten edges, so a dict of legal transitions is smaller than
 the adapter layer would be. Recorded rather than left unmentioned, so a later reviewer sees
 the reuse question was asked and answered. **No behaviour in this plan needs a package
 beyond the declared set.**
