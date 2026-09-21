@@ -106,7 +106,7 @@ reason M2a §0.2 records: `GITHUB_TOKEN` is set-but-empty in this dev container,
 only credential helper is VS Code's interactive one, terminal prompts are disabled and
 there is no `gh` CLI. The token is written into no config file.
 
-**Slice B branches from `6d17990`, not from `main`.** Pull request #14's head *is*
+**Slice B branches from slice A's tip, not from `main`.** Pull request #14's head *is*
 `feature/m2b-spec-builder`, so continuing to commit there would absorb slice B into the
 open pull request and destroy the split — the mistake M2a's §0.1.2 nearly made. Slice B
 is stacked, and a stacked pull request runs no CI until it is retargeted to `main` on its
