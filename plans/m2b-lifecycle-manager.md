@@ -61,12 +61,28 @@ was pushed; the milestone name is kept for pull-request titles.
 Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2 skipped**,
 `make lint` clean with mypy strict over 38 source files, `lint-imports` 5 kept, 0 broken.
 
+**Slice A** — `feature/m2b-spec-builder`:
+
 | # | Behaviour | Red | Green | Suite at green |
 |---|---|---|---|---|
 | 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
 | 2 | `ParsedMount` → `MountSpec` | `03b3b00` | `c979b2a` | 1546 passed, 2 skipped |
 | 3 | Resource, env and port passthrough | `d6a2d99` | `325bb3d` | 1555 passed, 2 skipped |
 | 4 | The builder's two guards | `ada2dea` | `7478dc9` | 1570 passed, 2 skipped |
+
+**Slice B** — `feature/m2b-state-machine`, stacked on slice A's tip `af00e89`:
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 5 | `ToolState` — six members | `9d10ee2` | `b070cc2` | 1579 passed, 2 skipped |
+| 6 | `ModelRuntimeState` — seven fields | `7ce868b` | `87a1cef` | 1586 passed, 2 skipped |
+| 7 | The transition table | | | |
+| 8 | Transitions are logged | | | |
+
+Two plan errors were found by subtasks checking this document against the source rather
+than trusting it, and both are corrected above: §6.10's field arithmetic (`2a832e9`), and
+behaviour 6's claim that the dataclass rejects an inconsistent handle, which contradicted
+its own error-behaviour line.
 
 **Slice A is complete and shipped as
 [#14](https://github.com/iar3-r8/tool-swap/pull/14)**, open against `main`. Head
@@ -539,8 +555,15 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 - **Edge cases:** it is **mutable** (`plan/06` §9's sketch is a plain `@dataclass`,
   unfrozen), unlike every M2a type — the manager updates it in place, and freezing it
   would mean reallocating on every request completion. `handle` is `None` exactly when no
-  container exists, which the state machine must keep consistent: a test asserts
-  `STOPPED` with a non-`None` handle is rejected.
+  container exists, and **that invariant belongs to the transitions, not to this class.**
+  This line previously said a test asserts `STOPPED` with a non-`None` handle "is
+  rejected", which contradicted the *"Error behaviour: n/a — a data holder"* line below
+  it, and the enforcement would have been illusory: the manager mutates these objects in
+  place, so a `__post_init__` check would pass construction and the invariant could break
+  immediately afterwards. A half-enforced invariant is worse than an unenforced one,
+  because the next reader trusts it. The shipped test therefore pins that construction
+  **stores what it is given**, and is named for that, so it fails if someone later adds
+  the validator this line used to imply. Behaviours 7 and 8 own the consistency.
 - **Error behaviour:** n/a — a data holder.
 - **Files:** `src/tool_swap/lifecycle/states.py`.
 - **Verified:** construction and default test, plus the field-set pin recording that
