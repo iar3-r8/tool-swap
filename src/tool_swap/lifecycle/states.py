@@ -1,4 +1,4 @@
-"""Tool-level lifecycle states (m2b plan §3, behaviour 5).
+"""Tool-level lifecycle states (m2b plan §3, behaviours 5 and 6).
 
 Answers "can this tool serve traffic" (only ``READY`` does), which is
 deliberately distinct from ``ContainerState`` in
@@ -11,7 +11,10 @@ backend seam. A ``StrEnum`` so members compare equal to the bare
 strings used in CLI output and persisted state.
 """
 
+from dataclasses import dataclass
 from enum import StrEnum
+
+from tool_swap.backend.base import ContainerHandle
 
 
 class ToolState(StrEnum):
@@ -29,3 +32,18 @@ class ToolState(StrEnum):
     READY = "ready"
     STOPPING = "stopping"
     FAILED = "failed"
+
+
+@dataclass
+class ModelRuntimeState:
+    """Mutable per-tool runtime facts, updated in place on every completion —
+    frozen would mean reallocating each time. ``last_error`` holds the
+    backend error's ``message`` verbatim, not ``str(err)``."""
+
+    tool: str
+    state: ToolState
+    handle: ContainerHandle | None  # None unless a container exists
+    last_used: float  # clock.now() on request completion
+    became_ready_at: float | None
+    inflight: int
+    last_error: str | None  # the taxonomy member's message, verbatim
