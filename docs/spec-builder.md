@@ -1,32 +1,37 @@
 # The config to ContainerSpec builder
 
-Every tool container the router starts is described by one
-[`ContainerSpec`](../src/tool_swap/backend/base.py:49). This page
-documents the function that assembles it:
-[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19),
-which turns resolved configuration into the spec the backend seam
-consumes.
+The router runs each tool inside its own container. Starting that
+container needs a precise recipe: which image, what name, which
+network, which host directories get mounted and in what mode, which
+environment variables, which GPUs. This page documents the function
+that writes that recipe —
+[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19)
+— which takes the tool's resolved configuration and the `backend:`
+block from your config file and returns the complete start
+instructions, a
+[`ContainerSpec`](../src/tool_swap/backend/base.py:49).
 
-**Status: slice A of M2b, shipped — the layer above the seam.** The
-function is pure: two config objects and an image reference in, one
-`ContainerSpec` out. It is the **only place a `ParsedMount` becomes a
-`MountSpec`**, so it is the only place the `mode → read_only`
-normalisation can live. It has **no caller yet**: the `LifecycleManager`
-that consumes it arrives in slice D, and nothing in the shipped tree
-calls `build_container_spec` today.
-[The backend seam page](backend-seam.md) documents what the spec is
-consumed *by*; this page documents how the spec is *built*, and it says
-explicitly where it stops.
+Without it, whatever code starts the container would have to work out
+for itself how the container is named, which labels mark it as
+tool-swap's, how environment values are coerced, where relative mount
+paths resolve from, and which host port is published — and each of
+those decisions could drift. The builder is the single place where the
+YAML you wrote in your config file and the container you see running
+in `docker ps` meet.
 
-The design is in
-[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
-§3 slice A for the behaviours,
-[D-D](../plans/m2b-lifecycle-manager.md:1059) and
-[D-E](../plans/m2b-lifecycle-manager.md:1068) for the two settled
-refusals, and
-[§6.3](../plans/m2b-lifecycle-manager.md:1139) and
-[§6.4](../plans/m2b-lifecycle-manager.md:1161) for the two config-layer
-gaps this function works around rather than fixes.
+**Where it sits:** you write the tool and the `backend:` block in your
+config file (the [Configuration guide](configuration-guide.md)
+covers that); this function turns the resolved result of that config
+into a `ContainerSpec`; and [the backend seam
+page](backend-seam.md) documents what consumes that spec to actually
+start, stop and inspect the container. If you do not yet know what the
+`backend:` block looks like, start with the Configuration guide.
+
+One honest caveat before the detail: **nothing in the shipped tree
+calls this function yet.** The component that will use it, the
+`LifecycleManager`, is planned but not built, so no container has been
+started through this path. The rest of the page documents the
+function in full, and says explicitly where it stops.
 
 ## The function
 
@@ -44,31 +49,15 @@ def build_container_spec(
 resolved values, [`cfg`](../src/tool_swap/config/schema.py:95) is the
 `backend:` block as its own object, `image` is the resolved image
 reference, and `config_dir` — **the config file's directory** — is the
-base relative mount hosts resolve against. Every spec field:
-
-| Spec field | Comes from | Note |
-|---|---|---|
-| `tool` | `resolved.name` | — |
-| `name` | [`container_name`](../src/tool_swap/backend/labels.py:111)(`cfg.container_prefix`, `tool`) | a name the helper rejects propagates as the same `ValueError` — it already names the prefix, the tool and the rule |
-| `image` | the `image` argument | an empty image raises `ValueError` naming the tool here, rather than reaching the backend's run-kwargs construction |
-| `container_port` | `resolved.values["container_port"]` | read from `values` because `BackendConfig` has **no** `container_port` field — it is a tool-level default; a non-int value raises `TypeError` naming the type it got |
-| `gpu_runtime` | `cfg.gpu_runtime` | |
-| `network` | `cfg.network` | |
-| `labels` | [`managed_labels`](../src/tool_swap/backend/labels.py:54)(`cfg.label_namespace`, `tool`) | |
-| `env` | `resolved.values["env"]` | every value coerced with `str()` — the schema types the dict `dict[str, Any]`, and a container cannot read a non-string; a non-mapping raises `TypeError` |
-| `devices` | `resolved.values["devices"]` | a tuple of ints in **authored order** — not sorted away, because the order is a real allocation; a non-int entry raises `TypeError` |
-| `cpus` | `resolved.values["cpus"]` | verbatim; `null` → `None`, which leaves it unlimited |
-| `memory` | `resolved.values["memory"]` | the size string verbatim — the SDK's `parse_bytes` parses it, not this function, so an authored `16zz` passes here and fails at the daemon call with the SDK's message (the [knowingly-brittle note on the seam page](backend-seam.md#two-things-documented-as-knowingly-brittle)) |
-| `shm_size` | `resolved.values["shm_size"]` | the config field is a non-optional string with built-in `"1g"`, so a tool configuring nothing gets `"1g"`, **never** the spec's `None` default — a `None` reaching the spec would read as a legitimate "unset" |
-| `mounts` | `resolved.values["mounts"]` through [`parse_mount`](../src/tool_swap/config/validate.py:2488) | see [Mounts](#mounts-one-conversion-three-refusals) |
-| `published_port` | `resolved.values["expose_host_port"]` | see [The published port](#the-published-port-four-forms-two-of-them-worth-explaining) |
+base relative mount hosts resolve against.
 
 ## The concrete through-line: authored YAML to `ContainerSpec`
 
-The rules above describe the mapping; this section shows it happening.
-A complete, validated config — the same `backend:` block as the
-committed [`tools.example.yaml`](../tools.example.yaml), a `defaults:`
-block with `env` and both mount forms, one tool:
+This section shows the whole thing happening on one real config
+before the exhaustive field table. A complete, validated config — the
+same `backend:` block as the committed
+[`tools.example.yaml`](../tools.example.yaml), a `defaults:` block
+with `env` and both mount forms, one tool:
 
 ```yaml
 # tools.yaml
@@ -160,6 +149,51 @@ Read it against the config, field by field:
 The `backend:` values reach the spec because the builder takes
 `BackendConfig` as a separate argument — the resolver never merged
 them; see [the trap](#the-trap-backendconfig-never-values) below.
+
+## Status and design sources
+
+**Status: slice A of M2b, shipped — the layer above the seam.** M2b is
+the project plan's milestone for the lifecycle layer, and "slice A" is
+this branch's share of it. The function is pure: two config objects
+and an image reference in, one `ContainerSpec` out. It is the **only
+place a `ParsedMount` becomes a `MountSpec`**, so it is the only place
+the `mode → read_only` normalisation can live. It has **no caller
+yet**: the `LifecycleManager` that consumes it arrives in slice D, and
+nothing in the shipped tree calls `build_container_spec` today.
+[The backend seam page](backend-seam.md) documents what the spec is
+consumed *by*; this page documents how the spec is *built*, and it
+says explicitly where it stops.
+
+The design is in
+[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
+§3 slice A for the behaviours,
+[D-D](../plans/m2b-lifecycle-manager.md:1059) and
+[D-E](../plans/m2b-lifecycle-manager.md:1068) for the two settled
+refusals (the illegal mount mode, and `expose_host_port: true`), and
+[§6.3](../plans/m2b-lifecycle-manager.md:1139) and
+[§6.4](../plans/m2b-lifecycle-manager.md:1161) for the two config-layer
+gaps this function works around rather than fixes.
+
+## The field mapping
+
+Every spec field:
+
+| Spec field | Comes from | Note |
+|---|---|---|
+| `tool` | `resolved.name` | — |
+| `name` | [`container_name`](../src/tool_swap/backend/labels.py:111)(`cfg.container_prefix`, `tool`) | a name the helper rejects propagates as the same `ValueError` — it already names the prefix, the tool and the rule |
+| `image` | the `image` argument | an empty image raises `ValueError` naming the tool here, rather than reaching the backend's run-kwargs construction |
+| `container_port` | `resolved.values["container_port"]` | read from `values` because `BackendConfig` has **no** `container_port` field — it is a tool-level default; a non-int value raises `TypeError` naming the type it got |
+| `gpu_runtime` | `cfg.gpu_runtime` | |
+| `network` | `cfg.network` | |
+| `labels` | [`managed_labels`](../src/tool_swap/backend/labels.py:54)(`cfg.label_namespace`, `tool`) | |
+| `env` | `resolved.values["env"]` | every value coerced with `str()` — the schema types the dict `dict[str, Any]`, and a container cannot read a non-string; a non-mapping raises `TypeError` |
+| `devices` | `resolved.values["devices"]` | a tuple of ints in **authored order** — not sorted away, because the order is a real allocation; a non-int entry raises `TypeError` |
+| `cpus` | `resolved.values["cpus"]` | verbatim; `null` → `None`, which leaves it unlimited |
+| `memory` | `resolved.values["memory"]` | the size string verbatim — the SDK's `parse_bytes` parses it, not this function, so an authored `16zz` passes here and fails at the daemon call with the SDK's message (the [knowingly-brittle note on the seam page](backend-seam.md#two-things-documented-as-knowingly-brittle)) |
+| `shm_size` | `resolved.values["shm_size"]` | the config field is a non-optional string with built-in `"1g"`, so a tool configuring nothing gets `"1g"`, **never** the spec's `None` default — a `None` reaching the spec would read as a legitimate "unset" |
+| `mounts` | `resolved.values["mounts"]` through [`parse_mount`](../src/tool_swap/config/validate.py:2488) | see [Mounts](#mounts-one-conversion-three-refusals) |
+| `published_port` | `resolved.values["expose_host_port"]` | see [The published port](#the-published-port-four-forms-two-of-them-worth-explaining) |
 
 ## What goes wrong
 

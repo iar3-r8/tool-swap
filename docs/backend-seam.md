@@ -1,34 +1,45 @@
 # The container backend seam
 
-Everything in this repository that starts, stops, inspects or lists a
-tool's container goes through one interface: the `ContainerBackend`
-protocol. This guide describes that seam — its data types, its naming
-and labelling rules, its error taxonomy, and the boundary that keeps
-the container runtime contained in one place.
+Everything in this repository that talks to Docker — starts, stops,
+inspects or lists a tool's container — goes through one small
+interface, the [`ContainerBackend`](../src/tool_swap/backend/base.py:171)
+protocol. That single boundary is the whole point: the rest of the
+system never touches Docker directly, so the backend can be tested
+without a container daemon at all (with an in-memory fake) and could
+be pointed at a different container runtime without rewriting the
+router.
 
-**Status: both implementations of the seam are shipped.** The data
-types, the helpers, the protocol declaration and the error taxonomy
-are in the tree, and both protocol implementations are: the
-in-memory `FakeBackend` (plan behaviours 10–13) and the Docker
-backend, which landed in two slices on the same milestone branch —
-the pure translation layer, behaviours 14–19
-([`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)
-and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
-and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
-shell with the import-linter contract, behaviours 20–27. `isinstance(backend, ContainerBackend)`
-is `True` for both, and "the only module that imports the Docker
-SDK" is now enforced rather than hoped for. The layer **above** the
-seam — the config to `ContainerSpec` builder, M2b slice A — is
-[documented on its own page](spec-builder.md), and what this page
-does **not** contain is the M2b tool state machine — `STOPPED`,
-`STARTING`, `LOADING`, `READY` — which does not exist. This page
-documents what is here, and says explicitly where it stops.
+Without it, Docker knowledge would be scattered everywhere: mount
+strings parsed in three places, container names built in five, one
+SDK exception type handled differently per call site. The seam
+contains all of it in one place, and this page documents that place —
+its data types, its naming and labelling rules, its error taxonomy,
+and the enforcement that keeps the Docker SDK contained inside one
+module.
 
-The design is specified in
-[`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
-(§4 for the design, §5 for the behaviour ledger); the interface it
-implements was first sketched in
-[`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §12.
+**Where it sits:** the config layer above it resolves your YAML; the
+[spec builder page](spec-builder.md) turns that resolution into a
+`ContainerSpec`; the seam consumes the spec to actually start, stop
+and inspect the container; and the [Configuration
+guide](configuration-guide.md) covers the `backend:` block whose
+values the seam reads. This page is reference material for the shipped
+seam — read the opening sections for the shape of it, then use the
+tables below as lookup.
+
+## What is in the tree
+
+The seam is five modules, all under `src/tool_swap/backend/`, plus
+both implementations of the protocol. The "behaviours N–M" numbers in
+the table are entries of the plan's ledger, glossed in
+[Status and design sources](#status-and-design-sources) below:
+
+| Module | Contents |
+|---|---|
+| [`base.py`](../src/tool_swap/backend/base.py) | [`MountSpec`](../src/tool_swap/backend/base.py:27), [`ContainerSpec`](../src/tool_swap/backend/base.py:49), [`ContainerHandle`](../src/tool_swap/backend/base.py:107), [`ContainerState`](../src/tool_swap/backend/base.py:129), [`ContainerStatus`](../src/tool_swap/backend/base.py:147), and the [`ContainerBackend`](../src/tool_swap/backend/base.py:171) protocol |
+| [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
+| [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
+| [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
+| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) — the pure half, behaviours 14–19 — and [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746), the thin shell over them, behaviours 20–26 |
 
 ## The shape of the seam
 
@@ -86,19 +97,6 @@ module: it produces the `ContainerSpec` the seam consumes, from
 `ParsedMount`, and
 [its page](spec-builder.md) documents the conversion and the two
 refusals that keep it honest.
-
-## What is in the tree
-
-The seam is five modules, all under `src/tool_swap/backend/`, plus
-both implementations of the protocol:
-
-| Module | Contents |
-|---|---|
-| [`base.py`](../src/tool_swap/backend/base.py) | [`MountSpec`](../src/tool_swap/backend/base.py:27), [`ContainerSpec`](../src/tool_swap/backend/base.py:49), [`ContainerHandle`](../src/tool_swap/backend/base.py:107), [`ContainerState`](../src/tool_swap/backend/base.py:129), [`ContainerStatus`](../src/tool_swap/backend/base.py:147), and the [`ContainerBackend`](../src/tool_swap/backend/base.py:171) protocol |
-| [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
-| [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
-| [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
-| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) — the pure half, behaviours 14–19 — and [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746), the thin shell over them, behaviours 20–26 |
 
 ## The data types
 
@@ -697,6 +695,35 @@ deletion — deleting the already-loaded `docker*` entries is not
 enough, because a fresh import would simply find the SDK again on
 the path. The fake stays usable in an environment with no SDK
 installed at all, which is what it exists for.
+
+## Status and design sources
+
+**Status: both implementations of the seam are shipped.** The data
+types, the helpers, the protocol declaration and the error taxonomy
+are in the tree, and both protocol implementations are: the
+in-memory `FakeBackend` (plan behaviours 10–13) and the Docker
+backend, which landed in two slices on the same milestone branch —
+the pure translation layer, behaviours 14–19
+([`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)
+and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
+and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
+shell with the import-linter contract, behaviours 20–27. "Behaviours"
+are the numbered entries of the plan's ledger — the unit of work
+each test cycle implements and pins. `isinstance(backend,
+ContainerBackend)` is `True` for both, and "the only module that
+imports the Docker SDK" is now enforced rather than hoped for. The
+layer **above** the seam — the config to `ContainerSpec` builder,
+M2b slice A — is [documented on its own page](spec-builder.md), and
+what this page does **not** contain is the M2b tool state machine —
+`STOPPED`, `STARTING`, `LOADING`, `READY` — which does not exist.
+This page documents what is here, and says explicitly where it
+stops.
+
+The design is specified in
+[`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
+(§4 for the design, §5 for the behaviour ledger); the interface it
+implements was first sketched in
+[`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §12.
 
 ## Troubleshooting: container start failures
 
