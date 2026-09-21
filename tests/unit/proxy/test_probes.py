@@ -15,6 +15,7 @@ import ast
 import dataclasses
 import importlib
 import inspect
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final, cast, get_type_hints
@@ -111,9 +112,18 @@ def _sig(signature: inspect.Signature) -> list[tuple[str, int]]:
     return [(p.name, int(p.kind.value)) for p in signature.parameters.values()]
 
 
-def _guard_detectors() -> tuple[Path, Any, Any]:
+_SourceReader = Callable[[], str]
+_MessageScanner = Callable[[ast.Module], list[str]]
+
+
+def _guard_detectors() -> tuple[Path, _SourceReader, _MessageScanner]:
     """(probes path, probes_source, http_import_messages) from the
     detector module, importing it at call time.
+
+    The two detector slots are values, not callables: probes_source is
+    a zero-arg source reader, http_import_messages takes an
+    ast.Module. An Any slot would let a dropped call slip past the
+    type checker.
 
     Raises:
         AssertionError: the detector module or a detector is missing.
@@ -411,7 +421,8 @@ def test_probes_py_imports_no_http_library() -> None:
         "src/tool_swap/proxy/probes.py before the guard can police it"
     )
     # Act
-    found = messages(ast.parse(source, filename=str(probes_path)))
+    tree = ast.parse(source(), filename=str(probes_path))
+    found = messages(tree)
     # Assert
     assert not found, (
         f"HTTP library imports found in src/tool_swap/proxy/probes.py: "
