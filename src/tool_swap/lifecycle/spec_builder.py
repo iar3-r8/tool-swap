@@ -1,8 +1,8 @@
 """The config -> ContainerSpec builder (m2b plan §3).
 
-Core assembly (behaviour 1) plus the ParsedMount -> MountSpec conversion
-(behaviour 2); the resource, environment and port fields (behaviour 3)
-keep their ContainerSpec defaults here.
+Core assembly (behaviour 1), the ParsedMount -> MountSpec conversion
+(behaviour 2) and the resource, environment and port fields
+(behaviour 3).
 """
 
 from __future__ import annotations
@@ -26,9 +26,10 @@ def build_container_spec(
     """Assemble the core ContainerSpec from both config blocks.
 
     Raises ValueError for an empty image, an unparseable mount entry, a
-    mount mode outside ro/rw (D-D), or mounts without a config_dir; a
-    name container_name rejects propagates unchanged. The backend-named
-    values come from cfg, never resolved.values (plan §6.3).
+    mount mode outside ro/rw (D-D), mounts without a config_dir, or an
+    expose_host_port of true (no allocator exists); a name container_name
+    rejects propagates unchanged. The backend-named values come from cfg,
+    never resolved.values (plan §6.3).
     """
     tool = resolved.name
     if not image:
@@ -47,9 +48,15 @@ def build_container_spec(
         image=image,
         gpu_runtime=cfg.gpu_runtime,
         container_port=port,
+        env=_env_map(resolved),
+        devices=_devices(resolved),
         labels=managed_labels(cfg.label_namespace, tool),
         network=cfg.network,
         mounts=_mount_specs(resolved, config_dir),
+        cpus=_cpus(resolved),
+        memory=_memory(resolved),
+        shm_size=_shm_size(resolved),
+        published_port=_published_port(resolved),
     )
 
 
@@ -105,3 +112,122 @@ def _mount_specs(
             )
         )
     return tuple(specs)
+
+
+def _env_map(resolved: ResolvedTool) -> dict[str, str]:
+    """The authored env as str -> str (plan §3.3).
+
+    Values are coerced with str(): the config types the dict as
+    dict[str, Any], and a container cannot read a non-string value.
+
+    Raises:
+        TypeError: env is not a mapping.
+    """
+    raw = resolved.values["env"]
+    if not isinstance(raw, dict):
+        raise TypeError(
+            f"env for tool {resolved.name!r} must be a mapping, "
+            f"got {type(raw).__name__}"
+        )
+    return {key: str(value) for key, value in raw.items()}
+
+
+def _devices(resolved: ResolvedTool) -> tuple[int, ...]:
+    """The authored GPU indices as a tuple, in authored order (plan §3.3):
+    the order is not sorted away, because it is a real allocation.
+
+    Raises:
+        TypeError: devices is not a list of ints.
+    """
+    tool = resolved.name
+    raw = resolved.values["devices"]
+    if not isinstance(raw, list):
+        raise TypeError(
+            f"devices for tool {tool!r} must be a list of int, got {type(raw).__name__}"
+        )
+    for device in raw:
+        if not isinstance(device, int):
+            raise TypeError(
+                f"devices for tool {tool!r} must be a list of int, "
+                f"got {type(device).__name__} entry"
+            )
+    return tuple(raw)
+
+
+def _cpus(resolved: ResolvedTool) -> float | None:
+    """The authored CPU limit, verbatim (plan §3.3); null leaves it
+    unlimited.
+
+    Raises:
+        TypeError: cpus is neither a number nor null.
+    """
+    raw = resolved.values["cpus"]
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return raw
+    raise TypeError(
+        f"cpus for tool {resolved.name!r} must be a number or null, "
+        f"got {type(raw).__name__}"
+    )
+
+
+def _memory(resolved: ResolvedTool) -> str | None:
+    """The authored memory limit, verbatim (plan §3.3): the size string
+    is parsed by the backend SDK, not here; null leaves it unlimited.
+
+    Raises:
+        TypeError: memory is neither a string nor null.
+    """
+    raw = resolved.values["memory"]
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    raise TypeError(
+        f"memory for tool {resolved.name!r} must be a string or null, "
+        f"got {type(raw).__name__}"
+    )
+
+
+def _shm_size(resolved: ResolvedTool) -> str:
+    """The shared-memory size, always set (plan §3.3): the config field
+    is non-optional with a built-in default, so a None reaching the spec
+    would read as a legitimate "unset".
+
+    Raises:
+        TypeError: shm_size is not a string.
+    """
+    raw = resolved.values["shm_size"]
+    if isinstance(raw, str):
+        return raw
+    raise TypeError(
+        f"shm_size for tool {resolved.name!r} must be a string, "
+        f"got {type(raw).__name__}"
+    )
+
+
+def _published_port(resolved: ResolvedTool) -> int | None:
+    """The host port from expose_host_port (plan §3.3): false and null
+    publish nothing (an authored null takes the benign default), an int
+    publishes exactly that port, never the container port.
+
+    Raises:
+        ValueError: the value is True — the schema promises
+            auto-allocation from backend.port_range, but no such
+            allocator exists.
+    """
+    raw = resolved.values["expose_host_port"]
+    # bool before int: True == 1 and isinstance(True, int), so a naive
+    # int check would publish port 1 (the C530/C531 precedent).
+    if isinstance(raw, bool):
+        if raw:
+            raise ValueError(
+                f"expose_host_port for tool {resolved.name!r} is true, "
+                "which promises auto-allocation from backend.port_range; "
+                "no allocator exists, so write an explicit port instead"
+            )
+        return None
+    if isinstance(raw, int):
+        return raw
+    return None
