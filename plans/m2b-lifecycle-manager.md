@@ -68,9 +68,22 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 | 3 | Resource, env and port passthrough | `d6a2d99` | `325bb3d` | 1555 passed, 2 skipped |
 | 4 | The builder's two guards | `ada2dea` | `7478dc9` | 1570 passed, 2 skipped |
 
-**Slice A's implementation is complete**: every behaviour has both a red and a green
-commit, and the suite is green at the branch tip. Remaining for the slice:
-documentation (behaviour 26's share for slice A), then the pull request.
+**Slice A is complete and shipped as
+[#14](https://github.com/iar3-r8/tool-swap/pull/14)**, open against `main`. Head
+`6d17990`, documentation commit `6d17990` preceding the pull request as behaviour 26
+requires. Every behaviour has both a red and a green commit, and the suite is green at
+the branch tip.
+
+The push used the `.roo/mcp.json` token through a one-shot `http.extraheader`, for the
+reason M2a §0.2 records: `GITHUB_TOKEN` is set-but-empty in this dev container, git's
+only credential helper is VS Code's interactive one, terminal prompts are disabled and
+there is no `gh` CLI. The token is written into no config file.
+
+**Slice B branches from `6d17990`, not from `main`.** Pull request #14's head *is*
+`feature/m2b-spec-builder`, so continuing to commit there would absorb slice B into the
+open pull request and destroy the split — the mistake M2a's §0.1.2 nearly made. Slice B
+is stacked, and a stacked pull request runs no CI until it is retargeted to `main` on its
+parent's merge ([§2.1](#21-branch-and-stacking-mechanics)).
 
 The guards were not taken on trust. A green guard and a blind guard are
 indistinguishable from the test output, so both were driven against a violation
