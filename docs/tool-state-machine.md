@@ -1,22 +1,63 @@
 # The tool state machine
 
-Every tool the router manages sits in one of six readiness states, and
-moves between them only along a table of ten legal edges. This page
-documents that machine — [`ToolState`](../src/tool_swap/lifecycle/states.py:35),
+The router runs each tool inside its own container, and that
+container's life has a long ramp-up: creating and starting the
+container takes a moment, and loading the model weights inside it
+takes longer still. So there is a long window in which the container
+is running but cannot answer anything, and then a point — and only a
+point — at which the tool is ready to serve. This page documents the
+part of the router that tracks where each tool is in that journey:
+the six states, the ten legal moves between them, the per-tool
+runtime facts the moves read, and the single function that moves a
+tool from one state to another —
+[`ToolState`](../src/tool_swap/lifecycle/states.py:35),
 [`ModelRuntimeState`](../src/tool_swap/lifecycle/states.py:53) and
 [`apply_transition`](../src/tool_swap/lifecycle/states.py:104) in
-[`states.py`](../src/tool_swap/lifecycle/states.py) — the layer that
-decides *when* a container should exist. The
-[spec builder page](spec-builder.md) documents the layer that decides
-*what* it should look like.
+[`states.py`](../src/tool_swap/lifecycle/states.py). The machine
+exists so the router has a typed, testable answer to *may a request
+go to this tool*: exactly one of its states means *ready to serve*,
+and every other state is a reason to queue or refuse.
 
-**Status: slice B of M2b, shipped — the machine, not its driver.** All
-four slice B behaviours (plan behaviours 5–8) are in the tree on
+Without it, the router has no way to tell `LOADING` from `READY` —
+to Docker they are the same thing, a container that is `running` —
+and a router that routed on container liveness alone would send
+requests into a process that is still loading weights, and be
+refused by it or made to hang until the load finishes. The machine
+is also the single place in the tree that records which states a
+tool may occupy and which moves are legal, so the component that
+will drive it — the `LifecycleManager`, planned but not built —
+never has to re-derive that knowledge by hand.
+
+**Where it sits:** the [spec builder
+page](spec-builder.md) documents the layer that decides *what* a
+tool's container should look like (the `ContainerSpec`); the
+[backend seam page](backend-seam.md) documents the layer that
+*starts* that container and reports whether its process is alive;
+this page documents the layer that decides *when* a container
+should exist at all. The other two pages are each about one
+container; this page is about one tool's journey through a sequence
+of them.
+
+One honest caveat before the detail: **nothing in the shipped tree
+drives this machine yet.** There is no `LifecycleManager`, no probe
+advancing the states, and no container has been started through
+this path. The machine — the states, the table, the holder, the
+transition function — is shipped and fully tested; its driver is
+not. The rest of the page documents the machine in full, and says
+explicitly where it stops.
+
+## Status and design sources
+
+**Status: slice B of M2b, shipped — the machine, not its driver.**
+M2b is the project plan's milestone for the lifecycle layer, and
+"slice B" is this branch's share of it. All four slice B behaviours
+(entries 5–8 of the plan's ledger) are in the tree on
 `feature/m2b-state-machine`, stacked on slice A. The module is pure:
 no daemon, no event loop, no I/O. It has **no caller yet**: the
-`LifecycleManager` that will drive it arrives in slice D, and nothing
-in the shipped tree calls `apply_transition` today. This page
-documents what is here, and says explicitly where it stops.
+`LifecycleManager` that will drive it arrives in slice D, and
+nothing in the shipped tree calls `apply_transition` today. The
+trigger column of the transition table below records what the table
+*accepts*, not what currently fires.
 
 The design is in
 [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
@@ -28,6 +69,9 @@ for the field arithmetic.
 
 ## `ToolState`: six states, one of which serves
 
+A **tool state** answers one question about one tool: *can it serve
+a request right now?* The six answers, in journey order, are:
+
 ```python
 class ToolState(StrEnum):
     STOPPED = "stopped"
@@ -38,10 +82,24 @@ class ToolState(StrEnum):
     FAILED = "failed"
 ```
 
-[`ToolState`](../src/tool_swap/lifecycle/states.py:35) answers one
-question only: **can this tool serve traffic** — and only `READY`
-can. It is deliberately a different enum from
-[`ContainerState`](../src/tool_swap/backend/base.py:129):
+- **`STOPPED`** — no container. Every tool begins life here, and it
+  is the state the machine returns to after a stop.
+- **`STARTING`** — a start has been requested; the container has not
+  yet confirmed its health.
+- **`LOADING`** — the container is up and answering its health
+  check, but the model weights are still loading and it is serving
+  nothing.
+- **`READY`** — the only state that can serve traffic.
+- **`STOPPING`** — a `stop` has been requested; the backend has not
+  yet confirmed it.
+- **`FAILED`** — the start, the readiness wait, or the container the
+  tool was relying on failed; the reason is carried in
+  [`ModelRuntimeState.last_error`](#modelruntimestate-seven-fields-no-invariants).
+
+[`ToolState`](../src/tool_swap/lifecycle/states.py:35) is
+deliberately a different enum from
+[`ContainerState`](../src/tool_swap/backend/base.py:129), because
+the two ask different questions:
 
 | | `ContainerState` | `ToolState` |
 |---|---|---|
@@ -49,20 +107,23 @@ can. It is deliberately a different enum from
 | Question | does a process exist | can this tool serve traffic |
 | Serving member | none — `running` does not mean serving | `READY` only |
 
-A container can be `running` while its tool is still `LOADING`
-weights and serving nothing — the two questions have different
-answers at that moment, which is why they are two enums. Both carry
-an **exact-set pin**
+A container is `running` from the moment it is up — including the
+whole `LOADING` stretch in which it is serving nothing — so "does a
+process exist" and "can this tool serve traffic" have different
+answers at exactly the moment a router most needs to tell them
+apart. That is why a tool's state is not just its container's
+state, and why they are two enums. Both carry an **exact-set pin**
 ([`test_states.py`](../tests/unit/lifecycle/test_states.py),
 [`test_container_handle_state_status.py`](../tests/unit/backend/test_container_handle_state_status.py)),
 so a member added to the wrong enum fails a test: the six-member set
 is closed, and the value strings are **disjoint** between the two
 enums, so a readiness concept can never be smuggled into the backend
-seam. `ToolState` is a `StrEnum` so members compare equal to the bare
-strings used in CLI output and persisted state.
+seam. `ToolState` is a `StrEnum` so members compare equal to the
+bare strings used in CLI output and persisted state.
 
-`STARTING` and `LOADING` are distinct because cold start is dominated
-by weight loading, not container start — [`plan/01`](../plan/01_ARCHITECTURE.md:209)
+`STARTING` and `LOADING` are distinct because cold start is
+dominated by weight loading, not container start —
+[`plan/01`](../plan/01_ARCHITECTURE.md:209)
 §4 keeps the `/health` versus `/ready` split and names it in the
 machine.
 
@@ -108,8 +169,8 @@ condition rather than something the transition function can perform.
 The plan carried the miscount until behaviour 7's red step counted
 the table (commit `4d4c524` corrected six occurrences of "eleven").
 
-The count is load-bearing because behaviour 7's test is arithmetic and
-**exhaustive over all 36 ordered pairs**
+The count is load-bearing because behaviour 7's test is arithmetic
+and **exhaustive over all 36 ordered pairs**
 ([`test_transition_table.py`](../tests/unit/lifecycle/test_transition_table.py)):
 ten legal, twenty-six illegal. A table with a missing edge and a
 table with a spurious one are both silently wrong under any sampled
@@ -172,8 +233,8 @@ The deferral is pinned in **both directions**
 ([`test_model_runtime_state.py`](../tests/unit/lifecycle/test_model_runtime_state.py)):
 the exact seven-field set fails on an extra field, and a named set of
 the seven M6 fields fails on an early one — so the omission stays
-visible rather than forgotten, and adding a deferred field later is a
-behaviour with a test, not a quiet edit. A field no behaviour reads
+visible rather than forgotten, and adding a deferred field later is
+a behaviour with a test, not a quiet edit. A field no behaviour reads
 is a field whose meaning is guessed.
 
 Two properties depart from convention and are pinned for that reason:
