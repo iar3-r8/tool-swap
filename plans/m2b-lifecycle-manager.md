@@ -65,7 +65,7 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 |---|---|---|---|---|
 | 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
 | 2 | `ParsedMount` → `MountSpec` | `03b3b00` | `c979b2a` | 1546 passed, 2 skipped |
-| 3 | Resource, env and port passthrough | | | |
+| 3 | Resource, env and port passthrough | `d6a2d99` | `325bb3d` | 1555 passed, 2 skipped |
 | 4 | The builder's two guards | | | |
 
 Plan commit: `76de92e`. Behaviour 1's green step corrected this plan's `container_port`
@@ -1053,6 +1053,36 @@ to read-only, because a silent downgrade hides a broken upstream invariant and y
 container whose mounts do not match its config. Unreachable unless config validation was
 bypassed — [`TSWAP-C541`](../src/tool_swap/config/validate.py:2736) rejects it
 case-sensitively, `"RO"` included. Behaviour 2 owns it.
+
+### D-E. `expose_host_port: null` publishes nothing; only `true` raises
+
+Settled by the user **during behaviour 3's red step**, which is why it is numbered after
+D-D rather than alongside it. The plan named three forms and left `null` — the fourth,
+reachable because the field is typed `bool | int | None` — unspecified.
+
+The qna-tester's first version raised on `null`, reasoning by analogy with `true`, and
+flagged it for confirmation rather than settling it alone. The user overruled it: **`null`
+publishes nothing, exactly like `false`.** Two reasons:
+
+1. **It matches this schema's convention for every other nullable field.** `cpus` and
+   `memory` both document *"null leaves it unlimited"*, and the auth token *"null disables
+   authentication"* — so an authored null in this configuration language means "no
+   opinion, take the benign default", never "error".
+2. **Raising would turn valid config into a runtime crash.** `TSWAP-C530` and
+   `TSWAP-C531` both skip non-`int` values
+   ([`validate.py`](../src/tool_swap/config/validate.py:2174)), so
+   `expose_host_port: null` passes validation. A builder that raised would let the router
+   start, load its config, resolve a tool, and only then fail — long after the point where
+   a configuration error should have been reported.
+
+**`true` still raises, and the asymmetry is the point.** There the schema promises
+something no code can deliver: it advertises an auto-allocation from `backend.port_range`,
+and nothing allocates — `port_range` is read only by `schema.py`, `defaults.py` and the
+validation rules ([§6.4](#64-expose_host_port-true-has-no-allocator)). Raising surfaces a
+genuine gap. For `null` there is an obvious, safe, convention-consistent reading, so there
+is no gap to surface.
+
+The two forms are now one parametrized test, since they pin a single contract.
 
 ---
 
