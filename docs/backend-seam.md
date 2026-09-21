@@ -1,32 +1,45 @@
 # The container backend seam
 
-Everything in this repository that starts, stops, inspects or lists a
-tool's container goes through one interface: the `ContainerBackend`
-protocol. This guide describes that seam — its data types, its naming
-and labelling rules, its error taxonomy, and the boundary that keeps
-the container runtime contained in one place.
+Everything in this repository that talks to Docker — starts, stops,
+inspects or lists a tool's container — goes through one small
+interface, the [`ContainerBackend`](../src/tool_swap/backend/base.py:171)
+protocol. That single boundary is the whole point: the rest of the
+system never touches Docker directly, so the backend can be tested
+without a container daemon at all (with an in-memory fake) and could
+be pointed at a different container runtime without rewriting the
+router.
 
-**Status: both implementations of the seam are shipped.** The data
-types, the helpers, the protocol declaration and the error taxonomy
-are in the tree, and both protocol implementations are: the
-in-memory `FakeBackend` (plan behaviours 10–13) and the Docker
-backend, which landed in two slices on the same milestone branch —
-the pure translation layer, behaviours 14–19
-([`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)
-and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
-and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
-shell with the import-linter contract, behaviours 20–27. `isinstance(backend, ContainerBackend)`
-is `True` for both, and "the only module that imports the Docker
-SDK" is now enforced rather than hoped for. What this page does **not**
-contain is the M2b tool state machine — `STOPPED`, `STARTING`,
-`LOADING`, `READY` — which does not exist. This page documents what
-is here, and says explicitly where it stops.
+Without it, Docker knowledge would be scattered everywhere: mount
+strings parsed in three places, container names built in five, one
+SDK exception type handled differently per call site. The seam
+contains all of it in one place, and this page documents that place —
+its data types, its naming and labelling rules, its error taxonomy,
+and the enforcement that keeps the Docker SDK contained inside one
+module.
 
-The design is specified in
-[`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
-(§4 for the design, §5 for the behaviour ledger); the interface it
-implements was first sketched in
-[`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §12.
+**Where it sits:** the config layer above it resolves your YAML; the
+[spec builder page](spec-builder.md) turns that resolution into a
+`ContainerSpec`; the seam consumes the spec to actually start, stop
+and inspect the container; and the [Configuration
+guide](configuration-guide.md) covers the `backend:` block whose
+values the seam reads. This page is reference material for the shipped
+seam — read the opening sections for the shape of it, then use the
+tables below as lookup.
+
+## What is in the tree
+
+The seam is five modules, all under `src/tool_swap/backend/`, plus
+both implementations of the protocol. The "behaviours N–M" numbers in
+the table are entries of the plan's ledger, glossed in
+[Status and design sources](#status-and-design-sources) below:
+
+| Module | Contents |
+|---|---|
+| [`base.py`](../src/tool_swap/backend/base.py) | [`MountSpec`](../src/tool_swap/backend/base.py:27), [`ContainerSpec`](../src/tool_swap/backend/base.py:49), [`ContainerHandle`](../src/tool_swap/backend/base.py:107), [`ContainerState`](../src/tool_swap/backend/base.py:129), [`ContainerStatus`](../src/tool_swap/backend/base.py:147), and the [`ContainerBackend`](../src/tool_swap/backend/base.py:171) protocol |
+| [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
+| [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
+| [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
+| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) — the pure half, behaviours 14–19 — and [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746), the thin shell over them, behaviours 20–26 |
 
 ## The shape of the seam
 
@@ -45,11 +58,16 @@ flowchart LR
         DOCK[docker_backend.py: DockerBackend, behaviours 20–26 — the only module that may import the Docker SDK]
         DOCKT[docker_backend.py: build_run_kwargs and map_sdk_error, behaviours 14–19, the pure half]
     end
+    subgraph lifc[lifecycle — M2b slices A and B, the layer above the seam]
+        SPEC[spec_builder.py: build_container_spec, the config → ContainerSpec conversion]
+        STATES[states.py: ToolState, ModelRuntimeState, the ten-edge transition table]
+    end
     subgraph future[later branches and milestones — not shipped]
-        LIFE[M2b: LifecycleManager, the tool state machine]
+        LIFE[M2b slice D: LifecycleManager, the driver of the state machine]
         BLD[M5: build and BuildSpec]
     end
-    VAL -. "ParsedMount, consumed by the config-to-spec builder (not shipped)" .-> TYPES
+    VAL -->|ParsedMount| SPEC
+    SPEC -->|produces| TYPES
     DEF -. "resolved values, passed in by callers" .-> HELPER
     TYPES --> PROTO
     HELPER --> PROTO
@@ -73,20 +91,17 @@ half `DOCKT` (plan §4.5) — `start` unpacks
 output into `create`, and every method routes exceptions through
 [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) —
 and it is the only module that may import the SDK (the fifth
-`.importlinter` contract, behaviour 27).
-
-## What is in the tree
-
-The seam is five modules, all under `src/tool_swap/backend/`, plus
-both implementations of the protocol:
-
-| Module | Contents |
-|---|---|
-| [`base.py`](../src/tool_swap/backend/base.py) | [`MountSpec`](../src/tool_swap/backend/base.py:27), [`ContainerSpec`](../src/tool_swap/backend/base.py:49), [`ContainerHandle`](../src/tool_swap/backend/base.py:107), [`ContainerState`](../src/tool_swap/backend/base.py:129), [`ContainerStatus`](../src/tool_swap/backend/base.py:147), and the [`ContainerBackend`](../src/tool_swap/backend/base.py:171) protocol |
-| [`labels.py`](../src/tool_swap/backend/labels.py) | [`managed_labels`](../src/tool_swap/backend/labels.py:54), [`container_name`](../src/tool_swap/backend/labels.py:111), [`label_selector`](../src/tool_swap/backend/labels.py:153) |
-| [`errors.py`](../src/tool_swap/backend/errors.py) | the seven exception classes, [`BackendError`](../src/tool_swap/backend/errors.py:24) and its six concrete subclasses |
-| [`fake_backend.py`](../src/tool_swap/backend/fake_backend.py) | [`FakeBackend`](../src/tool_swap/backend/fake_backend.py:77), the in-memory implementation, and [`FailureMode`](../src/tool_swap/backend/fake_backend.py:50) — the two scriptable failure modes |
-| [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py) | [`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102) and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275) — the pure half, behaviours 14–19 — and [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746), the thin shell over them, behaviours 20–26 |
+`.importlinter` contract, behaviour 27). `SPEC` and `STATES` sit in
+their own subgraph because both are M2b's layer **above** the seam,
+not seam modules: `SPEC` produces the `ContainerSpec` the seam
+consumes, from
+[`parse_mount`](../src/tool_swap/config/validate.py:2488)'s
+`ParsedMount`, and
+[its page](spec-builder.md) documents the conversion and the two
+refusals that keep it honest; `STATES` is the slice B tool state
+machine, whose ten edges decide *when* a container should exist,
+and [its page](tool-state-machine.md) documents the table, the
+runtime-state holder and the logging contract.
 
 ## The data types
 
@@ -130,10 +145,15 @@ hashable, and M2b keys its bookkeeping by them.
 
 Exactly four members — `created`, `running`, `exited`, `gone` — and
 they describe one thing only: **whether a process exists**. This is
-deliberately not the M2b tool state machine. `STARTING`, `LOADING` and
-`READY` are readiness concepts owned by M2b's health probe, which does
-not exist yet, and a test pins the four-member set so the two state
-machines cannot blur together.
+deliberately not the M2b tool state machine, which ships in slice B
+([`ToolState`](../src/tool_swap/lifecycle/states.py:35), six
+members, documented on
+[its own page](tool-state-machine.md)): `STARTING`, `LOADING` and
+`READY` are readiness concepts that a container can be `running`
+while its tool is still not serving. The health probe that answers
+them arrives in slice C. A test pins the four-member set, a second
+pins the six-member set, and the two value sets are asserted
+disjoint, so the two state machines cannot blur together.
 
 ### `ContainerStatus`
 
@@ -184,9 +204,15 @@ The seam's value is as much in what it refuses to do.
   re-doing any of them in the backend is exactly the duplication the
   seam was amended to prevent. A source-level guard test walks
   `src/tool_swap/backend/` on every run and fails if a second parser
-  appears. The single `ParsedMount` → `MountSpec` conversion happens in
-  the config-to-spec builder, which does not ship on this branch — so
-  there is currently no conversion in the tree at all.
+  appears — and since M2b slice A, a second guard walks
+  `src/tool_swap/lifecycle/` for the same reason. The single
+  `ParsedMount` → `MountSpec` conversion happens in the
+  config-to-spec builder,
+  [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19),
+  which **does ship** — it is in the tree, it has no caller yet
+  (the `LifecycleManager` is M2b slice D), and
+  [its page](spec-builder.md) documents the conversion, the
+  resolution base and the two source-level guards.
 - **No configured default is re-stated.** `gpu_runtime`,
   `container_port`, `label_namespace` and `container_prefix` all live
   in [`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:20);
@@ -680,6 +706,35 @@ enough, because a fresh import would simply find the SDK again on
 the path. The fake stays usable in an environment with no SDK
 installed at all, which is what it exists for.
 
+## Status and design sources
+
+**Status: both implementations of the seam are shipped.** The data
+types, the helpers, the protocol declaration and the error taxonomy
+are in the tree, and both protocol implementations are: the
+in-memory `FakeBackend` (plan behaviours 10–13) and the Docker
+backend, which landed in two slices on the same milestone branch —
+the pure translation layer, behaviours 14–19
+([`build_run_kwargs`](../src/tool_swap/backend/docker_backend.py:102)
+and [`map_sdk_error`](../src/tool_swap/backend/docker_backend.py:275)),
+and the [`DockerBackend`](../src/tool_swap/backend/docker_backend.py:746)
+shell with the import-linter contract, behaviours 20–27. "Behaviours"
+are the numbered entries of the plan's ledger — the unit of work
+each test cycle implements and pins. `isinstance(backend,
+ContainerBackend)` is `True` for both, and "the only module that
+imports the Docker SDK" is now enforced rather than hoped for. The
+layer **above** the seam is documented on its own pages: the config
+to `ContainerSpec` builder in [spec-builder.md](spec-builder.md), and
+the tool state machine — `STOPPED`, `STARTING`, `LOADING`, `READY`,
+`STOPPING`, `FAILED` — in
+[tool-state-machine.md](tool-state-machine.md). This page documents
+what is here, and says explicitly where it stops.
+
+The design is specified in
+[`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md)
+(§4 for the design, §5 for the behaviour ledger); the interface it
+implements was first sketched in
+[`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §12.
+
 ## Troubleshooting: container start failures
 
 Each failure the backend can report is one of the seven classes in
@@ -752,6 +807,14 @@ Two honest limits on the table:
 
 ## Where to go deeper
 
+- [`docs/spec-builder.md`](spec-builder.md) — the config to
+  `ContainerSpec` builder (M2b slice A): how each spec field is
+  assembled, the `BackendConfig`-not-`values` trap, the mount
+  conversion and its refusals, and the two guards.
+- [`docs/tool-state-machine.md`](tool-state-machine.md) — the tool
+  state machine (M2b slice B): the six states, the ten-edge table and
+  its two deliberate absences, `ModelRuntimeState`'s field
+  arithmetic, and the validate-first-log-second contract.
 - [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md) —
   the design decisions behind every type and rule on this page, with
   the per-behaviour ledger (§5) and what M2b will need from the seam

@@ -200,8 +200,8 @@ The `router:` and `backend:` blocks are optional and rarely needed at
 first. The defaults give you a local HTTP server on port 8600 with
 Docker as the container backend. Reach for `router:` to change the port,
 require a Bearer token on every request, or adjust logging, and for
-`backend:` to
-rename your containers or change what happens to orphaned ones:
+`backend:` to rename your containers or change what happens to
+orphaned ones:
 
 ```yaml
 router:
@@ -216,6 +216,12 @@ backend:
   container_prefix: ms-          # containers are named <prefix><tool>
   orphans: stop                  # containers whose tool left the config
 ```
+
+To see what this config actually produces, the
+[config to `ContainerSpec` builder](spec-builder.md#the-concrete-through-line-authored-yaml-to-containerspec)
+traces the same `backend:` block and one tool from authored YAML to the
+resolved spec, including the container name you'll see in `docker ps`
+and the labels reconciliation filters on.
 
 ## Your first multi-GPU config
 

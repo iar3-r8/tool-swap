@@ -107,7 +107,7 @@ tool-swap/
 │   │   ├── schema/             # JSON Schema compilation, tool definitions
 │   │   ├── registry/           # Tool registry, model definitions
 │   │   ├── scheduler/          # Dispatch, batching, occupancy accounting
-│   │   ├── lifecycle/          # Container lifecycle state machine
+│   │   ├── lifecycle/          # Container lifecycle (spec builder and tool state machine shipped)
 │   │   ├── backend/            # Pluggable container backends (Docker, fake)
 │   │   ├── preflight/          # Deployment gate: checks, runner, report
 │   │   │   └── checks/         # Static, build, boot, readiness, contract checks
@@ -134,7 +134,7 @@ tool-swap/
 │   ├── runtime/contract/       # Runtime contract tests
 │   ├── integration/            # Docker-based integration tests
 │   └── e2e/                    # End-to-end quickstart test
-├── docs/                       # User documentation (configuration guide, reference, backend seam)
+├── docs/                       # User documentation (configuration guide, reference, backend seam, spec builder)
 ├── deploy/                     # Deployment artifacts (systemd, prometheus, grafana)
 └── plan/                       # Implementation plans and architecture docs
 ```
