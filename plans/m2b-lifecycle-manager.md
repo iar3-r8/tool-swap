@@ -66,7 +66,18 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 | 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
 | 2 | `ParsedMount` → `MountSpec` | `03b3b00` | `c979b2a` | 1546 passed, 2 skipped |
 | 3 | Resource, env and port passthrough | `d6a2d99` | `325bb3d` | 1555 passed, 2 skipped |
-| 4 | The builder's two guards | | | |
+| 4 | The builder's two guards | `ada2dea` | `7478dc9` | 1570 passed, 2 skipped |
+
+**Slice A's implementation is complete**: every behaviour has both a red and a green
+commit, and the suite is green at the branch tip. Remaining for the slice:
+documentation (behaviour 26's share for slice A), then the pull request.
+
+The guards were not taken on trust. A green guard and a blind guard are
+indistinguishable from the test output, so both were driven against a violation
+**injected into the real source tree** and confirmed to catch it — a backend-named key
+read at line 35, and a second `parse_mount` with its split at lines 236 and 238 — before
+the tree was restored. The decoys prove the detectors discriminate; the injection proves
+the walk reaches the file that matters.
 
 Plan commit: `76de92e`. Behaviour 1's green step corrected this plan's `container_port`
 claim (see behaviour 1's outputs); no test was weakened to reach green, and no red step
