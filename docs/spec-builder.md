@@ -63,6 +63,125 @@ base relative mount hosts resolve against. Every spec field:
 | `mounts` | `resolved.values["mounts"]` through [`parse_mount`](../src/tool_swap/config/validate.py:2488) | see [Mounts](#mounts-one-conversion-three-refusals) |
 | `published_port` | `resolved.values["expose_host_port"]` | see [The published port](#the-published-port-four-forms-two-of-them-worth-explaining) |
 
+## The concrete through-line: authored YAML to `ContainerSpec`
+
+The rules above describe the mapping; this section shows it happening.
+A complete, validated config — the same `backend:` block as the
+committed [`tools.example.yaml`](../tools.example.yaml), a `defaults:`
+block with `env` and both mount forms, one tool:
+
+```yaml
+# tools.yaml
+version: 1
+
+backend:
+  type: docker
+  network: tool-swap-net
+  container_prefix: ms-
+  label_namespace: com.tool-swap
+  gpu_runtime: nvidia
+  orphans: stop
+  port_range: [7000, 7999]
+  registry_prefix: tool-swap
+
+defaults:
+  env:
+    HF_HOME: /weights/hf
+    HF_TOKEN: ${HF_TOKEN:-}
+  mounts:
+    - ./models:/weights/hf       # two-part: mode defaults to ro
+    - ./cache:/cache:rw          # three-part: read-write, explicit
+
+tools:
+  summarizer:
+    image: tool-swap/summarizer:1.0
+    description: Summarize a long text into one short paragraph.
+    expose_host_port: 7001       # an int publishes exactly that port
+```
+
+`expose_host_port` is written as an int on purpose: `true` is rejected
+by the builder — see [The published port](#the-published-port-four-forms-two-of-them-worth-explaining)
+and [What goes wrong](#what-goes-wrong). Run the config through the
+validated pipeline — `load_config`, `resolve_tool`, then
+[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19)
+with `config_dir` set to the directory holding the config — and it
+returns:
+
+```python
+ContainerSpec(
+    tool='summarizer',
+    name='ms-summarizer',
+    image='tool-swap/summarizer:1.0',
+    gpu_runtime='nvidia',
+    container_port=8000,
+    command=None,
+    env={'HF_HOME': '/weights/hf', 'HF_TOKEN': ''},
+    labels={'com.tool-swap.model': 'summarizer',
+            'com.tool-swap.managed-by': 'tool-swap'},
+    network='tool-swap-net',
+    mounts=(
+        MountSpec(source='config/models', target='/weights/hf', read_only=True),
+        MountSpec(source='config/cache', target='/cache', read_only=False),
+    ),
+    devices=(),
+    shm_size='1g',
+    cpus=None,
+    memory=None,
+    published_port=7001,
+)
+```
+
+Read it against the config, field by field:
+
+- **`name`** is `backend.container_prefix` plus the tool name, so the
+  container you will see in `docker ps` is predictable before anything
+  starts: `ms-` + `summarizer`.
+- **`labels`** is derived from `backend.label_namespace`: the
+  `model` and `managed-by` keys are always stamped
+  ([`managed_labels`](../src/tool_swap/backend/labels.py:54)), and
+  reconciliation later finds the router's own containers by filtering
+  on exactly these.
+- **The two mounts** show the two legal forms: the two-part entry takes
+  its mode from the parser's `ro` default, the three-part entry keeps
+  the authored `rw`. Each `source` is the relative host resolved
+  against **the config file's directory** — here `config/` — not the
+  tool's directory and not the working directory.
+- **`published_port`** is the authored `7001`. `false` and `null` both
+  yield `None` (nothing published); `true` raises, because the schema
+  promises an allocation from `backend.port_range` that nothing
+  implements — write an explicit port instead.
+- **`shm_size`** is `"1g"` although nothing in the config names it:
+  the built-in default is a non-optional string, so a tool that
+  configures nothing gets `"1g"`, never the spec's `None`.
+- **`env["HF_TOKEN"]` is `''`**: the variable was unset in this run and
+  the `:-` fallback is empty — interpolation substitutes the fallback,
+  and the builder coerces every value with `str()`.
+
+The `backend:` values reach the spec because the builder takes
+`BackendConfig` as a separate argument — the resolver never merged
+them; see [the trap](#the-trap-backendconfig-never-values) below.
+
+## What goes wrong
+
+Two of the three builder refusals are caught earlier, by
+`tswap validate`, and the messages a reader will actually see are the
+validator's:
+
+| Mistake | What you see |
+|---|---|
+| a mount mode that is not `ro` or `rw`, e.g. `./models:/weights/hf:RO` | `ERROR TSWAP-C541 — Mount entry './models:/weights/hf:RO' has mode 'RO'; the only legal modes are ro and rw` |
+| an unparseable entry, e.g. `./models/weights/hf` | `ERROR TSWAP-C540 — Mount entry './models/weights/hf' is unparseable: expected host:container or host:container:ro\|rw` |
+
+The third slips past the validator:
+
+| Mistake | What you see |
+|---|---|
+| `expose_host_port: true` | `tswap validate --strict` reports no problem at all; the error surfaces when the spec is built: `ValueError: expose_host_port for tool 'summarizer' is true, which promises auto-allocation from backend.port_range; no allocator exists, so write an explicit port instead` |
+
+The asymmetry is the point: the schema's own description promises the
+allocation, validation lets `true` through, and the builder is the
+boundary that refuses it with a message that names the fix.
+
 ## The trap: `BackendConfig`, never `values`
 
 `BackendConfig` is a **separate required argument**, never read out of
