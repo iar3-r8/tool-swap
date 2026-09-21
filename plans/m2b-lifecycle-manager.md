@@ -384,7 +384,7 @@ justified by what makes it one coherent review.
 
 | Slice | Branch | Behaviours | What makes it one reviewable unit |
 |---|---|---|---|
-| **A** | `feature/m2b-lifecycle-manager` | 1–4 | **The config → spec builder. Pure, and no manager.** A function over two config objects returning a `ContainerSpec`; a reviewer needs the config layer and M2a's data types, and nothing about state or async. It also unblocks every later slice, which needs specs to start. |
+| **A** | `feature/m2b-spec-builder` | 1–4 | **The config → spec builder. Pure, and no manager.** A function over two config objects returning a `ContainerSpec`; a reviewer needs the config layer and M2a's data types, and nothing about state or async. It also unblocks every later slice, which needs specs to start. |
 | **B** | `feature/m2b-state-machine` | 5–8 | **The state machine. Pure, and no I/O.** An enum, a dataclass, a transition table and a logging rule — exhaustively table-testable, with no backend, no probe and no event loop. |
 | **C** | `feature/m2b-probe-seam` | 9–11 | **The probe seam and the readiness progression.** A protocol, a scripted double, and the deadline logic that turns probe answers into `STARTING → LOADING → READY`. A reviewer checks the progression and the two deadlines without meeting the coalescing machinery. |
 | **D** | `feature/m2b-ensure-ready` | 12–18 | **`ensure_ready` and coalescing.** The concurrency core: one lock, one future, `shield`, `run_in_executor`. The hardest slice to review, and it is alone in its pull request for exactly that reason. |
