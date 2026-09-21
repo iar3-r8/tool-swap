@@ -64,7 +64,7 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 | # | Behaviour | Red | Green | Suite at green |
 |---|---|---|---|---|
 | 1 | `build_container_spec` core assembly | `fc2772e` | `e73071b` | 1530 passed, 2 skipped |
-| 2 | `ParsedMount` → `MountSpec` | | | |
+| 2 | `ParsedMount` → `MountSpec` | `03b3b00` | `c979b2a` | 1546 passed, 2 skipped |
 | 3 | Resource, env and port passthrough | | | |
 | 4 | The builder's two guards | | | |
 
