@@ -1240,11 +1240,24 @@ and set the precedent.
 
 ### 6.10 `plan/06` §9's `ModelRuntimeState` is shipped incomplete, by decision
 
-Behaviour 6 ships seven of the sketch's thirteen fields. The six omitted (`group`, `ttl`,
-`keep_warm`, `evict_cost`, `queued`, `vram_gb`, `consecutive_failures`) belong to features
-M2b does not have, and a field no behaviour reads is a field whose semantics are guessed.
-The field-set pin makes the omission visible. **If M3 or M6 needs one of them, adding it is
-a behaviour with a test, not a quiet edit.**
+**Corrected during behaviour 6's red step**, where the qna-tester checked this paragraph
+against the source instead of taking it on trust. It read "seven of the sketch's thirteen
+fields. The six omitted", and both numbers were wrong: the sketch has **twelve** fields,
+and the list that followed named **seven**, not six. Verified by counting
+[`plan/06` §9](../plan/06_LIFECYCLE_TTL_AND_SCHEDULING.md:396).
+
+The arithmetic never worked because the relationship is not a subset. Of the sketch's
+twelve fields M2b **keeps five** — `name` renamed to `tool`, `state` retyped from
+`ModelState` to `ToolState`, plus `last_used`, `became_ready_at` and `inflight` — and
+**defers seven**: `group`, `queued`, `keep_warm`, `ttl`, `evict_cost`, `vram_gb`,
+`consecutive_failures`. It then **adds two the sketch never had**: `handle`, because
+something must hold the `ContainerHandle` the backend returns, and `last_error`, because
+`FAILED` carries a reason. Five kept plus two added is the seven M2b ships.
+
+The seven deferred fields belong to features M2b does not have, and a field no behaviour
+reads is a field whose semantics are guessed. The field-set pin makes the omission
+visible. **If M3 or M6 needs one of them, adding it is a behaviour with a test, not a
+quiet edit.**
 
 ### 6.11 `FakeProbe` models no transport failure
 
