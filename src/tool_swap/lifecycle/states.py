@@ -1,4 +1,4 @@
-"""Tool-level lifecycle states (m2b plan §3, behaviours 5, 6 and 7).
+"""Tool-level lifecycle states (m2b plan §3, behaviours 5–8).
 
 Answers "can this tool serve traffic" (only ``READY`` does), which is
 deliberately distinct from ``ContainerState`` in
@@ -14,14 +14,22 @@ Behaviour 7 pins the transition table: the ten legal edges of plan
 §1.1 as data, ``is_legal_transition`` as the pure predicate over that
 data, and ``apply_transition`` as the single entry point that mutates
 a ``ModelRuntimeState`` in place, raising ``IllegalTransitionError``
-on anything else.
+on anything else. Behaviour 8 logs every applied transition; a refused
+one stays silent.
 """
 
+import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
 from tool_swap.backend.base import ContainerHandle
+
+#: Module-level logger; one INFO record per applied transition, the
+#: structured fields attached via ``extra`` (the repository has no
+#: logging helper to follow, so it stays plain).
+logger = logging.getLogger(__name__)
 
 
 class ToolState(StrEnum):
@@ -99,9 +107,10 @@ def apply_transition(
     """Move the holder to ``to_state`` in place and return the new state.
 
     The from-state is read from ``state.state``, so the pair cannot be
-    inconsistent with the holder. ``reason`` is accepted but not yet
-    used; behaviour 8 logs it from this entry point. An illegal pair
-    raises ``IllegalTransitionError`` and leaves the holder untouched.
+    inconsistent with the holder. ``reason`` is attached verbatim to
+    the INFO record logged for the transition. An illegal pair raises
+    ``IllegalTransitionError``, logs nothing, and leaves the holder
+    untouched.
     """
     from_state = state.state
     if (from_state, to_state) not in _LEGAL_TRANSITIONS:
@@ -109,4 +118,22 @@ def apply_transition(
             f"Illegal transition {from_state.name} -> {to_state.name}"
         )
     state.state = to_state
+    # Validate first, log second: a refused transition must leave no
+    # record, or a log reader would believe a change that never
+    # happened. A broken handler must not raise and cannot undo the
+    # state change already made, so the call is best-effort.
+    with suppress(Exception):
+        logger.info(
+            "%s moved from %s to %s: %s",
+            state.tool,
+            from_state,
+            to_state,
+            reason,
+            extra={
+                "tool": state.tool,
+                "from_state": from_state,
+                "to_state": to_state,
+                "reason": reason,
+            },
+        )
     return to_state
