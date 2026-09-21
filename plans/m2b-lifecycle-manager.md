@@ -79,8 +79,19 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 | 7 | The transition table | `a5a6dfe` | `d5e1079` | 1661 passed, 2 skipped |
 | 8 | Transitions are logged | `1a6b4ff` | `ac5c39c` | 1698 passed, 2 skipped |
 
-**Slice B's implementation is complete.** Remaining: documentation, then the stacked
-pull request.
+**Slice B is complete and shipped as
+[#15](https://github.com/iar3-r8/tool-swap/pull/15)**, stacked on #14 and based on
+`feature/m2b-spec-builder` rather than `main`, so its diff shows only behaviours 5–8.
+Head `2ed0859`, documentation commit `2ed0859` preceding the pull request.
+
+**#15 runs no CI until it is retargeted to `main`**, which happens when #14 merges. The
+workflow triggers on `branches: [main]` only, so the absence of a check is configuration
+rather than failure — and retargeting is what makes CI run, so it should happen before
+approval rather than after.
+
+**Slice C branches from `2ed0859`**, for the reason §2.1 records: #15's head *is*
+`feature/m2b-state-machine`, so continuing to commit there would absorb slice C into the
+open pull request.
 
 Two tests in slice B assert an *absence* and therefore pass before their feature exists,
 which would normally make them worthless as red steps. Both were checked by injecting the
