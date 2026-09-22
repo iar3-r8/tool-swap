@@ -28,7 +28,8 @@ import pytest
 
 
 def _get_probes_module() -> ModuleType:
-    """Import tool_swap.proxy.probes at call time, RED-safely.
+    """Import tool_swap.proxy.probes at call time, so a missing module
+    fails as an informative assertion, not a collection error.
 
     Raises:
         AssertionError: the module is missing; the message names the
@@ -43,7 +44,8 @@ def _get_probes_module() -> ModuleType:
 
 
 def _get_probe() -> type[Any]:
-    """Return the Probe protocol, RED-safely.
+    """Return the Probe protocol; a missing name raises an informative
+    AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the name is missing from probes.py.
@@ -58,7 +60,8 @@ def _get_probe() -> type[Any]:
 
 
 def _get_probe_target() -> type[Any]:
-    """Return the ProbeTarget dataclass, RED-safely.
+    """Return the ProbeTarget dataclass; a missing name raises an
+    informative AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the name is missing from probes.py.
@@ -73,7 +76,8 @@ def _get_probe_target() -> type[Any]:
 
 
 def _get_fake_probe() -> type[Any]:
-    """Return the FakeProbe class, RED-safely.
+    """Return the FakeProbe class; a missing name raises an informative
+    AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the name is missing from probes.py.
@@ -89,7 +93,8 @@ def _get_fake_probe() -> type[Any]:
 
 
 def _get_calls(probe: Any) -> list[tuple[str, str]]:
-    """Fetch ``probe.calls``, RED-safely.
+    """Fetch ``probe.calls``; a missing journal raises an informative
+    AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the probe has no ``calls`` attribute — the
