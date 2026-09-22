@@ -58,9 +58,11 @@ flowchart LR
         DOCK[docker_backend.py: DockerBackend, behaviours 20–26 — the only module that may import the Docker SDK]
         DOCKT[docker_backend.py: build_run_kwargs and map_sdk_error, behaviours 14–19, the pure half]
     end
-    subgraph lifc[lifecycle — M2b slices A and B, the layer above the seam]
+    subgraph lifc[lifecycle — M2b slices A, B and C, the layer above the seam]
         SPEC[spec_builder.py: build_container_spec, the config → ContainerSpec conversion]
         STATES[states.py: ToolState, ModelRuntimeState, the ten-edge transition table]
+        PROBE[probes.py: the Probe protocol, ProbeTarget, FakeProbe — the readiness seam, no client]
+        MANAGE[manager.py: drive_readiness, the state machine's first driver]
     end
     subgraph future[later branches and milestones — not shipped]
         LIFE[M2b slice D: LifecycleManager, the driver of the state machine]
@@ -78,6 +80,9 @@ flowchart LR
     DOCKT -->|reads| TYPES
     DOCKT -->|uses| HELPER
     DOCKT -->|returns members of| ERR
+    MANAGE -->|applies| STATES
+    MANAGE -->|polls| PROBE
+    LIFE -.->|will delegate to| MANAGE
     LIFE -.->|will call off the event loop| PROTO
     BLD -.->|deliberately absent from the protocol| PROTO
 ```
@@ -101,7 +106,11 @@ consumes, from
 refusals that keep it honest; `STATES` is the slice B tool state
 machine, whose ten edges decide *when* a container should exist,
 and [its page](tool-state-machine.md) documents the table, the
-runtime-state holder and the logging contract.
+runtime-state holder and the logging contract. `PROBE` and `MANAGE`
+join the subgraph in slice C: the readiness seam
+([its page](readiness-probe.md)) and the first driver of the state
+machine (documented on
+[the state machine page](tool-state-machine.md#the-first-driver-drive_readiness)).
 
 ## The data types
 
@@ -150,8 +159,11 @@ deliberately not the M2b tool state machine, which ships in slice B
 members, documented on
 [its own page](tool-state-machine.md)): `STARTING`, `LOADING` and
 `READY` are readiness concepts that a container can be `running`
-while its tool is still not serving. The health probe that answers
-them arrives in slice C. A test pins the four-member set, a second
+while its tool is still not serving. The probe that answers them is
+the seam on [the readiness probe
+page](readiness-probe.md) — shipped as a declaration with no client;
+the real probe arrives in M3. A test pins the four-member set, a
+second
 pins the six-member set, and the two value sets are asserted
 disjoint, so the two state machines cannot blur together.
 
@@ -368,8 +380,9 @@ is the point of reference:
 M2b's drain test, and shipping a member no test proves would be
 dead code — M2b introduces it in the same red/green cycle as that
 test (plan §7 item 5). **"Never ready" is deliberately not a mode
-either**: readiness belongs to M2b's health probe, which does not
-exist yet, and the fake has no probe to be un-ready against. That is a
+either**: readiness belongs to the readiness probe, which ships as a
+seam with no client, and the fake backend models the container rather
+than the tool — it has no probe to be un-ready against. That is a
 knowing departure from issue #3's Scope wording, confirmed by the
 user and recorded in plan §7 item 5 — the issue was not amended, so
 that plan entry is the record.
@@ -815,6 +828,10 @@ Two honest limits on the table:
   state machine (M2b slice B): the six states, the ten-edge table and
   its two deliberate absences, `ModelRuntimeState`'s field
   arithmetic, and the validate-first-log-second contract.
+- [`docs/readiness-probe.md`](readiness-probe.md) — the readiness
+  probe seam (M2b slice C): the two-method `Probe` protocol, the
+  no-URL `ProbeTarget`, the enforced no-HTTP-client rule and the
+  scripted `FakeProbe`.
 - [`plans/m2a-container-backend-seam.md`](../plans/m2a-container-backend-seam.md) —
   the design decisions behind every type and rule on this page, with
   the per-behaviour ledger (§5) and what M2b will need from the seam

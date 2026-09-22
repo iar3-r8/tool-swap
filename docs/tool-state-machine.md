@@ -24,47 +24,63 @@ and a router that routed on container liveness alone would send
 requests into a process that is still loading weights, and be
 refused by it or made to hang until the load finishes. The machine
 is also the single place in the tree that records which states a
-tool may occupy and which moves are legal, so the component that
-will drive it — the `LifecycleManager`, planned but not built —
-never has to re-derive that knowledge by hand.
+tool may occupy and which moves are legal, so its drivers —
+`drive_readiness`, shipped, and the `LifecycleManager` class that
+will own it in production, slice D — never re-derive that knowledge
+by hand.
 
 **Where it sits:** the [spec builder
 page](spec-builder.md) documents the layer that decides *what* a
 tool's container should look like (the `ContainerSpec`); the
 [backend seam page](backend-seam.md) documents the layer that
 *starts* that container and reports whether its process is alive;
-this page documents the layer that decides *when* a container
-should exist at all. The other two pages are each about one
-container; this page is about one tool's journey through a sequence
-of them.
+the [readiness probe
+page](readiness-probe.md) documents the seam whose `health` and
+`ready` answers move a tool through the states; this page documents
+the states themselves and the rules that govern the moves between
+them. The other pages are each about one layer; this page is about
+one tool's journey through a sequence of containers.
 
-One honest caveat before the detail: **nothing in the shipped tree
-drives this machine yet.** There is no `LifecycleManager`, no probe
-advancing the states, and no container has been started through
-this path. The machine — the states, the table, the holder, the
-transition function — is shipped and fully tested; its driver is
-not. The rest of the page documents the machine in full, and says
-explicitly where it stops.
+One honest caveat before the detail: **no production code drives
+this machine yet.** The machine — the states, the table, the holder,
+the transition function — is shipped and fully tested, and it now
+has a first driver:
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75) walks
+a tool `STARTING → LOADING → READY` on probe answers. But nothing in
+the shipped tree calls `drive_readiness` from the router yet either —
+the `LifecycleManager` class that will own it arrives in slice D,
+and no container has been started through this path. The rest of the
+page documents the machine in full, says where the driver gets there
+and where it stops.
 
 ## Status and design sources
 
-**Status: slice B of M2b, shipped — the machine, not its driver.**
-M2b is the project plan's milestone for the lifecycle layer, and
-"slice B" is this branch's share of it. All four slice B behaviours
-(entries 5–8 of the plan's ledger) are in the tree on
-`feature/m2b-state-machine`, stacked on slice A. The module is pure:
-no daemon, no event loop, no I/O. It has **no caller yet**: the
-`LifecycleManager` that will drive it arrives in slice D, and
-nothing in the shipped tree calls `apply_transition` today. The
-trigger column of the transition table below records what the table
-*accepts*, not what currently fires.
+**Status: slices B and C of M2b, shipped — the machine and its
+first driver.** M2b is the project plan's milestone for the
+lifecycle layer. All four slice B behaviours (entries 5–8 of the
+plan's ledger) are in the tree on `feature/m2b-state-machine`,
+stacked on slice A, and slice C (entries 9–11, on
+`feature/m2b-probe-seam`) added the probe seam and
+`drive_readiness`, the machine's first driver — documented in
+[The first driver](#the-first-driver-drive_readiness) below.
+`states.py` itself is pure: no daemon, no event loop, no I/O. The
+`LifecycleManager` *class* that will own the machine in production
+arrives in slice D; `drive_readiness` is the first — and so far
+only — caller of `apply_transition` in the tree, and nothing in the
+shipped tree calls it from the router yet. The trigger column of
+the transition table below records what the table *accepts*, not
+what currently fires.
 
 The design is in
 [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
 [§1.1](../plans/m2b-lifecycle-manager.md:130) for the state machine,
 [§1.2](../plans/m2b-lifecycle-manager.md:184) for
-`ModelRuntimeState`, [§3 slice B](../plans/m2b-lifecycle-manager.md:554)
-for the behaviours, and [§6.10](../plans/m2b-lifecycle-manager.md:1285)
+`ModelRuntimeState`, [§1.3](../plans/m2b-lifecycle-manager.md:271)
+for how waiting composes with the injected clock,
+[§1.5](../plans/m2b-lifecycle-manager.md:352) for the probe seam,
+[§3 slice B](../plans/m2b-lifecycle-manager.md:554) and
+[§3 slice C](../plans/m2b-lifecycle-manager.md:689) for the
+behaviours, and [§6.10](../plans/m2b-lifecycle-manager.md:1285)
 for the field arithmetic.
 
 ## `ToolState`: six states, one of which serves
@@ -306,19 +322,99 @@ The log call is **best-effort**: it is wrapped in
 been made. The order is validate, mutate, log — and only the first
 step can refuse.
 
+## The first driver: `drive_readiness`
+
+Before this slice, the table above was data waiting to be driven:
+the states could be moved, but nothing in the tree moved them.
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75) is
+the first driver. It takes a holder sitting at `STARTING`, a
+probe, a clock and the tool's address, and walks the holder to
+`READY`:
+
+```python
+async def drive_readiness(
+    state: ModelRuntimeState,
+    probe: Probe,
+    clock: Clock,
+    target: ProbeTarget,
+    start_timeout: float = 120.0,
+    ready_timeout: float = 600.0,
+    probe_interval: float = 1.0,
+) -> ToolState: ...
+```
+
+It polls `probe.health` until it answers true, applies
+`STARTING → LOADING`, then polls `probe.ready` until it answers
+true and applies `LOADING → READY`. Both moves go through
+[`apply_transition`](../src/tool_swap/lifecycle/states.py:104), so
+the table's legality check and the `INFO` log are inherited rather
+than reimplemented, and each call carries a `reason` into the log
+record. The probe it polls is the seam documented on
+[the readiness probe page](readiness-probe.md); the real probe
+does not exist yet, and the tests inject the scripted
+`FakeProbe` in its place.
+
+### Two independent deadlines
+
+The two timeouts are **independent windows, not a chain**:
+`start_timeout` covers container-up-to-health, and `ready_timeout`
+covers health-to-ready and **starts when `health` answered**, not
+at `t=0`. That is the whole point of the two states — ninety
+simulated seconds in `LOADING` is a different incident from ninety
+in `STARTING` — and a shared clock would report the ready window as
+720 seconds when it ran 600. The tests pin the arithmetic: a ready
+timeout after a two-poll start reads `clock.now() == 602.0` with
+`elapsed == 600.0`.
+
+When a deadline elapses, the phase's error is raised:
+[`StartTimeoutError`](../src/tool_swap/lifecycle/manager.py:59)
+leaves the holder `STARTING`,
+[`ReadyTimeoutError`](../src/tool_swap/lifecycle/manager.py:67)
+leaves it `LOADING`. Both subclass the built-in `TimeoutError`
+(through a shared `ReadinessTimeoutError` base that holds the
+pinned attributes once) and both carry `deadline` — which of the two
+ran out — and `elapsed`, the simulated seconds it ran, so an
+operator can tell a hung start from a hung ready. **A timeout
+raises; it does not mark the tool `FAILED`.** That transition is a
+later behaviour (16 in the plan's ledger), so the holder is left in
+the phase it hung in for the caller to classify.
+
+### Waiting goes through the clock, never `asyncio.wait_for`
+
+Each wait is `await clock.sleep(probe_interval)`, and each deadline
+is a comparison against `clock.now()` before every poll. The
+prohibition is load-bearing: `asyncio.wait_for`'s deadline is the
+*event loop's* clock, which a `ManualClock` does not control — a
+`wait_for` here would wait 120 real seconds against a 20-second
+suite. A first-call true answer breaks before the sleep, so a warm
+tool costs zero simulated time.
+
+### A module-level coroutine, not a method
+
+`drive_readiness` lives in
+[`manager.py`](../src/tool_swap/lifecycle/manager.py) but is a free
+coroutine, not a `LifecycleManager` method, because the manager
+class belongs to the next slice (behaviour 12): a free coroutine
+keeps this slice shippable on its own, and the class will delegate
+to it. The three deadline parameters default to values read from
+[`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:42)
+rather than retyped, so the signature cannot drift from the config
+layer.
+
 ## What this page does not claim
 
-- **There is no `LifecycleManager`.** Nothing calls
-  `apply_transition`; the manager is slice D, and it is what will own
-  coalescing, timeouts and the liveness sweep. This slice ships the
-  machine, not its driver.
-- **No probe exists.** That is slice C. The
-  `STARTING → LOADING → READY` progression is *expressible* by the
-  table, but nothing drives it yet — the trigger column above is what
-  the table accepts, not what currently fires.
-- **No container has been started.** Every test in the slice is pure:
-  no daemon, no event loop; time is a `ManualClock` value, not a
-  running clock.
+- **There is no `LifecycleManager` class.** The driver above is a
+  free coroutine; the class that will own coalescing, the liveness
+  sweep and the `FAILED` transitions arrives in slice D, and
+  nothing in the shipped tree calls `drive_readiness` from the
+  router yet.
+- **No *real* probe exists.** The seam and its scripted double are
+  shipped (slice C); M3 ships the probe that opens sockets. And
+  `drive_readiness` raises on a timeout rather than marking the
+  holder `FAILED` — that is behaviour 16's.
+- **No container has been started.** Every test in the slice is
+  pure: no daemon, no event loop; time is a `ManualClock` value,
+  not a running clock.
 - **`ModelRuntimeState` enforces no invariants** — see
   [the section above](#modelruntimestate-seven-fields-no-invariants).
   Consistency between `state` and `handle` is the manager's
@@ -330,13 +426,18 @@ step can refuse.
   this machine holds, the `ContainerState` that answers a different
   question, and the error taxonomy whose `message` feeds
   `last_error`.
+- [`docs/readiness-probe.md`](readiness-probe.md) — the `Probe`
+  seam `drive_readiness` polls: the two-method protocol, the
+  no-URL address, the no-HTTP-client guard and the scripted double.
 - [`docs/spec-builder.md`](spec-builder.md) — slice A of the same
   milestone: how the `ContainerSpec` the machine will eventually start
   is built.
 - [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
   — [§1.1](../plans/m2b-lifecycle-manager.md:130) and
   [§1.2](../plans/m2b-lifecycle-manager.md:184) for the design,
-  [§3 slice B](../plans/m2b-lifecycle-manager.md:554) for the
+  [§1.3](../plans/m2b-lifecycle-manager.md:271) for the clock
+  rules, [§3 slice B](../plans/m2b-lifecycle-manager.md:554) and
+  [§3 slice C](../plans/m2b-lifecycle-manager.md:689) for the
   behaviour ledger, and [§6.10](../plans/m2b-lifecycle-manager.md:1285)
   for the field arithmetic and its correction.
 - [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §4 — the
