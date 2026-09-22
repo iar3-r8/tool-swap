@@ -3,10 +3,10 @@
 When a tool's container starts, there is a window in which the process
 is not yet up, and a longer window in which the process is up but the
 model weights are still loading and it cannot serve anything. During
-that whole ramp-up, the router needs to be able to ask the tool two
-separate questions: *is your process running yet?* and *are you
-ready to take traffic yet?* This page documents the seam that makes
-those two questions possible: the
+that whole ramp-up, the router needs to ask the tool two separate
+questions: *is your process running yet?* and *are you ready to take
+traffic yet?* This page documents the seam that makes those two
+questions possible: the
 [`Probe`](../src/tool_swap/proxy/probes.py:22) protocol, the
 [`ProbeTarget`](../src/tool_swap/proxy/probes.py:37) address a probe
 receives, and
@@ -18,47 +18,40 @@ Without a probe, the router has no way to move a tool past `STARTING`
 or `LOADING`: to Docker the container is `running` the whole time, and
 routing on container liveness alone would send requests into a process
 that is still loading weights. The probe is what turns "the container
-exists" into "the tool can serve". It is also a **seam, not an
-implementation**: the protocol is the shape M3's real HTTP probe must
-fit, and the tests pin that shape so M3 cannot redesign it.
+exists" into "the tool can serve".
+
+**What is not here:** there is no real probe in this tree, and none
+can be — the repository declares no HTTP client at all, and a guard
+test fails the suite if one is ever imported into this module. What is
+here is the *contract* and a scripted *double* (a stand-in the tests
+can drive) that answers it; a future real probe must fit the same
+shape.
 
 **Where it sits:** the [backend seam
 page](backend-seam.md) documents the layer that *starts* the
 container; [the tool state machine page](tool-state-machine.md)
-documents the six states the probe answers exist to move between.
-The probe sits between the two: it is consumed by
-[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), the
-first driver of the state machine, which polls it and applies the
-`STARTING → LOADING → READY` transitions on its answers. The probe
-itself knows nothing about containers, backends or states — it takes
-an address and returns a `bool`.
+documents the six states the probe answers exist to move between. The
+probe sits between the two: it is consumed by
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), which
+polls it and applies the `STARTING → LOADING → READY` transitions on
+its answers. The probe itself knows nothing about containers, backends
+or states — it takes an address and returns a `bool`.
 
-One honest caveat before the detail: **no real probe exists in this
-tree, and none can.** The repository declares no HTTP client at all,
-and a guard test fails the suite if one is ever imported in this
-module. What ships is the contract and the double; M3 ships the probe
-that opens sockets.
+## Where this page stops
 
-## Status and design sources
-
-**Status: slice C of M2b, shipped — the seam, not the probe.**
-M2b is the project plan's milestone for the lifecycle layer, and
-"slices A, B and C" are this branch family's shares of it: slice A
-the [spec builder](spec-builder.md), slice B the
-[state machine](tool-state-machine.md), slice C this seam plus the
-progression that consumes it. The module is a declaration and a test
-double: no socket, no HTTP client, no I/O. Its consumer,
-`drive_readiness`, is shipped too — but the `LifecycleManager` class
-that will own the seam in production arrives in slice D, and the
-probe that answers with real HTTP arrives in M3.
-
-The design is in
-[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
-[§1.5](../plans/m2b-lifecycle-manager.md:352) for the seam,
-[D-B](../plans/m2b-lifecycle-manager.md:1152) for the no-client
-decision, [§3 slice C](../plans/m2b-lifecycle-manager.md:689) for the
-behaviour ledger, and [§6.11](../plans/m2b-lifecycle-manager.md:1367)
-for the failure mode deliberately left unmodelled.
+The seam, its address type and `FakeProbe` are in the tree, and
+`drive_readiness` — the code that polls the seam and moves states — is
+in the tree and fully tested. What is not: a probe that opens sockets
+(depends on an HTTP client the project has not chosen yet), the
+`LifecycleManager` class that will own the seam in production, and any
+model of a probe that *raises* on transport failure, because the shape
+of that failure depends on whichever client is declared. The design
+and its reasoning are in
+[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
+— [§1.5](../plans/m2b-lifecycle-manager.md:367) for the seam,
+[D-B](../plans/m2b-lifecycle-manager.md:1167) for the no-client
+decision, and [§6.11](../plans/m2b-lifecycle-manager.md:1382) for the
+deliberately unmodelled transport failure.
 
 ## The protocol: two questions, kept separate
 
@@ -81,10 +74,10 @@ machine exists to express.
 
 The other two shape decisions are `async` and `bool`:
 
-- **Async**, because M3's probe will be async HTTP; declaring it now
-  avoids an executor hop and a later signature change. This does not
-  contradict the backend seam staying synchronous — the probe is a
-  new seam of M2b's own, and the two coexist by design.
+- **Async**, so a real probe that waits on HTTP can implement the
+  protocol without forcing a thread hop onto its callers. This does
+  not contradict the backend seam staying synchronous — the probe is
+  a different seam, and the two coexist by design.
 - **`bool`, not a status object**, because the driver owns the
   deadlines. A probe that returned a state would be a second state
   machine; a `false` answer plus a deadline is the whole contract.
@@ -109,8 +102,8 @@ The complete address of one tool, and **nothing else — no URL**,
 because the probe composes the URL and this type owns no client; a
 pre-composed URL would put HTTP vocabulary into a type that has no
 transport. `host` is the **container name**, because tools are
-addressed by name on the shared network (D21,
-[`plan/01` §7](../plan/01_ARCHITECTURE.md:365)) — so the probe needs
+addressed by name on the shared network
+([`plan/01` §9](../plan/01_ARCHITECTURE.md:371)) — so the probe needs
 neither config access nor container knowledge.
 
 `frozen` and `slots` are load-bearing: without them a probe or the
@@ -131,9 +124,10 @@ The declared dependencies of this repository are `typer`, `pydantic`,
 `pyyaml`, `python-dotenv`, `jsonschema` and `docker`
 ([`pyproject.toml`](../pyproject.toml)); `requests` exists only
 transitively under `docker`, and importing it directly would be an
-undeclared dependency. D-B therefore makes the probe **a seam with no
-client**, and the rule is made executable rather than merely
-documented:
+undeclared dependency. The no-client decision
+([D-B](../plans/m2b-lifecycle-manager.md:1167)) makes the probe
+**a seam with no client**, and the rule is made executable rather
+than merely documented:
 
 - [`tests/unit/proxy/probe_guard.py`](../tests/unit/proxy/probe_guard.py)
   walks the **written** imports of `probes.py` as an AST and fails on
@@ -148,7 +142,7 @@ documented:
   `sys.modules`, so a dynamic check would go red on a clean tree
   depending on test order.
 
-The guard was verified against the real file, not only against
+The guard is verified against the real file, not only against
 in-memory decoys: a planted `import requests` fails naming its line,
 and the file is byte-identical after revert.
 
@@ -177,9 +171,10 @@ so a test that does not care about probing scripts nothing. The
 `None` sentinel is the weak point of the mapping — it means both
 "absent, so default true" and "scripted never true", and the
 implementation disambiguates with an explicit membership check before
-the read — and is recorded as the place to revisit if a fourth script
-shape ever appears (plan §6.11 names M3's transport failure as the
-likely one).
+the read. That is the place to revisit if a fourth script shape ever
+appears; the plan names the likely one
+([§6.11](../plans/m2b-lifecycle-manager.md:1382)): a transport
+failure.
 
 `FakeProbe` also carries a **call journal**: `probe.calls` is a list
 of `(method, tool)` pairs in call order, recorded on entry and
@@ -196,15 +191,15 @@ as long as the simulated deadline lasts.
 
 - **There is no real probe.** No socket is opened anywhere in this
   tree, and the no-HTTP guard makes it impossible to add one to this
-  module without failing the suite. M3's probe implements `Probe`;
-  this page documents the shape it must fit.
+  module without failing the suite. A real probe will implement
+  `Probe`; this page documents the shape it must fit.
 - **A probe that raises is not modelled.** A transport failure —
   connection refused, TLS error, a malformed response — is a real
-  scenario, but its shape depends on the HTTP client M3 declares, and
-  inventing it here would be an unverified claim about a dependency
-  that does not exist. The plan records the hand-off: M3 must add
-  that failure mode to `FakeProbe` alongside the real probe
-  ([§6.11](../plans/m2b-lifecycle-manager.md:1367)).
+  scenario, but its shape depends on the HTTP client that does not
+  exist yet, and inventing it here would be an unverified claim about
+  a dependency. The plan records the hand-off
+  ([§6.11](../plans/m2b-lifecycle-manager.md:1382)): the real probe
+  must add that failure mode to `FakeProbe` alongside it.
 - **The double is not a simulation of timing.** It answers by call
   count, not by elapsed time; the simulated time in the tests comes
   from the `ManualClock`, not from the probe.
@@ -212,17 +207,16 @@ as long as the simulated deadline lasts.
 ## Where to go deeper
 
 - [`docs/tool-state-machine.md`](tool-state-machine.md) — the states
-  these answers move between, and `drive_readiness`, the first
-  driver that polls this seam.
+  these answers move between, and `drive_readiness`, the driver that
+  polls this seam.
 - [`docs/backend-seam.md`](backend-seam.md) — the `ContainerState`
   that asks a different question, and why `FakeBackend` deliberately
   has no "never ready" failure mode.
 - [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
-  — [§1.5](../plans/m2b-lifecycle-manager.md:352) for the seam's four
-  shape decisions, [§3 slice C](../plans/m2b-lifecycle-manager.md:689)
-  for the behaviour ledger, and
-  [§6.11](../plans/m2b-lifecycle-manager.md:1367) for the unmodelled
+  — [§1.5](../plans/m2b-lifecycle-manager.md:367) for the seam's four
+  shape decisions, and
+  [§6.11](../plans/m2b-lifecycle-manager.md:1382) for the unmodelled
   transport failure.
 - [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §4 — why
-  `STARTING` and `LOADING` are distinct, and §7 (D21) for why tools
-  are addressed by container name.
+  `STARTING` and `LOADING` are distinct, and §9 for why tools are
+  addressed by container name.

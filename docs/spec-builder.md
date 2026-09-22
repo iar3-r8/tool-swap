@@ -27,11 +27,11 @@ page](backend-seam.md) documents what consumes that spec to actually
 start, stop and inspect the container. If you do not yet know what the
 `backend:` block looks like, start with the Configuration guide.
 
-One honest caveat before the detail: **nothing in the shipped tree
-calls this function yet.** The component that will use it, the
-`LifecycleManager`, is planned but not built, so no container has been
-started through this path. The rest of the page documents the
-function in full, and says explicitly where it stops.
+One honest caveat before the detail: **nothing in the router calls
+this function yet.** The component that will use it, the
+`LifecycleManager`, is not built, so no container has been started
+through this path. The rest of the page documents the function in
+full, and says explicitly where it stops.
 
 ## The function
 
@@ -150,28 +150,25 @@ The `backend:` values reach the spec because the builder takes
 `BackendConfig` as a separate argument — the resolver never merged
 them; see [the trap](#the-trap-backendconfig-never-values) below.
 
-## Status and design sources
+## Where this page stops
 
-**Status: slice A of M2b, shipped — the layer above the seam.** M2b is
-the project plan's milestone for the lifecycle layer, and "slice A" is
-this branch's share of it. The function is pure: two config objects
-and an image reference in, one `ContainerSpec` out. It is the **only
-place a `ParsedMount` becomes a `MountSpec`**, so it is the only place
-the `mode → read_only` normalisation can live. It has **no caller
-yet**: the `LifecycleManager` that consumes it arrives in slice D, and
-nothing in the shipped tree calls `build_container_spec` today.
-[The backend seam page](backend-seam.md) documents what the spec is
-consumed *by*; this page documents how the spec is *built*, and it
-says explicitly where it stops.
+The function is pure: two config objects and an image reference in,
+one `ContainerSpec` out. It is the **only place a `ParsedMount`
+becomes a `MountSpec`**, so the `mode → read_only` normalisation can
+live in only one place. It has **no caller yet**: the
+`LifecycleManager` that consumes it is not built, so nothing in the
+router calls `build_container_spec` today and no container has been
+started through this path. [The backend seam
+page](backend-seam.md) documents what the spec is consumed *by*; this
+page documents how the spec is *built*.
 
-The design is in
-[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
-§3 slice A for the behaviours,
-[D-D](../plans/m2b-lifecycle-manager.md:1059) and
-[D-E](../plans/m2b-lifecycle-manager.md:1068) for the two settled
+The design and its reasoning are in
+[`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
+— [D-D](../plans/m2b-lifecycle-manager.md:1192) and
+[D-E](../plans/m2b-lifecycle-manager.md:1201) for the two settled
 refusals (the illegal mount mode, and `expose_host_port: true`), and
-[§6.3](../plans/m2b-lifecycle-manager.md:1139) and
-[§6.4](../plans/m2b-lifecycle-manager.md:1161) for the two config-layer
+[§6.3](../plans/m2b-lifecycle-manager.md:1272) and
+[§6.4](../plans/m2b-lifecycle-manager.md:1294) for the two config-layer
 gaps this function works around rather than fixes.
 
 ## The field mapping
@@ -219,9 +216,10 @@ boundary that refuses it with a message that names the fix.
 ## The trap: `BackendConfig`, never `values`
 
 `BackendConfig` is a **separate required argument**, never read out of
-`resolved.values`. This is the subtlest thing the branch ships, and a
-reader who does not know it will reach for `values` — the code would
-type-check, pass a naive test, and fail much later in a different place.
+`resolved.values`. This is the subtlest thing about the builder, and
+a reader who does not know it will reach for `values` — the code would
+type-check, pass a naive test, and fail much later in a different
+place.
 
 The shape of the trap:
 
@@ -247,11 +245,11 @@ the router itself started** — `list_managed` filters by the
 configured namespace and cannot see the wrongly-labelled containers.
 
 **This is a live gap in the config layer, not a style rule**
-([plan §6.3](../plans/m2b-lifecycle-manager.md:1139)). The real fix
-belongs there — either a `backend:` layer in the resolver, or removing
-the backend keys from the tool-level key set so the wrong value is
-unreachable rather than merely unused — and it is **not filed by this
-branch**. Until it lands, two local mitigations hold the line:
+([§6.3](../plans/m2b-lifecycle-manager.md:1272)). The real fix belongs
+there — either a `backend:` layer in the resolver, or removing the
+backend keys from the tool-level key set so the wrong value is
+unreachable rather than merely unused — and it is **not yet fixed in
+the tree**. Until it lands, two local mitigations hold the line:
 `BackendConfig` is a required argument of the builder, and the second
 [guard](#the-two-guards) fails the suite if any backend-named key is
 ever read out of `values` under `lifecycle/`.
@@ -284,7 +282,7 @@ validation's job (`TSWAP-C503`).
 Three refusals, all raising:
 
 1. **A mode that is neither `ro` nor `rw` raises**
-   ([D-D](../plans/m2b-lifecycle-manager.md:1059)). The loud default
+   ([D-D](../plans/m2b-lifecycle-manager.md:1192)). The loud default
    over the safe one: a silent downgrade to read-only would hide a
    bypassed validator and yield a container whose mounts do not match
    its config. It is unreachable unless config validation was
@@ -310,8 +308,7 @@ A `mounts` value that is not a list of strings raises `TypeError`, and
 ([`schema.py:447`](../src/tool_swap/config/schema.py:447)), so four
 forms are reachable, and
 [`_published_port`](../src/tool_swap/lifecycle/spec_builder.py:210)
-pins all four
-([D-E](../plans/m2b-lifecycle-manager.md:1068)):
+pins all four ([D-E](../plans/m2b-lifecycle-manager.md:1201)):
 
 | Authored value | `published_port` |
 |---|---|
@@ -334,15 +331,15 @@ only then fail.
 description promises that `true` "auto-allocates from
 `backend.port_range`", and **no allocator exists**: nothing outside
 `schema.py`, `defaults.py` and the validation rules reads
-`port_range` ([plan §6.4](../plans/m2b-lifecycle-manager.md:1161)).
-The generated [Configuration reference](configuration.md) reproduces
-that schema description, so it carries the same promise — the text is
-a promise, not a working feature. The builder therefore raises a
+`port_range` ([§6.4](../plans/m2b-lifecycle-manager.md:1294)). The
+generated [Configuration reference](configuration.md) reproduces that
+schema description, so it carries the same promise — the text is a
+promise, not a working feature. The builder therefore raises a
 `ValueError` that names the gap and tells the operator to write an
 explicit port, rather than inventing an allocation policy inside a
 spec builder. The right fix — an allocator, or a `TSWAP-C` rule
-rejecting `true` — belongs to the config layer and is **not filed by
-this branch**.
+rejecting `true` — belongs to the config layer and is **not yet fixed
+in the tree**.
 
 One last asymmetry: `true` and the integer `1` are **deliberately not
 interchangeable** despite being equal in Python (`True == 1`, and
@@ -352,8 +349,8 @@ because a naive int check would publish port `1` for `true`.
 ## The two guards
 
 Ordinary tests cannot police the two boundaries above — a regression
-there compiles, type-checks and passes this slice's behaviour tests —
-so behaviour 4 ships two source-level guards, in
+there compiles, type-checks and passes the builder's tests — so two
+source-level guards walk the source tree, in
 [`tests/unit/lifecycle/test_spec_builder_guards.py`](../tests/unit/lifecycle/test_spec_builder_guards.py),
 with the AST detectors in
 [`tests/unit/lifecycle/spec_builder_guards.py`](../tests/unit/lifecycle/spec_builder_guards.py).
@@ -364,11 +361,12 @@ neither writes anything under `src/`.
 `src/tool_swap/lifecycle/` (excluding `__pycache__`) and fails on a
 `split` / `partition` / `rpartition` / `re.split` call whose
 **first positional argument** is the literal `":"`, or on any callable
-**defined** `parse_mount`. M2a's one-parser guard walks
-`src/tool_swap/backend/` only — the conversion has since moved into a
-directory nothing policed, and this walk is what keeps it a *call* to
-[`parse_mount`](../src/tool_swap/config/validate.py:2488) rather than a
-copy. A *call* to the legitimate parser is not an offender, nor is a
+**defined** `parse_mount`. The backend's one-parser guard walks
+`src/tool_swap/backend/` only; this walk covers the directory the
+`ParsedMount` → `MountSpec` conversion lives in, and is what keeps it
+a *call* to
+[`parse_mount`](../src/tool_swap/config/validate.py:2488) rather than
+a copy. A *call* to the legitimate parser is not an offender, nor is a
 split on another separator, nor a separator carried by a later
 argument.
 
@@ -386,37 +384,35 @@ carried two ways: in-memory decoys (string constants parsed with
 `ast.parse`, covering both the reach side — each violation shape must
 be reported — and the precision side — benign colons and the builder's
 own legitimate code must not be) and **real violations injected into
-the source tree** — a backend-key read at line 35 and a second parser
-at lines 236/238 — each confirmed caught before the tree was restored
-(commit `7478dc9`).
+the source tree**, each confirmed caught before the tree was restored.
 
 **The key-set pin is a subset, not an exact match.** `BACKEND_KEYS` is
 pinned against `BUILT_IN_DEFAULTS` by a subset check, because the four
 trap keys cannot be derived from the eight backend keys without
 restating them. It fails if one of the four **disappears** from
 `BUILT_IN_DEFAULTS`; it does **not** fail if a fifth backend-named key
-is **added** and goes unpoliced. That residual gap is recorded
-(commit `ada2dea`) and stated here rather than papered over.
+is **added** and goes unpoliced. That residual gap is stated here
+rather than papered over.
 
 ## What this page does not claim
 
-- **No daemon verification.** Every test on the branch is a pure
-  function over config objects. No container has been started, no
-  socket opened, no docker fact asserted.
-- **The builder has no caller yet.** `LifecycleManager` arrives in
-  slice D; until then `build_container_spec` is a reviewed, guarded
-  function with no production consumer.
+- **No daemon verification.** Every test here is a pure function over
+  config objects. No container has been started, no socket opened, no
+  docker fact asserted.
+- **The builder has no caller yet.** The `LifecycleManager` that
+  would use it is not built, so `build_container_spec` is a reviewed,
+  guarded function with no production consumer.
 - **`expose_host_port: true` is not supported.** The schema
   description promising an auto-allocation is currently wrong; writing
   `true` yields the `ValueError` documented above.
 - **The guard's key set is a subset pin**, not an exact one — a fifth
   unpoliced backend key would not fail the suite.
-- **The two config-layer gaps are recorded, not fixed** — `backend:`
-  is not a resolver layer
-  ([§6.3](../plans/m2b-lifecycle-manager.md:1139)) and there is no
-  port allocator
-  ([§6.4](../plans/m2b-lifecycle-manager.md:1161)). Both are left
-  unfiled by this branch, deliberately.
+- **The two config-layer gaps are not fixed** — `backend:` is not a
+  resolver layer ([§6.3](../plans/m2b-lifecycle-manager.md:1272)) and
+  there is no port allocator
+  ([§6.4](../plans/m2b-lifecycle-manager.md:1294)). Both remain open
+  in the tree; the builder works around each with a refusal or a
+  required argument.
 
 ## Where to go deeper
 
@@ -428,7 +424,9 @@ is **added** and goes unpoliced. That residual gap is recorded
   configured; the generated [Configuration
   reference](configuration.md) for exact types and defaults.
 - [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
-  — the behaviour ledger for slice A (§3), the settled decisions D-D
-  and D-E (§5), and the open assumptions §6.3 and §6.4.
+  — the settled decisions D-D and D-E
+  ([§5](../plans/m2b-lifecycle-manager.md#5-settled-decisions)) and the
+  open assumptions
+  (§6.3, §6.4 in [§6](../plans/m2b-lifecycle-manager.md#6-open-assumptions)).
 - [`plan/01_ARCHITECTURE.md`](../plan/01_ARCHITECTURE.md) §10 — why
   mounts are read-only by default.
