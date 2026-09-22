@@ -114,6 +114,21 @@ what proves the work landed. M2a set the identical trap and it cost time to unpi
 Baseline re-measured at `b3fafef` before branching: **1698 passed, 2 skipped**, `make lint`
 clean with mypy strict over 40 source files, `lint-imports` 5 kept, 0 broken.
 
+**Slice C is complete and shipped as
+[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, open against `main`. Head `90d51d4`,
+ten commits, documentation commit `90d51d4` preceding the pull request. At the tip: 1744
+passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5 kept, 0 broken.
+Because it branched from `main`, CI runs without retargeting.
+
+The push used the `.roo/mcp.json` token, as §0.2 of the M2a plan records — but **the
+one-shot `http.extraheader` did not work here** and the method note should be corrected
+before slice D repeats it. VS Code's credential helper is consulted first and fails with
+"terminal prompts disabled" before the header is offered, and adding
+`-c credential.helper=` to disable it does not help, because the header alone leaves git
+with no username to send. What worked was putting the token in the push URL for that one
+invocation, `https://x-access-token:${TOKEN}@github.com/...`, which writes nothing to
+`.git/config` and leaves the `origin` remote unchanged — both verified after the push.
+
 Behaviour 9 needed **two** red commits, and the reason is the most useful thing this slice
 learned. Its no-HTTP guard passed the bare `probes_source` *function* to `ast.parse`
 instead of calling it, so the scan raised `TypeError: compile() arg 1 must be a string`
