@@ -45,7 +45,8 @@ M6_FIELDS: Final[frozenset[str]] = frozenset(
 
 
 def _get_states_module() -> ModuleType:
-    """Import tool_swap.lifecycle.states at call time, RED-safely.
+    """Import tool_swap.lifecycle.states at call time, so a missing
+    module fails as an informative assertion, not a collection error.
 
     Raises:
         AssertionError: the module is missing; the message names the
@@ -61,7 +62,8 @@ def _get_states_module() -> ModuleType:
 
 
 def _get_model_runtime_state() -> type[Any]:
-    """Return the ModelRuntimeState class, RED-safely.
+    """Return the ModelRuntimeState class; a missing name raises an
+    informative AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the class is missing from states.py.
@@ -76,7 +78,8 @@ def _get_model_runtime_state() -> type[Any]:
 
 
 def _tool_state() -> type[Any]:
-    """Return the ToolState class from the same module, RED-safely.
+    """Return the ToolState class from the same module; a missing name
+    raises an informative AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the class is missing from states.py.

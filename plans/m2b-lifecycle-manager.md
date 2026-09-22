@@ -84,14 +84,79 @@ Baseline re-measured at `main` (`ff2428f`) rather than trusted: **1524 passed, 2
 `feature/m2b-spec-builder` rather than `main`, so its diff shows only behaviours 5–8.
 Head `2ed0859`, documentation commit `2ed0859` preceding the pull request.
 
-**#15 runs no CI until it is retargeted to `main`**, which happens when #14 merges. The
-workflow triggers on `branches: [main]` only, so the absence of a check is configuration
+**#15 ran no CI until it was retargeted to `main`**, which happened when #14 merged. The
+workflow triggers on `branches: [main]` only, so the absence of a check was configuration
 rather than failure — and retargeting is what makes CI run, so it should happen before
 approval rather than after.
 
-**Slice C branches from `2ed0859`**, for the reason §2.1 records: #15's head *is*
-`feature/m2b-state-machine`, so continuing to commit there would absorb slice C into the
-open pull request.
+**Slice C branches from `main` at `b3fafef`**, superseding this section's earlier
+instruction to branch from `2ed0859`. That instruction was correct while #15 was open and
+slice C would otherwise have been absorbed into it; both slices have since merged, so
+`main` now carries behaviours 1–8 and is the right base. Because slice C branches from
+`main` rather than from another branch, **its pull request runs CI normally** and needs no
+retargeting.
+
+**Verify that by tree, not by ancestry.** The GitHub API reports `mergeable_state:
+unknown` for #14 and #15, and `git merge-base --is-ancestor feature/m2b-state-machine
+origin/main` answers *no*, because a squash merge rewrites the commits and leaves no
+ancestry link. Both readings are misleading. The tree is what matters:
+`git diff origin/main feature/m2b-state-machine` is empty but for later commits, which is
+what proves the work landed. M2a set the identical trap and it cost time to unpick.
+
+**Slice C** — `feature/m2b-probe-seam`, branched from `main` at `b3fafef`:
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 9 | `Probe` protocol and `ProbeTarget` | `1de9832`, repaired by `dd10933` | `e057cdd` | 1713 passed, 2 skipped |
+| 10 | `FakeProbe` — three scripts, call journal | `a22c323` | `1ca3684` | 1737 passed, 2 skipped |
+| 11 | `STARTING → LOADING → READY` | `9c23f1b` | `907a1fb` | 1744 passed, 2 skipped |
+
+Baseline re-measured at `b3fafef` before branching: **1698 passed, 2 skipped**, `make lint`
+clean with mypy strict over 40 source files, `lint-imports` 5 kept, 0 broken.
+
+**Slice C is complete and shipped as
+[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, open against `main`. Head `90d51d4`,
+ten commits, documentation commit `90d51d4` preceding the pull request. At the tip: 1744
+passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5 kept, 0 broken.
+Because it branched from `main`, CI runs without retargeting.
+
+The push used the `.roo/mcp.json` token, as §0.2 of the M2a plan records — but **the
+one-shot `http.extraheader` did not work here** and the method note should be corrected
+before slice D repeats it. VS Code's credential helper is consulted first and fails with
+"terminal prompts disabled" before the header is offered, and adding
+`-c credential.helper=` to disable it does not help, because the header alone leaves git
+with no username to send. What worked was putting the token in the push URL for that one
+invocation, `https://x-access-token:${TOKEN}@github.com/...`, which writes nothing to
+`.git/config` and leaves the `origin` remote unchanged — both verified after the push.
+
+Behaviour 9 needed **two** red commits, and the reason is the most useful thing this slice
+learned. Its no-HTTP guard passed the bare `probes_source` *function* to `ast.parse`
+instead of calling it, so the scan raised `TypeError: compile() arg 1 must be a string`
+and never walked a tree. At the red step the subject-exists gate failed first and hid it,
+so the guard was **neither honestly red nor honestly green — it was erroring in both
+states**. Planting `import requests` would have produced the same `TypeError` as a clean
+tree, so the injection discipline alone would *not* have caught it. What caught it was the
+coder refusing to edit a test to reach green and reporting it instead. The repair is
+`dd10933`; the helper's return type went from `tuple[Path, Any, Any]` to named `Callable`
+aliases, so the same mistake now fails type checking rather than at runtime.
+
+Guards were then verified against the real file rather than only against decoys:
+`import requests` at line 14 and `from httpx import AsyncClient` at line 16 each fail
+naming their line, and `probes.py` is byte-identical after revert. Behaviour 11's green
+was checked by mutation for the same reason — making the ready window share the start
+clock turns `test_ready_timeout` red at the 720.0 the plan warns of, and replacing the
+`LOADING` transition with a direct field assignment turns three tests red.
+
+Behaviour 11's arithmetic claim was checked against source before delegating, as §0.2's
+precedent requires: `start_timeout` 120, `ready_timeout` 600 and `probe_interval` 1.0 are
+all real at [`defaults.py`](../src/tool_swap/config/defaults.py:42). The claim held.
+
+Two open decisions were reported rather than absorbed, both left as the plan has them: a
+probe that **raises** stays unmodelled, since a transport failure is M3's real probe's
+concern; and a flapping true-then-false script was considered and not added. One API the
+plan left open was decided — behaviour 11 lives as a module-level `drive_readiness` in
+`manager.py`, because `LifecycleManager` is behaviour 12's and slice C must ship without
+it; the class can delegate to the coroutine when slice D builds it.
 
 Two tests in slice B assert an *absence* and therefore pass before their feature exists,
 which would normally make them worthless as red steps. Both were checked by injecting the

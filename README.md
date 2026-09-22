@@ -107,11 +107,11 @@ tool-swap/
 │   │   ├── schema/             # JSON Schema compilation, tool definitions
 │   │   ├── registry/           # Tool registry, model definitions
 │   │   ├── scheduler/          # Dispatch, batching, occupancy accounting
-│   │   ├── lifecycle/          # Container lifecycle (spec builder and tool state machine shipped)
+│   │   ├── lifecycle/          # Container lifecycle (spec builder, state machine, readiness driver)
 │   │   ├── backend/            # Pluggable container backends (Docker, fake)
 │   │   ├── preflight/          # Deployment gate: checks, runner, report
 │   │   │   └── checks/         # Static, build, boot, readiness, contract checks
-│   │   ├── proxy/              # Streaming reverse proxy, health probes
+│   │   ├── proxy/              # Streaming reverse proxy; readiness probe seam (no HTTP client yet)
 │   │   ├── api/                # FastAPI routes (run, upstream, admin, discovery)
 │   │   │   └── ui/             # Status page (single HTML file, no build step)
 │   │   ├── observability/      # Logging, metrics, request IDs
@@ -134,7 +134,7 @@ tool-swap/
 │   ├── runtime/contract/       # Runtime contract tests
 │   ├── integration/            # Docker-based integration tests
 │   └── e2e/                    # End-to-end quickstart test
-├── docs/                       # User documentation (configuration guide, reference, backend seam, spec builder)
+├── docs/                       # User documentation (configuration guide, reference, backend seam, spec builder, state machine, readiness probe)
 ├── deploy/                     # Deployment artifacts (systemd, prometheus, grafana)
 └── plan/                       # Implementation plans and architecture docs
 ```

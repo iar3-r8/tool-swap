@@ -15,7 +15,8 @@ import pytest
 
 
 def _get_states_module() -> ModuleType:
-    """Import tool_swap.lifecycle.states at call time, RED-safely.
+    """Import tool_swap.lifecycle.states at call time, so a missing
+    module fails as an informative assertion, not a collection error.
 
     Raises:
         AssertionError: the module is missing; the message names the
@@ -31,7 +32,8 @@ def _get_states_module() -> ModuleType:
 
 
 def _get_tool_state() -> type[Any]:
-    """Return the ToolState class, RED-safely.
+    """Return the ToolState class; a missing name raises an informative
+    AssertionError instead of a bare AttributeError.
 
     Raises:
         AssertionError: the module or class is missing.
