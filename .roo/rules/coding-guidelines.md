@@ -12,6 +12,7 @@ trigger: always_on
 ## Documentation guidelines
 
 - A docstring explains what the code pins and why it could fail — never how the decision was reached. Decisions and rationale belong in the commit message and the plan: both are permanent, searchable, and already required.
+- Documentation pages (and docstrings) describe the system as it is now, not the work that produced it: no slice letters, milestone identifiers, behaviour numbers, pull request numbers, commit hashes, or "shipped/planned" sequencing in prose. Capability limits are allowed; project schedules are not. The full standard, with examples and the pre-finish self-check, is in `.roo/rules-docs-manager/guidelines.xml` — it applies to every mode that writes documentation, not only Docs Manager.
 - Keep docstrings short. A test docstring is normally one to three lines; one approaching the length of the code it documents is narrating the decision — move the narrative to the commit message or the plan.
 - Minimal inline comments - only explain non-obvious logic or technical constraints
 - Never document a flag or command from memory; confirm against the code first
