@@ -12,7 +12,7 @@ they fail differently:
    shape-pinning tests parse the shipped ``.importlinter`` (mirroring
    ``tests/unit/test_import_boundaries.py``'s configparser idiom and
    copied helpers); the subprocess test runs ``lint-imports`` and
-   asserts all five contracts are kept.
+   asserts all six contracts are kept.
 
 2. **``fake_backend``, ``base`` and ``labels`` import with ``docker``
    blocked from the import system** — the load-bearing behavioural
@@ -73,8 +73,8 @@ memory:
   edge and the chain search sees it directly.
 
 **The RED gate.**  The contract is not in the tree yet, so the
-session-option, shape and five-names tests fail individually, and the
-subprocess test fails on the ``5 kept`` summary line — with their
+session-option, shape and six-names tests fail individually, and the
+subprocess test fails on the ``6 kept`` summary line — with their
 assertions present and reachable, never aborting pytest collection.
 The non-vacuity tests (built from the pinned literal options) and the
 SDK-absent tests guard machinery that already holds and are expected
@@ -122,6 +122,13 @@ IMPORTLINTER_CONFIG = ROOT / ".importlinter"
 #: ("docker is importable from one module only").
 DOCKER_CONTRACT_NAME = "The docker SDK is importable from one module only"
 
+#: The sixth contract's name, quoted verbatim from
+#: ``tests/unit/lifecycle/test_lifecycle_docker_backend_boundary.py``
+#: so the two files pin the same string.
+LIFECYCLE_BACKEND_CONTRACT_NAME = (
+    "The lifecycle and proxy layers never import the docker backend"
+)
+
 #: The four names pinned by behaviour 7 (``tests/unit/test_imports.py``)
 #: and behaviour 26 (``tests/unit/test_import_boundaries.py``), quoted
 #: verbatim.
@@ -133,6 +140,12 @@ _PREVIOUS_CONTRACT_NAMES = frozenset(
         "The schema compiler does not depend on the pydantic config models",
     }
 )
+
+#: All six contract names in the shipped .importlinter.
+_ALL_SIX_CONTRACT_NAMES = _PREVIOUS_CONTRACT_NAMES | {
+    DOCKER_CONTRACT_NAME,
+    LIFECYCLE_BACKEND_CONTRACT_NAME,
+}
 
 #: The module the SDK is forbidden from, and the one module it is
 #: permitted from.
@@ -321,22 +334,23 @@ def test_the_docker_contract_pins_the_pinned_shape() -> None:
     )
 
 
-def test_the_five_contract_names_are_exactly_the_pinned_set() -> None:
-    """The contract names in .importlinter are exactly the pinned five.
+def test_the_six_contract_names_are_exactly_the_pinned_set() -> None:
+    """The contract names in .importlinter are exactly the pinned six.
 
     Arrange: parse the shipped ``.importlinter``.
     Act: collect the ``name`` value of every contract section.
-    Assert: the SET of names equals the pinned five — M0's two,
-    M1's two, and behaviour 27's one.  Prints missing and unexpected
-    names separately, mirroring the M1 anti-drift pin.
+    Assert: the SET of names equals the pinned six — the four
+    pre-existing names plus the docker-SDK and lifecycle-backend
+    contracts.  Prints missing and unexpected names separately,
+    mirroring the M1 anti-drift pin.
     """
     parser = _parse_importlinter()
     shipped = {parser.get(s, "name") for s in _contract_sections(parser)}
-    expected = _PREVIOUS_CONTRACT_NAMES | {DOCKER_CONTRACT_NAME}
+    expected = _ALL_SIX_CONTRACT_NAMES
     missing = expected - shipped
     unexpected = shipped - expected
     assert not missing and not unexpected, (
-        f".importlinter contract names do not equal the expected five.\n"
+        f".importlinter contract names do not equal the expected six.\n"
         f"Missing: {sorted(missing)}\n"
         f"Unexpected: {sorted(unexpected)}\n"
         f"Shipped: {sorted(shipped)}"
@@ -344,18 +358,18 @@ def test_the_five_contract_names_are_exactly_the_pinned_set() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Section 2 — lint-imports passes with the contract, all five kept
+# Section 2 — lint-imports passes with the contract, all six kept
 # ---------------------------------------------------------------------------
 
 
-def test_lint_imports_keeps_all_five_contracts() -> None:
-    """lint-imports keeps all five contracts and reports ``5 kept``.
+def test_lint_imports_keeps_all_six_contracts() -> None:
+    """lint-imports keeps all six contracts and reports ``6 kept``.
 
     Arrange: locate the lint-imports binary (the M0/M1 helper idiom).
     Act: run ``lint-imports --config .importlinter`` with
     ``PYTHONPATH=src`` in the repo root.
-    Assert: exit 0, each of the five contract names appears in the
-    output, and the tool's own summary line reads ``5 kept, 0 broken``
+    Assert: exit 0, each of the six contract names appears in the
+    output, and the tool's own summary line reads ``6 kept, 0 broken``
     — so a silently-dropped or silently-matching-nothing contract
     fails here even if the name check were relaxed.
     """
@@ -373,13 +387,13 @@ def test_lint_imports_keeps_all_five_contracts() -> None:
         f"lint-imports failed with exit code {result.returncode}.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    for name in sorted(_PREVIOUS_CONTRACT_NAMES | {DOCKER_CONTRACT_NAME}):
+    for name in sorted(_ALL_SIX_CONTRACT_NAMES):
         assert name in combined, (
             f"Contract {name!r} is not named in the lint-imports output.\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
-    assert "5 kept, 0 broken" in combined, (
-        f"Expected the summary line to read '5 kept, 0 broken'.\n"
+    assert "6 kept, 0 broken" in combined, (
+        f"Expected the summary line to read '6 kept, 0 broken'.\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 

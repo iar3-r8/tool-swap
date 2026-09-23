@@ -114,11 +114,29 @@ what proves the work landed. M2a set the identical trap and it cost time to unpi
 Baseline re-measured at `b3fafef` before branching: **1698 passed, 2 skipped**, `make lint`
 clean with mypy strict over 40 source files, `lint-imports` 5 kept, 0 broken.
 
-**Slice C is complete and shipped as
-[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, open against `main`. Head `90d51d4`,
-ten commits, documentation commit `90d51d4` preceding the pull request. At the tip: 1744
-passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5 kept, 0 broken.
-Because it branched from `main`, CI runs without retargeting.
+**Slice C is complete and merged as
+[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, squashed onto `main` as `605c4b0`.
+Head was `90d51d4`, ten commits, documentation commit `90d51d4` preceding the pull request.
+At the tip: 1744 passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5
+kept, 0 broken. Because it branched from `main`, CI ran without retargeting.
+
+**Slice D** — `feature/m2b-ensure-ready`, branched from `main` at `605c4b0`:
+
+Baseline re-measured at `605c4b0` before branching rather than trusted: **1744 passed, 2
+skipped**, `make lint` clean with mypy strict over 42 source files, `lint-imports` 5 kept,
+0 broken. Slice C's merge was confirmed **by tree** — `git diff origin/main
+feature/m2b-probe-seam` is empty while `git merge-base --is-ancestor` still answers *no*,
+the squash-merge trap this section already warns about.
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 12 | Construction, injection, sixth contract | — | — | — |
+| 13 | `ensure_ready` cold-start happy path | — | — | — |
+| 14 | Ten concurrent `ensure_ready`, one start | — | — | — |
+| 15 | Start failure yields `FAILED` with reason | — | — | — |
+| 16 | Readiness timeout yields `FAILED` | — | — | — |
+| 17 | Cancellation neither kills nor orphans | — | — | — |
+| 18 | Backend calls run in an executor | — | — | — |
 
 The push used the `.roo/mcp.json` token, as §0.2 of the M2a plan records — but **the
 one-shot `http.extraheader` did not work here** and the method note should be corrected
