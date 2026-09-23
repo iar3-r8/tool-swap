@@ -130,13 +130,36 @@ the squash-merge trap this section already warns about.
 
 | # | Behaviour | Red | Green | Suite at green |
 |---|---|---|---|---|
-| 12 | Construction, injection, sixth contract | — | — | — |
+| 12 | Construction, injection, sixth contract | `ba37128` | blocked | — |
 | 13 | `ensure_ready` cold-start happy path | — | — | — |
 | 14 | Ten concurrent `ensure_ready`, one start | — | — | — |
 | 15 | Start failure yields `FAILED` with reason | — | — | — |
 | 16 | Readiness timeout yields `FAILED` | — | — | — |
 | 17 | Cancellation neither kills nor orphans | — | — | — |
 | 18 | Backend calls run in an executor | — | — | — |
+
+**The loop is paused at behaviour 12's green step**, on a question escalated to issue #3
+([comment](https://github.com/iar3-r8/tool-swap/issues/3#issuecomment-5794175312)).
+
+§1.4's constructor sketch names `timeouts: Timeouts`, but **no `Timeouts` type exists
+anywhere in `src/`** — the five values are plain `int`/`float` fields on `DefaultsConfig`
+([`schema.py`](../src/tool_swap/config/schema.py:236): `start_timeout` 236,
+`ready_timeout` 242, `drain_timeout` 257, `stop_timeout` 263, `probe_interval` 282), with
+no aggregate wrapping them. This is the **seventh plan error** found by reading the plan
+against the source.
+
+It is escalated rather than absorbed because the tests cannot catch it: behaviour 12 pins
+`timeouts` **by identity**, so a bare `object()` satisfies them and all three candidate
+shapes pass equally. The choice also binds **slice E**, which needs `drain_timeout` and
+`stop_timeout` from the same object. The three options are `DefaultsConfig` passed
+directly, a new frozen `Timeouts` dataclass, or individual keyword arguments mirroring
+`drive_readiness`'s existing signature.
+
+Behaviour 12's red is committed at `ba37128`: **12 failed, 1744 passed, 2 skipped**, every
+failure an assertion failure on the absent class or the absent sixth contract. M2a's three
+anti-drift pins were moved from five to six and **kept exact** — set equality preserved,
+the summary line still a literal match on `6 kept, 0 broken` — per §6.9, which records that
+those pins are meant to fail so someone looks.
 
 The push used the `.roo/mcp.json` token, as §0.2 of the M2a plan records — but **the
 one-shot `http.extraheader` did not work here** and the method note should be corrected
