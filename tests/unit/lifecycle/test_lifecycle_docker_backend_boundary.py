@@ -7,9 +7,10 @@ Three claims, each failing for its own reason while the tree is red:
    ``DockerBackend``'s client — and refuses ``None`` for the backend or
    the probe with ``TypeError`` at construction. The class does not
    exist yet, so these fail on a gate that names the missing class
-   rather than on a module-level ``ImportError``. The ``timeouts``
-   argument is still a bare object: the plan names the type ``Timeouts``,
-   but no module in the shipped config layer defines it.
+   rather than on a module-level ``ImportError``. The three timeout
+   arguments are plain scalars mirroring ``drive_readiness``: the plan's
+   ``Timeouts`` type does not exist in ``src/`` and the decision is not
+   to build one.
 
 2. The sixth ``.importlinter`` contract — ``tool_swap.lifecycle`` and
    ``tool_swap.proxy`` must not import
@@ -49,6 +50,7 @@ from tests.unit.test_docker_sdk_boundary import (
     _verify_blocker_live,
 )
 from tool_swap.backend.fake_backend import FakeBackend
+from tool_swap.config.defaults import BUILT_IN_DEFAULTS
 from tool_swap.config.schema import BackendConfig
 from tool_swap.proxy.probes import FakeProbe
 from tool_swap.utils.clock import ManualClock
@@ -212,19 +214,16 @@ def _manager_class() -> type:
 
 
 def _make_manager(manager_class: type, backend: Any, probe: Any, clock: Any) -> Any:
-    """Construct the manager with the two keyword-only argument values.
+    """Construct the manager with a real ``BackendConfig`` and no timeouts.
 
-    ``backend_config`` is a real ``BackendConfig`` (the config layer
-    type the plan names); ``timeouts`` is a bare identity marker,
-    because the plan's ``Timeouts`` type does not exist in the shipped
-    config layer.
+    The timeout scalars are omitted so the constructor's own defaults
+    apply; every test using this helper is indifferent to their values.
     """
     return manager_class(
         backend,
         probe=probe,
         clock=clock,
         backend_config=BackendConfig(),
-        timeouts=object(),
     )
 
 
@@ -267,29 +266,63 @@ def test_constructor_stores_exactly_the_injected_clock() -> None:
     )
 
 
-def test_constructor_stores_exactly_the_injected_config_objects() -> None:
-    """backend_config and timeouts are held by identity, nothing else.
+def test_constructor_stores_backend_config_and_timeout_scalars() -> None:
+    """backend_config is held by identity; the three timeouts by value.
 
-    The ledger pins "the manager holds exactly the injected objects —
-    identity-wise"; this half covers the two arguments whose types the
-    config layer already ships (``BackendConfig``) or has not yet
-    shipped (``Timeouts`` — a bare marker object).
+    ``BackendConfig`` is a real object the constructor receives, so
+    identity is its pin; the timeouts are plain numbers, so a manager
+    that re-derives or re-packs them instead of holding the injection
+    fails equality on the distinctive scalars passed here.
     """
     manager_class = _manager_class()
     backend_config = BackendConfig()
-    timeouts = object()
     manager = manager_class(
         FakeBackend(),
         probe=FakeProbe(),
         clock=ManualClock(),
         backend_config=backend_config,
-        timeouts=timeouts,
+        start_timeout=42.5,
+        ready_timeout=31.5,
+        probe_interval=0.25,
     )
     assert manager.backend_config is backend_config, (
         "the manager's backend_config attribute is not the injected object"
     )
-    assert manager.timeouts is timeouts, (
-        "the manager's timeouts attribute is not the injected object"
+    assert manager.start_timeout == 42.5, (
+        "the manager's start_timeout is not the injected scalar: "
+        f"{manager.start_timeout!r}"
+    )
+    assert manager.ready_timeout == 31.5, (
+        "the manager's ready_timeout is not the injected scalar: "
+        f"{manager.ready_timeout!r}"
+    )
+    assert manager.probe_interval == 0.25, (
+        "the manager's probe_interval is not the injected scalar: "
+        f"{manager.probe_interval!r}"
+    )
+
+
+def test_constructor_defaults_timeouts_to_the_built_in_values() -> None:
+    """A manager built without timeouts carries the built-in values.
+
+    The manager delegates to ``drive_readiness``, which already defaults
+    its three scalars from ``BUILT_IN_DEFAULTS``; requiring them here
+    would force every caller to re-state values with a single source of
+    truth.
+    """
+    manager_class = _manager_class()
+    manager = _make_manager(manager_class, FakeBackend(), FakeProbe(), ManualClock())
+    assert manager.start_timeout == BUILT_IN_DEFAULTS["start_timeout"], (
+        "a manager constructed without timeouts did not carry the built-in "
+        "start_timeout"
+    )
+    assert manager.ready_timeout == BUILT_IN_DEFAULTS["ready_timeout"], (
+        "a manager constructed without timeouts did not carry the built-in "
+        "ready_timeout"
+    )
+    assert manager.probe_interval == BUILT_IN_DEFAULTS["probe_interval"], (
+        "a manager constructed without timeouts did not carry the built-in "
+        "probe_interval"
     )
 
 
@@ -563,7 +596,6 @@ def test_the_manager_constructs_with_the_sdk_absent() -> None:
             probe=probe,
             clock=clock,
             backend_config=object(),
-            timeouts=object(),
         )
         assert manager.backend is backend
 

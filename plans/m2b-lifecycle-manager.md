@@ -138,22 +138,34 @@ the squash-merge trap this section already warns about.
 | 17 | Cancellation neither kills nor orphans | — | — | — |
 | 18 | Backend calls run in an executor | — | — | — |
 
-**The loop is paused at behaviour 12's green step**, on a question escalated to issue #3
-([comment](https://github.com/iar3-r8/tool-swap/issues/3#issuecomment-5794175312)).
-
-§1.4's constructor sketch names `timeouts: Timeouts`, but **no `Timeouts` type exists
-anywhere in `src/`** — the five values are plain `int`/`float` fields on `DefaultsConfig`
+**§1.4's `Timeouts` type does not exist — resolved, see below.** The constructor sketch
+names `timeouts: Timeouts`, but **no such type exists anywhere in `src/`**; the five values
+are plain `int`/`float` fields on `DefaultsConfig`
 ([`schema.py`](../src/tool_swap/config/schema.py:236): `start_timeout` 236,
 `ready_timeout` 242, `drain_timeout` 257, `stop_timeout` 263, `probe_interval` 282), with
 no aggregate wrapping them. This is the **seventh plan error** found by reading the plan
 against the source.
 
-It is escalated rather than absorbed because the tests cannot catch it: behaviour 12 pins
+It was escalated rather than absorbed because the tests cannot catch it: behaviour 12 pins
 `timeouts` **by identity**, so a bare `object()` satisfies them and all three candidate
-shapes pass equally. The choice also binds **slice E**, which needs `drain_timeout` and
-`stop_timeout` from the same object. The three options are `DefaultsConfig` passed
-directly, a new frozen `Timeouts` dataclass, or individual keyword arguments mirroring
-`drive_readiness`'s existing signature.
+shapes pass equally.
+
+**Decision (user, on issue #3, 2026-09-23): option 3 — individual `int`/`float` keyword
+arguments.** No `Timeouts` class is built, and no config object carries the values. The
+reasoning, recorded because it governs slices E and F too: a class is not worth building
+when a plain scalar satisfies the need, and **passing a config object is too specific — a
+caller that does not use the config layer should still be able to construct a manager**.
+Passing `DefaultsConfig` would put config-layer coupling in the constructor for no gain.
+
+So the constructor takes `start_timeout`, `ready_timeout` and `probe_interval` as scalars,
+mirroring [`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), which the manager
+delegates to. **Slices E and F add `drain_timeout` and `stop_timeout` the same way** rather
+than introducing an aggregate later. `backend_config: BackendConfig` is unaffected: that
+type does exist, the spec builder already needs it, and the decision above was about the
+timeout values.
+
+§1.4's signature is therefore superseded on this point; the rest of it — the per-tool lock,
+the pending future, `asyncio.shield`, `run_in_executor` — stands.
 
 Behaviour 12's red is committed at `ba37128`: **12 failed, 1744 passed, 2 skipped**, every
 failure an assertion failure on the absent class or the absent sixth contract. M2a's three
@@ -810,9 +822,15 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 12. Construction and injection; the manager never imports `docker_backend`
 
 - **Inputs:** `LifecycleManager(backend, probe=..., clock=..., backend_config=...,
-  timeouts=...)`.
-- **Outputs:** a manager holding exactly the injected objects — identity-wise, the way
-  M2a's behaviour 20 pinned `DockerBackend`'s client. No object is constructed internally.
+  start_timeout=..., ready_timeout=..., probe_interval=...)`. The three timeouts are
+  **plain scalars with built-in defaults**, mirroring `drive_readiness`; the `Timeouts`
+  type this line once named was never built, and the user decided against building one
+  (§0.2). Slices E and F add `drain_timeout` and `stop_timeout` the same way.
+- **Outputs:** a manager holding exactly the injected objects — identity-wise for the
+  backend, probe, clock and `backend_config`, the way M2a's behaviour 20 pinned
+  `DockerBackend`'s client; by value for the three scalars, since numbers have no useful
+  identity. No object is constructed internally. Omitted timeouts carry the
+  `BUILT_IN_DEFAULTS` values, read from that named source rather than restated.
 - **Edge cases:** the named guard — **the manager must be fully usable with the docker SDK
   blocked from the import system**, driven by `FakeBackend`. M2a §6 item 1 states the rule
   ("it must never import `docker_backend` directly — only `base`") and behaviour 27's
