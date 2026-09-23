@@ -135,8 +135,24 @@ the squash-merge trap this section already warns about.
 | 14 | Ten concurrent `ensure_ready`, one start | `d32eeaa` | `bc290be` | 1770 passed, 2 skipped |
 | 15 | Start failure yields `FAILED` with reason | `965e8dd` | `533dd8e` | 1775 passed, 2 skipped |
 | 16 | Readiness timeout yields `FAILED` | `ee50494` | `a91a7b9` | 1781 passed, 2 skipped |
-| 17 | Cancellation neither kills nor orphans | — | — | — |
+| 17 | Cancellation neither kills nor orphans | passed on arrival | `175d3ec` | 1784 passed, 2 skipped |
 | 18 | Backend calls run in an executor | — | — | — |
+
+**Behaviour 17 needed no production change**, and that is recorded rather than disguised:
+behaviour 14's coalescing already put every awaiter behind `asyncio.shield`, and the
+`BaseException` handler already left `CancelledError` unmapped, so 17's contract was
+satisfied by the mechanism 14 installed. Its three tests passed on arrival and were proved
+able to fail by removing the shield, which reddens all three.
+
+**Open defect for slice E — the pending slot is not cleared after a *successful* start.**
+`registration.pending` is released only in `_cold_start`'s failure handler, so a completed
+task stays in the slot, contradicting `_ToolRegistration`'s own docstring ("`None` when no
+start is in flight"). Confirmed by direct inspection, not merely by reading. Today the
+`READY` short-circuit hides it, which is why no test catches it. Once `stop` lets a tool
+leave `READY`, a `STOPPED` tool whose slot still points at a finished task would take the
+`pending is not None` branch and shield the dead task, **returning a stale handle without
+starting a container**. Slice E owns the fix, because `stop` is what makes it reachable by
+a test.
 
 **The spec-ownership gap — resolved.** `ensure_ready` must call `backend.start(spec)`, and
 [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19) needs a
