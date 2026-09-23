@@ -1,11 +1,17 @@
-"""Pins the cold-start happy path of ``LifecycleManager.ensure_ready``
-(m2b plan §3 behaviour 13, §1.3, §1.4): a ``STOPPED`` tool whose probe
-answers true immediately walks ``STOPPED -> STARTING -> LOADING -> READY``
-through the transition table, the backend is started exactly once, the
-returned handle is the one ``backend.start`` produced,
+"""Pins the cold start of ``LifecycleManager.ensure_ready`` (m2b plan
+§3 behaviours 13 and 14, §1.3, §1.4): a ``STOPPED`` tool whose probe
+answers true immediately walks ``STOPPED -> STARTING -> LOADING ->
+READY`` through the transition table, the backend is started exactly
+once, the returned handle is the one ``backend.start`` produced,
 ``became_ready_at`` is stamped from the injected clock, and a second
 ``ensure_ready`` on an already-``READY`` tool starts nothing, re-stamps
-nothing and returns the same handle.
+nothing and returns the same handle. Behaviour 14 adds the coalesced
+cold start: ten concurrent callers start the backend exactly once, all
+ten receive the same handle, the simulated elapsed time is what one
+cold start costs (the proof that the other callers await the in-flight
+start rather than poll or sleep), a failed single start reaches all ten
+callers as one shared failure, and a round after ``READY`` starts
+nothing.
 
 The manager receives each tool's ``ResolvedTool`` and image through
 ``register_tool(tool, resolved, image=...)`` and exposes the per-tool
@@ -13,13 +19,14 @@ runtime state through ``state_of(tool)`` — the seam the plan leaves open
 and this file pins, because ``build_container_spec`` needs both and
 ``BackendConfig`` carries no per-tool data.
 
-The three members do not exist yet, so every test fails at the per-test
-deferred gate that names the missing member rather than aborting
+The deferred gates below name the missing member when one has not been
+built yet, so a red run says what to build rather than aborting
 collection.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 from types import ModuleType
@@ -29,7 +36,7 @@ import pytest
 
 import tool_swap.lifecycle.states as states_module
 from tool_swap.backend.base import ContainerSpec
-from tool_swap.backend.fake_backend import FakeBackend
+from tool_swap.backend.fake_backend import FailureMode, FakeBackend
 from tool_swap.backend.labels import container_name
 from tool_swap.config.resolver import ResolvedTool, resolve_tool
 from tool_swap.config.schema import BackendConfig
@@ -528,4 +535,209 @@ async def test_ensure_ready_leaves_last_used_untouched() -> None:
     assert (await _state_of(manager)).last_used == before, (
         "the READY shortcut rewrote last_used — a second ensure_ready "
         "touches nothing about it"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 14 — ten concurrent callers, one start
+# ---------------------------------------------------------------------------
+
+# One scripted false health answer forces exactly one simulated wait:
+# the leader polls health, gets false, sleeps probe_interval, polls again
+# and gets true; ready is unscripted and answers true immediately. The
+# cold start therefore costs exactly probe_interval of simulated time —
+# CLOCK_START + 1.0 = 101.0.
+COALESCED_PROBE_SCRIPT = {TOOL: {"health": 1}}
+COLD_START_COST = 1.0
+COALESCED_CLOCK_END = CLOCK_START + COLD_START_COST
+WAITERS = 10
+
+
+async def _gather_ensure_ready(manager: Any, count: int = WAITERS) -> list[Any]:
+    """Run *count* concurrent ``ensure_ready(TOOL)`` calls and return
+    their results in caller order.
+
+    Raises:
+        AssertionError: ``ensure_ready`` is missing or does not accept
+            the tool name.
+    """
+    ensure_ready = _ensure_ready(manager)
+
+    async def one_call() -> Any:
+        return await ensure_ready(TOOL)
+
+    return list(await asyncio.gather(*(one_call() for _ in range(count))))
+
+
+@pytest.mark.asyncio
+async def test_ten_concurrent_ensure_ready_start_the_backend_exactly_once() -> None:
+    """Ten concurrent callers against one STOPPED tool produce exactly
+    one start entry in the journal; a cold start that is not coalesced
+    starts a container per caller that still sees the tool STOPPED."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _gather_ensure_ready(manager)
+    # Assert
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start calls — ten concurrent "
+        "ensure_ready callers on one STOPPED tool must produce exactly "
+        "one start, counted from the journal, which records on entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ten_concurrent_ensure_ready_return_the_same_handle() -> None:
+    """All ten concurrent callers return, and every one of them holds
+    the handle the single backend start produced — a caller that
+    started its own container would return a different one."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    handles = await _gather_ensure_ready(manager)
+    # Assert
+    assert len(handles) == WAITERS, (
+        f"only {len(handles)} of {WAITERS} callers returned — every "
+        "concurrent caller must receive the handle, not an exception"
+    )
+    starts = _starts(backend)
+    assert starts, (
+        "the tool is READY without any start call in the journal — "
+        "there is no backend handle the callers could share"
+    )
+    managed = backend.list_managed()
+    assert len(managed) == 1, (
+        f"the backend manages {len(managed)} containers — one coalesced "
+        "cold start creates exactly one"
+    )
+    for handle in handles:
+        assert handle is managed[0], (
+            f"one caller returned {handle!r}, not the started "
+            f"container {managed[0]!r} — all callers must return the "
+            "single backend.start handle, identity-wise"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ten_concurrent_ensure_ready_cost_one_cold_start_in_simulated_time() -> (
+    None
+):
+    """The clock ends exactly where one cold start ends it: concurrent
+    ManualClock sleeps sum rather than overlap, so any other caller
+    polling or sleeping would have advanced the clock further."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _gather_ensure_ready(manager)
+    # Assert
+    assert clock.now() == COALESCED_CLOCK_END, (
+        f"the clock reads {clock.now()!r}, one cold start costs "
+        f"{COLD_START_COST}s from {CLOCK_START} and ends at "
+        f"{COALESCED_CLOCK_END} — more elapsed time means the other "
+        "callers slept or polled instead of awaiting the in-flight "
+        "start"
+    )
+    assert (await _state_of(manager)).state is ToolState.READY, (
+        f"the tool is {(await _state_of(manager)).state!r} after ten "
+        "concurrent ensure_ready — the coalesced cold start must end "
+        "READY"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_after_concurrent_ready_round_starts_nothing() -> None:
+    """A further round of ensure_ready calls after the tool is READY
+    adds no start and returns the same handle the cold start produced —
+    the READY short-circuit must serve late callers, not re-start."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    first_round = await _gather_ensure_ready(manager)
+    # Act: the tool is READY, so a second round takes the short-circuit
+    second_round = await _gather_ensure_ready(manager)
+    # Assert
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} starts after the READY tool "
+        "was asked for again — a READY tool starts nothing"
+    )
+    assert len(second_round) == WAITERS, (
+        f"only {len(second_round)} of {WAITERS} second-round callers "
+        "returned — the READY short-circuit must serve every caller"
+    )
+    for handle in second_round:
+        assert handle is first_round[0], (
+            f"the second round returned {handle!r}, not the handle the "
+            "cold start produced — a READY tool returns the handle it "
+            "already holds"
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_single_start_reaches_all_callers_once() -> None:
+    """When the single coalesced start refuses, all ten callers receive
+    that one start's failure — one shared failure, not nine ValueErrors
+    and not ten attempts in the journal."""
+    # Arrange: the backend refuses this tool's start, repeatedly
+    backend = FakeBackend(script={TOOL: FailureMode.FAIL_TO_START})
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcomes = await asyncio.gather(
+        *(_call_ensure_ready(manager) for _ in range(WAITERS)),
+        return_exceptions=True,
+    )
+    # Assert: every caller saw a failure
+    assert len(outcomes) == WAITERS, (
+        f"only {len(outcomes)} of {WAITERS} callers returned an outcome — "
+        "every concurrent caller must be reached"
+    )
+    failures = [o for o in outcomes if isinstance(o, BaseException)]
+    assert len(failures) == WAITERS, (
+        f"{WAITERS - len(failures)} of {WAITERS} callers returned a "
+        "handle although the start refused — a refused start must reach "
+        "every caller, not some of them"
+    )
+    # Assert: one shared failure — one type, one message
+    assert all(type(f) is type(failures[0]) for f in failures), (
+        f"the callers received {sorted({type(f).__name__ for f in failures})} "
+        "— every caller must receive the same failure type"
+    )
+    assert all(str(f) == str(failures[0]) for f in failures), (
+        "the callers received different failure messages — ten callers "
+        "awaiting one failed start must all receive that start's failure"
+    )
+    # Assert: the journal shows one refused attempt, not one per caller
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start attempts — the ten "
+        "callers must coalesce into a single start, even a failing one"
     )
