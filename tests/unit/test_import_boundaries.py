@@ -14,8 +14,9 @@ existing pair:
 M0's file, ``tests/unit/test_imports.py``, keeps behaviour-7 ownership; this
 file imports nothing from it and copies the one helper it needs.
 
-The exact-set pin also carries behaviour 27's fifth contract name, imported
-from ``tests/unit/test_docker_sdk_boundary.py`` (its red-step test) so the
+The exact-set pin also carries behaviour 27's fifth and behaviour 12's
+sixth contract names, both imported from
+``tests/unit/test_docker_sdk_boundary.py`` (its red-step test) so each
 name has a single source; the ``N kept, 0 broken`` summary line is owned
 by that file, not this one.
 
@@ -33,16 +34,20 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.test_docker_sdk_boundary import DOCKER_CONTRACT_NAME
+from tests.unit.test_docker_sdk_boundary import (
+    DOCKER_CONTRACT_NAME,
+    LIFECYCLE_BACKEND_CONTRACT_NAME,
+)
 
 ROOT = Path(__file__).resolve().parents[2]  # repo root
 SRC_ROOT = ROOT / "src"
 IMPORTLINTER_CONFIG = ROOT / ".importlinter"
 
-# The five contract names that ``.importlinter`` must carry exactly — M0's
+# The six contract names that ``.importlinter`` must carry exactly — M0's
 # two (quoted verbatim from the shipped file), behaviour 26's two
-# (plans/m1-configuration.md, item 3, verbatim) and behaviour 27's one,
-# imported from its own red-step test so the name has a single source.
+# (plans/m1-configuration.md, item 3, verbatim), behaviour 27's one and
+# behaviour 12's one, each imported from its red-step test so the names
+# have a single source.
 _EXPECTED_CONTRACTS = frozenset(
     {
         "Router and runtime are strictly separate",
@@ -50,6 +55,7 @@ _EXPECTED_CONTRACTS = frozenset(
         "The config layer is a leaf",
         "The schema compiler does not depend on the pydantic config models",
         DOCKER_CONTRACT_NAME,
+        LIFECYCLE_BACKEND_CONTRACT_NAME,
     }
 )
 
@@ -139,21 +145,21 @@ def _module_set(section: configparser.SectionProxy, option: str) -> set[str]:
 
 
 def test_the_expected_contract_names_are_exactly_the_shipped_ones() -> None:
-    """The contract names in .importlinter are exactly the five pinned ones.
+    """The contract names in .importlinter are exactly the six pinned ones.
 
     Arrange: parse the shipped ``.importlinter``.
     Act: collect the ``name`` value of every contract section.
-    Assert: the SET of names equals the five-name pin — M0's two,
-    behaviour 26's two and behaviour 27's one (the docker name imported
-    from its red-step test). Prints missing and unexpected names
-    separately.
+    Assert: the SET of names equals the six-name pin — M0's two,
+    behaviour 26's two, behaviour 27's one and behaviour 12's one (the
+    docker and lifecycle names imported from their red-step tests).
+    Prints missing and unexpected names separately.
     """
     parser = _parse_importlinter()
     shipped = set(_contract_names(parser).values())
     missing = _EXPECTED_CONTRACTS - shipped
     unexpected = shipped - _EXPECTED_CONTRACTS
     assert not missing and not unexpected, (
-        f".importlinter contract names do not equal the expected five.\n"
+        f".importlinter contract names do not equal the expected six.\n"
         f"Missing: {sorted(missing)}\n"
         f"Unexpected: {sorted(unexpected)}\n"
         f"Shipped: {sorted(shipped)}"
@@ -230,17 +236,17 @@ def test_lint_imports_reports_every_contract_kept() -> None:
     Arrange: locate the lint-imports binary (the M0 helper idiom).
     Act: run ``lint-imports --config .importlinter`` with ``PYTHONPATH=src``
     in the repo root.
-    Assert: exit 0 and each of the five contract names appears in the
+    Assert: exit 0 and each of the six contract names appears in the
     output, so a silently-dropped contract fails here even if the name
     check on the config file were relaxed.
 
     This file deliberately does NOT assert the ``N kept, 0 broken``
     summary line: behaviour 27's pin
     (``tests/unit/test_docker_sdk_boundary.py``) owns the exact
-    five-contract total and asserts ``5 kept, 0 broken``.  Two tests
+    six-contract total and asserts ``6 kept, 0 broken``.  Two tests
     asserting the same summary line would be two places to update for
-    one change, so the count has a single owner; a sixth contract
-    still fails the suite, via that file's exact-set and summary pins.
+    one change, so the count has a single owner; a contract beyond the
+    six still fails the suite, via that file's exact-set and summary pins.
     """
     env = {**os.environ, "PYTHONPATH": str(SRC_ROOT)}
     result = subprocess.run(

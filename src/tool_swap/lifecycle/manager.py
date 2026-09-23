@@ -14,16 +14,22 @@ The two deadlines are independent: ``start_timeout`` covers
 container-up-to-health; ``ready_timeout`` covers health-to-ready and
 starts when health answered. A deadline that elapses raises
 ``StartTimeoutError`` or ``ReadyTimeoutError`` naming that deadline and
-the simulated seconds it ran; marking the holder ``FAILED`` is
-behaviour 16's, so the raise leaves the holder in the phase it hung in.
-The ``LifecycleManager`` class (behaviour 12) is a later slice.
+the simulated seconds it ran; marking the holder ``FAILED`` is left to
+the caller, so the raise leaves the holder in the phase it hung in.
+
+``LifecycleManager`` is the object that owns the injected ``backend``,
+``probe``, ``clock`` and ``backend_config`` plus the three timeout
+scalars; it constructs nothing internally, so it can be built in an
+environment where the docker SDK is not importable.
 """
 
 from __future__ import annotations
 
 from typing import Final, cast
 
+from tool_swap.backend.base import ContainerBackend
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS
+from tool_swap.config.schema import BackendConfig
 from tool_swap.lifecycle.states import (
     ModelRuntimeState,
     ToolState,
@@ -131,3 +137,55 @@ async def drive_readiness(
     else:
         raise ReadyTimeoutError(clock.now() - (ready_deadline - ready_timeout))
     return apply_transition(state, ToolState.READY, reason="ready probe answered true")
+
+
+class LifecycleManager:
+    """Owns the injected backend, probe, clock and backend configuration.
+
+    Holds each injected object by identity and the three timeout
+    scalars by value, so the manager uses exactly what it was given —
+    a ``FakeBackend`` keeps it usable where the docker SDK is not
+    importable, and a caller that does not use the config layer can
+    still construct it. Construction performs no backend work and no
+    clock movement; any readiness progression it later runs must
+    delegate to :func:`drive_readiness`.
+
+    Raises:
+        TypeError: ``backend`` or ``probe`` is ``None`` — a
+            programming error refused at construction rather than at
+            the first call.
+    """
+
+    def __init__(
+        self,
+        backend: ContainerBackend,
+        *,
+        probe: Probe,
+        clock: Clock,
+        backend_config: BackendConfig,
+        start_timeout: float = _START_TIMEOUT,
+        ready_timeout: float = _READY_TIMEOUT,
+        probe_interval: float = _PROBE_INTERVAL,
+    ) -> None:
+        """Store the injections by identity and the scalars by value.
+
+        Args:
+            backend: The container backend; held by identity.
+            probe: The readiness probe; held by identity.
+            clock: The time source every wait and deadline reads.
+            backend_config: The ``backend:`` config block.
+            start_timeout: Seconds allowed for container-up-to-health.
+            ready_timeout: Seconds allowed for health-to-ready.
+            probe_interval: Simulated seconds between polls.
+        """
+        if backend is None:
+            raise TypeError("backend must not be None")
+        if probe is None:
+            raise TypeError("probe must not be None")
+        self.backend = backend
+        self.probe = probe
+        self.clock = clock
+        self.backend_config = backend_config
+        self.start_timeout = start_timeout
+        self.ready_timeout = ready_timeout
+        self.probe_interval = probe_interval

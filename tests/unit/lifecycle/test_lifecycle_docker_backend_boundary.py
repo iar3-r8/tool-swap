@@ -394,7 +394,10 @@ def test_the_sixth_contract_pins_the_pinned_shape() -> None:
     parser = _parse_importlinter()
     section = _section_for_name(parser, LIFECYCLE_BACKEND_CONTRACT_NAME)
     shipped = {key: _clean_value(value) for key, value in section.items()}
-    expected = _pinned_sixth_contract_options()
+    expected = {
+        key: _clean_value(value)
+        for key, value in _pinned_sixth_contract_options().items()
+    }
     for key, value in expected.items():
         assert key in section, (
             f"contract {LIFECYCLE_BACKEND_CONTRACT_NAME!r} is missing {key!r}"
