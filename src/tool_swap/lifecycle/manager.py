@@ -25,11 +25,14 @@ environment where the docker SDK is not importable.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Final, cast
 
-from tool_swap.backend.base import ContainerBackend
+from tool_swap.backend.base import ContainerBackend, ContainerHandle
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS
+from tool_swap.config.resolver import ResolvedTool
 from tool_swap.config.schema import BackendConfig
+from tool_swap.lifecycle.spec_builder import build_container_spec
 from tool_swap.lifecycle.states import (
     ModelRuntimeState,
     ToolState,
@@ -189,3 +192,142 @@ class LifecycleManager:
         self.start_timeout = start_timeout
         self.ready_timeout = ready_timeout
         self.probe_interval = probe_interval
+        self._tools: dict[str, _ToolRegistration] = {}
+
+    def register_tool(self, tool: str, resolved: ResolvedTool, *, image: str) -> None:
+        """Store a tool's configuration and image under a fresh state.
+
+        The manager needs the ``ResolvedTool`` and an image before it
+        can build a ``ContainerSpec``, and nothing else supplies them;
+        registering is what makes the tool ready-able. The fresh state
+        is ``STOPPED`` with no container, which is what a registered
+        tool is until a start runs.
+
+        Args:
+            tool: The tool name the manager tracks it under.
+            resolved: The tool's fully resolved configuration.
+            image: The container image reference to start it with.
+
+        Raises:
+            ValueError: ``tool`` does not match ``resolved.name``, or
+                the tool is already registered — re-registering would
+                drop the state of a tool that may be serving.
+        """
+        if tool != resolved.name:
+            raise ValueError(
+                f"register_tool was given tool {tool!r} but its resolved "
+                f"config names {resolved.name!r}"
+            )
+        if tool in self._tools:
+            raise ValueError(f"tool {tool!r} is already registered")
+        state = ModelRuntimeState(
+            tool=tool,
+            state=ToolState.STOPPED,
+            handle=None,
+            last_used=self.clock.now(),
+            became_ready_at=None,
+            inflight=0,
+            last_error=None,
+        )
+        self._tools[tool] = _ToolRegistration(
+            resolved=resolved, image=image, state=state
+        )
+
+    def state_of(self, tool: str) -> ModelRuntimeState:
+        """The tool's runtime state holder, for read-back.
+
+        Returns:
+            The ``ModelRuntimeState`` the manager tracks for the tool.
+
+        Raises:
+            KeyError: the tool was never registered with this manager.
+        """
+        return self._registration(tool).state
+
+    async def ensure_ready(self, tool: str) -> ContainerHandle:
+        """Bring a registered tool to ``READY`` and return its handle.
+
+        A ``STOPPED`` tool walks ``STOPPED -> STARTING -> LOADING ->
+        READY`` through ``apply_transition``, starting its container
+        once and delegating the probe progression to
+        :func:`drive_readiness`. A tool already ``READY`` returns the
+        handle it holds without starting anything or re-stamping
+        ``became_ready_at``; ``last_used`` is never touched here, since
+        it belongs to request completion.
+
+        Args:
+            tool: The registered tool to make ready.
+
+        Returns:
+            The ``ContainerHandle`` the backend start produced; for a
+            ``READY`` tool, the handle it already holds.
+
+        Raises:
+            KeyError: the tool was never registered with this manager.
+            ValueError: the tool sits in a state this method does not
+                serve yet (anything but ``STOPPED`` and ``READY``).
+            StartTimeoutError: ``health`` never answered true within
+                ``start_timeout``; the holder is left ``STARTING``.
+            ReadyTimeoutError: ``ready`` never answered true within
+                ``ready_timeout``; the holder is left ``LOADING``.
+            IllegalTransitionError: from ``apply_transition`` on an
+                illegal pair, leaving the holder untouched.
+        """
+        registration = self._registration(tool)
+        state = registration.state
+        if state.state is ToolState.READY:
+            return cast("ContainerHandle", state.handle)
+        if state.state is not ToolState.STOPPED:
+            raise ValueError(
+                f"ensure_ready on tool {tool!r} in state {state.state!r} is "
+                "not supported yet; only STOPPED and READY are"
+            )
+        apply_transition(state, ToolState.STARTING, reason="ensure_ready cold start")
+        spec = build_container_spec(
+            registration.resolved, self.backend_config, registration.image
+        )
+        target = ProbeTarget(
+            tool=tool,
+            host=spec.name,
+            port=spec.container_port,
+            health_path=str(registration.resolved.values["health_path"]),
+            ready_path=str(registration.resolved.values["ready_path"]),
+        )
+        handle = self.backend.start(spec)
+        state.handle = handle
+        await drive_readiness(
+            state,
+            self.probe,
+            self.clock,
+            target,
+            start_timeout=self.start_timeout,
+            ready_timeout=self.ready_timeout,
+            probe_interval=self.probe_interval,
+        )
+        state.became_ready_at = self.clock.now()
+        return handle
+
+    def _registration(self, tool: str) -> _ToolRegistration:
+        """The registration for a tool, or a named KeyError.
+
+        Raises:
+            KeyError: the tool was never registered with this manager.
+        """
+        try:
+            return self._tools[tool]
+        except KeyError as exc:
+            raise KeyError(f"tool {tool!r} is not registered") from exc
+
+
+@dataclass
+class _ToolRegistration:
+    """One registered tool's spec inputs and its runtime holder.
+
+    The holder is shared by identity with ``state_of`` and
+    ``ensure_ready``: ``drive_readiness`` mutates it in place, so a
+    copy would let the read-back lie about the live state.
+    """
+
+    resolved: ResolvedTool
+    image: str
+    state: ModelRuntimeState

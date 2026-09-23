@@ -495,15 +495,28 @@ async def test_ensure_ready_on_ready_tool_starts_nothing_and_returns_same_handle
 @pytest.mark.asyncio
 async def test_ensure_ready_leaves_last_used_untouched() -> None:
     """last_used is written on request completion, not arrival — a stamp
-    here would run a tool's TTL against a request that never ran."""
+    here would run a tool's TTL against a request that never ran; the
+    scripted probe makes a cold-start stamp visible to the assertion."""
     # Arrange
-    backend, probe, clock, resolved, backend_config = _fixtures()
+    backend, _, clock, resolved, backend_config = _fixtures()
+    # The shared probe is unscripted, so its cold start costs no simulated
+    # time and a stamp written during it would store the same value as the
+    # registration stamp. One scripted false health answer makes the
+    # progression sleep probe_interval, so the clock has moved by the time
+    # the cold start ends.
+    probe = FakeProbe(script={TOOL: {"health": 1}})
     manager = _build_manager(backend, probe, clock, backend_config)
     await _register(manager, resolved)
     before = (await _state_of(manager)).last_used
     # Act: the cold start
     await _call_ensure_ready(manager)
     # Assert
+    assert clock.now() > before, (
+        f"the scripted cold start cost no simulated time — the clock reads "
+        f"{clock.now()!r}, the registration stamp is {before!r} — a stamp "
+        "written during the cold start would be invisible to the next "
+        "assertion"
+    )
     assert (await _state_of(manager)).last_used == before, (
         "the cold start rewrote last_used — it is set on request "
         "completion, not on arrival"
