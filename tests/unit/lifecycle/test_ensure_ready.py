@@ -957,16 +957,16 @@ async def test_ensure_ready_on_a_failed_tool_retries_via_the_failed_to_starting_
         f"the journal shows {len(starts)} start attempts — the retry must "
         "attempt a fresh start, and the refusal must repeat on it"
     )
-    # Assert: the retry logged the legal edge out of FAILED
+    # Assert: the log records both attempts and both refusals
     records = [
         record
         for record in caplog.records
         if record.name == "tool_swap.lifecycle.states"
     ]
-    assert len(records) == 3, (
-        f"the transition log shows {len(records)} record(s) — the failure "
-        "and its retry move the tool STARTING, into FAILED, back to "
-        "STARTING"
+    assert len(records) == 4, (
+        f"the transition log shows {len(records)} record(s) — the two "
+        "attempts and the two refusals move the tool STOPPED -> STARTING, "
+        "into FAILED, back to STARTING, into FAILED again"
     )
     assert records[1].to_state is ToolState.FAILED, (
         f"the second record moves to {records[1].to_state!r} — the "
@@ -980,6 +980,22 @@ async def test_ensure_ready_on_a_failed_tool_retries_via_the_failed_to_starting_
     assert records[2].to_state is ToolState.STARTING, (
         f"the retry logged to_state={records[2].to_state!r} — the retry "
         "moves the tool back to STARTING"
+    )
+    assert getattr(records[3], "from_state", None) is ToolState.STARTING, (
+        f"the fourth record logged "
+        f"from_state={getattr(records[3], 'from_state', None)!r} — the "
+        "retry's refusal moves the tool out of STARTING"
+    )
+    assert records[3].to_state is ToolState.FAILED, (
+        f"the fourth record moves to {records[3].to_state!r} — the retry's "
+        "refusal must be recorded as the second move into FAILED; a "
+        "missing record here means the refusal was silently swallowed"
+    )
+    assert getattr(records[3], "reason", None) == first.message, (
+        f"the fourth record carries "
+        f"reason={getattr(records[3], 'reason', None)!r}, the refusal's "
+        f"message is {first.message!r} — the retry's refusal is logged "
+        "with the taxonomy message verbatim"
     )
 
 

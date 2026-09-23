@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Final, cast
 
 from tool_swap.backend.base import ContainerBackend, ContainerHandle
+from tool_swap.backend.errors import BackendError
 from tool_swap.config.defaults import BUILT_IN_DEFAULTS
 from tool_swap.config.resolver import ResolvedTool
 from tool_swap.config.schema import BackendConfig
@@ -254,7 +255,9 @@ class LifecycleManager:
         :func:`drive_readiness`. A tool already ``READY`` returns the
         handle it holds without starting anything or re-stamping
         ``became_ready_at``; ``last_used`` is never touched here, since
-        it belongs to request completion.
+        it belongs to request completion. A ``FAILED`` tool is retried
+        through the legal ``FAILED -> STARTING`` edge, so a refused start
+        never strands the tool until a manual reset.
 
         Args:
             tool: The registered tool to make ready.
@@ -266,7 +269,8 @@ class LifecycleManager:
         Raises:
             KeyError: the tool was never registered with this manager.
             ValueError: the tool sits in a state this method does not
-                serve yet (anything but ``STOPPED`` and ``READY``).
+                serve yet (anything but ``STOPPED``, ``READY`` and
+                ``FAILED``).
             StartTimeoutError: ``health`` never answered true within
                 ``start_timeout``; the holder is left ``STARTING``.
             ReadyTimeoutError: ``ready`` never answered true within
@@ -282,7 +286,10 @@ class LifecycleManager:
             state = registration.state
             if state.state is ToolState.READY:
                 return cast("ContainerHandle", state.handle)
-            if state.state is ToolState.STOPPED and registration.pending is None:
+            if (
+                state.state in (ToolState.STOPPED, ToolState.FAILED)
+                and registration.pending is None
+            ):
                 # The decision and the holder move happen under the same
                 # lock: a STARTING mutation made before any await would
                 # let a caller arriving in between miss the pending task
@@ -297,7 +304,8 @@ class LifecycleManager:
             else:
                 raise ValueError(
                     f"ensure_ready on tool {tool!r} in state {state.state!r} "
-                    "is not supported yet; only STOPPED and READY are"
+                    "is not supported yet; only STOPPED, READY and FAILED "
+                    "are"
                 )
         # A caller cancelled while awaiting must not cancel the start
         # its peers are awaiting: shield raises the cancellation here
@@ -310,8 +318,13 @@ class LifecycleManager:
 
         Runs as the single task every concurrent ``ensure_ready`` caller
         for this tool awaits, so it is the only caller that polls the
-        probe or sleeps on the clock. Any exception is re-raised into
-        every waiter, so one failed start is one shared failure.
+        probe or sleeps on the clock. A backend start refusal ends the
+        holder ``FAILED`` with the taxonomy member's message, recorded
+        once here rather than per waiter, because the transition table
+        has no ``FAILED -> FAILED`` self-edge and ten waiters each
+        applying it would raise nine ``IllegalTransitionError``s on top
+        of the real failure. Any exception is re-raised into every
+        waiter, so one failed start is one shared failure.
         """
         state = registration.state
         try:
@@ -325,7 +338,17 @@ class LifecycleManager:
                 health_path=str(registration.resolved.values["health_path"]),
                 ready_path=str(registration.resolved.values["ready_path"]),
             )
-            handle = self.backend.start(spec)
+            try:
+                handle = self.backend.start(spec)
+            except BackendError as err:
+                # The refusal's message, verbatim: str(err) appends the
+                # remedy, and the recorded reason must carry the message
+                # alone. No handle is stored — the refusal created no
+                # container — and the re-raise keeps the caller's error
+                # path on the taxonomy member.
+                state.last_error = err.message
+                apply_transition(state, ToolState.FAILED, reason=err.message)
+                raise
             state.handle = handle
             await drive_readiness(
                 state,
@@ -338,8 +361,8 @@ class LifecycleManager:
             )
         except BaseException:
             # Release the slot so a later caller does not await a dead
-            # task; the holder is left where the start died, and the
-            # failure mapping that state to is the caller's.
+            # task; a failure the handler above does not map to FAILED
+            # leaves the holder where the start died.
             registration.pending = None
             raise
         state.became_ready_at = self.clock.now()
