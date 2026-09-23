@@ -7,8 +7,15 @@ A tool swapping router for managing AI agent tool contexts.
 See the full architecture overview in [plan/01_ARCHITECTURE.md](plan/01_ARCHITECTURE.md).
 The complete implementation plan is at [plan/README.md](plan/README.md).
 The container backend seam — the data types, the `ContainerBackend`
-protocol and the error taxonomy the lifecycle will be built on — is
-documented in [docs/backend-seam.md](docs/backend-seam.md).
+protocol and the error taxonomy the lifecycle is built on — is
+documented in [docs/backend-seam.md](docs/backend-seam.md); the
+lifecycle layer — the spec builder, the tool state machine and the
+`LifecycleManager` that brings a registered tool to `READY` — is
+documented across
+[docs/spec-builder.md](docs/spec-builder.md),
+[docs/tool-state-machine.md](docs/tool-state-machine.md),
+[docs/readiness-probe.md](docs/readiness-probe.md) and
+[docs/lifecycle-manager.md](docs/lifecycle-manager.md).
 
 ## Distributions
 
@@ -107,7 +114,7 @@ tool-swap/
 │   │   ├── schema/             # JSON Schema compilation, tool definitions
 │   │   ├── registry/           # Tool registry, model definitions
 │   │   ├── scheduler/          # Dispatch, batching, occupancy accounting
-│   │   ├── lifecycle/          # Container lifecycle (spec builder, state machine, readiness driver)
+│   │   ├── lifecycle/          # Container lifecycle (spec builder, state machine, LifecycleManager)
 │   │   ├── backend/            # Pluggable container backends (Docker, fake)
 │   │   ├── preflight/          # Deployment gate: checks, runner, report
 │   │   │   └── checks/         # Static, build, boot, readiness, contract checks
@@ -134,7 +141,8 @@ tool-swap/
 │   ├── runtime/contract/       # Runtime contract tests
 │   ├── integration/            # Docker-based integration tests
 │   └── e2e/                    # End-to-end quickstart test
-├── docs/                       # User documentation (configuration guide, reference, backend seam, spec builder, state machine, readiness probe)
+├── docs/                       # User documentation (configuration guide, reference, backend seam,
+│                               #   spec builder, state machine, readiness probe, lifecycle manager)
 ├── deploy/                     # Deployment artifacts (systemd, prometheus, grafana)
 └── plan/                       # Implementation plans and architecture docs
 ```

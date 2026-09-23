@@ -1,4 +1,4 @@
-"""The readiness progression (m2b plan §3 behaviour 11, §1.3).
+"""The readiness progression and the object that drives it.
 
 ``drive_readiness`` walks one ``ModelRuntimeState`` from ``STARTING``
 to ``READY``: it polls the probe's ``health`` until it answers true
@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReadinessTimeoutError(TimeoutError):
-    """A readiness deadline elapsed (m2b plan §3 behaviour 11).
+    """A readiness deadline elapsed.
 
     Carries ``deadline`` — which of the two deadlines ran out — and
     ``elapsed``, the simulated seconds it ran, so an operator can tell a
@@ -131,7 +131,7 @@ async def drive_readiness(
     """
     # Deadlines are compared against clock.now(): asyncio.wait_for's
     # deadline is the event loop's clock, which a manual clock does not
-    # control (m2b plan §1.3).
+    # control.
     start_deadline = clock.now() + start_timeout
     while clock.now() < start_deadline:
         if await probe.health(target):

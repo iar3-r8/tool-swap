@@ -1,4 +1,4 @@
-"""Tool-level lifecycle states (m2b plan §3, behaviours 5–8).
+"""Tool-level lifecycle states.
 
 Answers "can this tool serve traffic" (only ``READY`` does), which is
 deliberately distinct from ``ContainerState`` in
@@ -10,12 +10,12 @@ cannot drift together, and ``ToolState``'s values stay disjoint from
 backend seam. A ``StrEnum`` so members compare equal to the bare
 strings used in CLI output and persisted state.
 
-Behaviour 7 pins the transition table: the ten legal edges of plan
-§1.1 as data, ``is_legal_transition`` as the pure predicate over that
-data, and ``apply_transition`` as the single entry point that mutates
-a ``ModelRuntimeState`` in place, raising ``IllegalTransitionError``
-on anything else. Behaviour 8 logs every applied transition; a refused
-one stays silent.
+The transition table is the ten legal edges as data,
+``is_legal_transition`` is the pure predicate over that data, and
+``apply_transition`` is the single entry point that mutates a
+``ModelRuntimeState`` in place, raising ``IllegalTransitionError`` on
+anything else. Every applied transition is logged with its from, to
+and reason; a refused one stays silent.
 """
 
 import logging

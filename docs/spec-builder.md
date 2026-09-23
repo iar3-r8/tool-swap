@@ -5,7 +5,7 @@ container needs a precise recipe: which image, what name, which
 network, which host directories get mounted and in what mode, which
 environment variables, which GPUs. This page documents the function
 that writes that recipe —
-[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19)
+[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:20)
 — which takes the tool's resolved configuration and the `backend:`
 block from your config file and returns the complete start
 instructions, a
@@ -27,11 +27,13 @@ page](backend-seam.md) documents what consumes that spec to actually
 start, stop and inspect the container. If you do not yet know what the
 `backend:` block looks like, start with the Configuration guide.
 
-One honest caveat before the detail: **nothing in the router calls
-this function yet.** The component that will use it, the
-`LifecycleManager`, is not built, so no container has been started
-through this path. The rest of the page documents the function in
-full, and says explicitly where it stops.
+One honest note before the detail: the function's only caller is the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154), which
+builds the spec inside its cold start
+([the lifecycle manager page](lifecycle-manager.md)); nothing
+*above* the lifecycle layer calls it, and no router endpoint has
+started a container through this path. The rest of the page documents
+the function in full, and says explicitly where it stops.
 
 ## The function
 
@@ -92,7 +94,7 @@ tools:
 by the builder — see [The published port](#the-published-port-four-forms-two-of-them-worth-explaining)
 and [What goes wrong](#what-goes-wrong). Run the config through the
 validated pipeline — `load_config`, `resolve_tool`, then
-[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19)
+[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:20)
 with `config_dir` set to the directory holding the config — and it
 returns:
 
@@ -155,12 +157,15 @@ them; see [the trap](#the-trap-backendconfig-never-values) below.
 The function is pure: two config objects and an image reference in,
 one `ContainerSpec` out. It is the **only place a `ParsedMount`
 becomes a `MountSpec`**, so the `mode → read_only` normalisation can
-live in only one place. It has **no caller yet**: the
-`LifecycleManager` that consumes it is not built, so nothing in the
-router calls `build_container_spec` today and no container has been
-started through this path. [The backend seam
-page](backend-seam.md) documents what the spec is consumed *by*; this
-page documents how the spec is *built*.
+live in only one place. Its only caller is the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154),
+which builds the spec for each cold start and hands it to
+`backend.start`; nothing above the lifecycle layer calls it, and no
+router endpoint has started a container through this path. [The
+backend seam page](backend-seam.md) documents what the spec is
+consumed *by*; [the lifecycle manager
+page](lifecycle-manager.md) documents the caller; this page documents
+how the spec is *built*.
 
 The design and its reasoning are in
 [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
@@ -258,7 +263,7 @@ ever read out of `values` under `lifecycle/`.
 
 The builder is the single `ParsedMount` → `MountSpec` conversion in
 the tree
-([`_mount_specs`](../src/tool_swap/lifecycle/spec_builder.py:63)). One
+([`_mount_specs`](../src/tool_swap/lifecycle/spec_builder.py:65)). One
 `MountSpec` per authored entry, **in declaration order**:
 
 - `source` is the **resolved** host path — `MountSpec` performs no
@@ -307,7 +312,7 @@ A `mounts` value that is not a list of strings raises `TypeError`, and
 `expose_host_port` is typed `bool | int | None`
 ([`schema.py:447`](../src/tool_swap/config/schema.py:447)), so four
 forms are reachable, and
-[`_published_port`](../src/tool_swap/lifecycle/spec_builder.py:210)
+[`_published_port`](../src/tool_swap/lifecycle/spec_builder.py:211)
 pins all four ([D-E](../plans/m2b-lifecycle-manager.md:1201)):
 
 | Authored value | `published_port` |
@@ -399,9 +404,11 @@ rather than papered over.
 - **No daemon verification.** Every test here is a pure function over
   config objects. No container has been started, no socket opened, no
   docker fact asserted.
-- **The builder has no caller yet.** The `LifecycleManager` that
-  would use it is not built, so `build_container_spec` is a reviewed,
-  guarded function with no production consumer.
+- **The builder has one caller.** The
+  [`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+  builds the spec inside its cold start; nothing above the lifecycle
+  layer calls it, and no router endpoint has started a container
+  through this path.
 - **`expose_host_port: true` is not supported.** The schema
   description promising an auto-allocation is currently wrong; writing
   `true` yields the `ValueError` documented above.

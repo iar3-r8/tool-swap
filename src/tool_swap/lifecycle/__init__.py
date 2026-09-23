@@ -1,4 +1,6 @@
-"""Container lifecycle: the config to ContainerSpec builder (M2b slice A).
+"""Container lifecycle for tool containers.
 
-The tool state machine and LifecycleManager arrive in later slices.
+The config to ``ContainerSpec`` builder, the tool state machine, the
+readiness progression and the ``LifecycleManager`` that brings a
+registered tool to ``READY``.
 """

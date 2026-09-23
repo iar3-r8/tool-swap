@@ -60,10 +60,9 @@ flowchart LR
         SPEC[spec_builder.py: build_container_spec, the config → ContainerSpec conversion]
         STATES[states.py: ToolState, ModelRuntimeState, the ten-edge transition table]
         PROBE[probes.py: the Probe protocol, ProbeTarget, FakeProbe — the readiness seam, no client]
-        MANAGE[manager.py: drive_readiness, the state machine's first driver]
+        MANAGE[manager.py: drive_readiness and LifecycleManager, the state machine's drivers]
     end
     subgraph future[in the plan, not in the tree]
-        LIFE[LifecycleManager, the driver of the state machine]
         BLD[build and BuildSpec]
     end
     VAL -->|ParsedMount| SPEC
@@ -80,8 +79,8 @@ flowchart LR
     DOCKT -->|returns members of| ERR
     MANAGE -->|applies| STATES
     MANAGE -->|polls| PROBE
-    LIFE -.->|will delegate to| MANAGE
-    LIFE -.->|will call off the event loop| PROTO
+    MANAGE -->|builds| SPEC
+    MANAGE -->|starts, stops off the event loop| PROTO
     BLD -.->|deliberately absent from the protocol| PROTO
 ```
 
@@ -106,9 +105,11 @@ whose ten edges decide *when* a container should exist, and
 [its page](tool-state-machine.md) documents the table, the
 runtime-state holder and the logging contract. `PROBE` and `MANAGE`
 are the readiness seam
-([its page](readiness-probe.md)) and the first driver of the state
-machine (documented on
-[the state machine page](tool-state-machine.md#the-first-driver-drive_readiness)).
+([its page](readiness-probe.md)) and the readiness progression plus
+the `LifecycleManager` that drives it (documented on
+[the state machine page](tool-state-machine.md#the-first-driver-drive_readiness)
+and
+[the lifecycle manager page](lifecycle-manager.md)).
 
 ## The data types
 
@@ -219,9 +220,9 @@ The seam's value is as much in what it refuses to do.
   appears — and a second guard walks `src/tool_swap/lifecycle/` for
   the same reason. The single `ParsedMount` → `MountSpec`
   conversion happens in the config-to-spec builder,
-  [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19),
-  which is in the tree but has no caller yet (the
-  `LifecycleManager` is not built), and
+  [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:20),
+  which the `LifecycleManager` calls during a cold start
+  ([the lifecycle manager page](lifecycle-manager.md)), and
   [its page](spec-builder.md) documents the conversion, the
   resolution base and the two source-level guards.
 - **No configured default is re-stated.** `gpu_runtime`,
@@ -240,10 +241,13 @@ The seam's value is as much in what it refuses to do.
   from one module only" — forbids `docker` from every `tool_swap`
   module and carves out exactly
   `tool_swap.backend.docker_backend -> docker`
-  ([`.importlinter`](../.importlinter:39)); `lint-imports` reports
-  **5 kept, 0 broken**. The other four contracts keep the router and
-  runtime apart and the config layer a leaf that never imports the
-  backend. The mechanism has two teeth, documented in detail in
+  ([`.importlinter`](../.importlinter:39)); a sixth keeps the
+  lifecycle and proxy layers off `docker_backend` itself
+  ([`.importlinter`](../.importlinter:46), [documented below](#the-import-boundary));
+  `lint-imports` reports **6 kept, 0 broken**. The other four
+  contracts keep the router and runtime apart and the config layer a
+  leaf that never imports the backend. The mechanism has two teeth,
+  documented in detail in
   [The import boundary](#the-import-boundary): without
   the top-level `include_external_packages` the contract would raise
   a configuration error rather than check anything, and its
@@ -679,9 +683,17 @@ The fifth contract in
 importable from one module only"* — is what makes
 [`docker_backend.py`](../src/tool_swap/backend/docker_backend.py)
 being the only SDK-importing module **enforced rather than hoped
-for**. `lint-imports` reports **5 kept, 0 broken**; a test runs the
-tool and asserts the summary line, and shape-pinning tests parse
-the in-tree file so the contract cannot drift silently.
+for**. A sixth contract
+([`.importlinter`](../.importlinter:46)) forbids
+`tool_swap.lifecycle` and `tool_swap.proxy` from importing
+`docker_backend` itself: contract five covers the SDK, but nothing
+enforced the `docker_backend` direction before it, and the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+exists to be usable with `FakeBackend` in an environment where the
+SDK cannot be imported. `lint-imports` reports **6 kept, 0
+broken**; a test runs the tool and asserts the summary line, and
+shape-pinning tests parse the in-tree file so the contracts cannot
+drift silently.
 
 Two mechanism facts are worth knowing, because both are load-bearing
 and neither is obvious:
@@ -712,7 +724,12 @@ and neither is obvious:
 The behavioural half of the boundary: `base`, `labels` and
 `fake_backend` must import — and `FakeBackend()` must construct —
 with the SDK blocked from the import system
-([`test_docker_sdk_boundary.py`](../tests/unit/test_docker_sdk_boundary.py)).
+([`test_docker_sdk_boundary.py`](../tests/unit/test_docker_sdk_boundary.py));
+the lifecycle and proxy modules — the manager, the probe seam and
+`FakeBackend` together, and a constructed
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154) on
+top of them — must import and construct the same way
+([`test_lifecycle_docker_backend_boundary.py`](../tests/unit/lifecycle/test_lifecycle_docker_backend_boundary.py)).
 The blocker is a `sys.meta_path` finder, not a `sys.modules`
 deletion — deleting the already-loaded `docker*` entries is not
 enough, because a fresh import would simply find the SDK again on
@@ -819,6 +836,10 @@ Two honest limits on the table:
   `ContainerSpec` builder: how each spec field is
   assembled, the `BackendConfig`-not-`values` trap, the mount
   conversion and its refusals, and the two guards.
+- [`docs/lifecycle-manager.md`](lifecycle-manager.md) — the
+  `LifecycleManager` that calls this seam's `start` and `stop` off
+  the event loop, and the sixth import contract that keeps it able
+  to do so without the docker SDK importable.
 - [`docs/tool-state-machine.md`](tool-state-machine.md) — the tool
   state machine: the six states, the ten-edge table and
   its two deliberate absences, `ModelRuntimeState`'s field
