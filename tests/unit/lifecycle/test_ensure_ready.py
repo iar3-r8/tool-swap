@@ -30,7 +30,16 @@ contract of the coalesced cold start: a caller cancelled mid-start
 raises ``CancelledError`` and no one else does, the start keeps running
 for the remaining callers, and when every caller walks away the cold
 start still runs to completion and records its outcome, so a started
-container is never left without a recorded handle.
+container is never left without a recorded handle. Behaviour 18 pins
+that backend calls run in an executor, never on the event loop: a start
+parked on a threading.Event leaves the loop free for other work, a
+second tool's cold start is attempted while the first tool's start is
+still blocked, a readiness-timeout's stop is off the loop too, and an
+exception raised in the backend's thread reaches the await as the same
+instance, so behaviour 15's FAILED mapping and verbatim last_error hold
+across the hop. The blocking backend is a double in this file, not a
+FakeBackend mode, and every thread wait is budget-bounded so a mistake
+fails rather than hangs.
 
 The manager receives each tool's ``ResolvedTool`` and image through
 ``register_tool(tool, resolved, image=...)`` and exposes the per-tool
@@ -49,13 +58,16 @@ import asyncio
 import importlib
 import inspect
 import logging
+import threading
+import uuid
+from collections.abc import Callable
 from types import ModuleType
 from typing import Any
 
 import pytest
 
 import tool_swap.lifecycle.states as states_module
-from tool_swap.backend.base import ContainerSpec, ContainerState
+from tool_swap.backend.base import ContainerHandle, ContainerSpec, ContainerState
 from tool_swap.backend.errors import (
     BackendError,
     ContainerNameConflictError,
@@ -1688,4 +1700,459 @@ async def test_a_caller_arriving_after_a_cancelled_start_gets_ready() -> None:
     assert len(starts) == 1, (
         f"the journal shows {len(starts)} starts — a late caller on a "
         "READY tool must not start a second container"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 18 — backend calls run in an executor, never on the event loop
+# ---------------------------------------------------------------------------
+#
+# A backend whose start or stop blocks on a threading.Event until the
+# test releases it. It is a double local to this file, not a FakeBackend
+# failure mode: FakeBackend spawns no threads by construction, and a
+# shared fake that can block would make every other test's timing depend
+# on its release (m2b plan §3 behaviour 18).
+#
+# Every thread wait is bounded in two places. The double's own blocking
+# wait is budget-capped: if a test forgets to release, the worker raises
+# on its own budget instead of deadlocking the loop's teardown. The loop
+# side never blocks: it polls worker flags with asyncio.sleep on the
+# loop's real clock, and every such poll has a deadline that raises with
+# the waited-on thing named rather than hanging. asyncio.wait_for appears
+# nowhere — a worker thread's progress cannot be expressed in simulated
+# time, so there is no simulated deadline to wait on.
+#
+# ManualClock never enters the assertions in this section. Simulated time
+# does not advance while a worker blocks, so the assertions are about
+# real concurrency: the loop ran other work while the backend call was
+# still in flight, the second tool's start was reached while the first
+# block was open, and the readiness-timeout's stop ran off the loop.
+#
+# Non-vacuity: every "the loop kept running" observation is ordered
+# inside the block window. The entered flag is set from inside the
+# worker, immediately before the blocking wait, so observation begins
+# only once the call is genuinely blocked; the observer records, at the
+# moment its own work ends, whether the block had already finished or
+# raised, and asserts it had not — a test cannot pass by observing the
+# loop before or after the block.
+
+
+TOOL_TWO = "t2"
+
+# The stop timeout the manager hands the backend, read from defaults.py
+# so the comparison cannot drift from the source of truth.
+STOP_TIMEOUT: float = float(BUILT_IN_DEFAULTS["stop_timeout"])
+
+
+class BlockingStartBackend:
+    """A ContainerBackend whose start or stop blocks on a threading.Event.
+
+    ``block="start"`` parks every start until ``release()``;
+    ``block="stop"`` parks stop the same way, reached through the
+    readiness-timeout path (the only call site the manager has for stop
+    today). ``fail_start_with`` makes start raise the given instance
+    from its thread, pinning that an exception raised in the executor
+    surfaces at the await with its type intact. The journal records
+    every protocol call on entry, mirroring FakeBackend.
+
+    The ``*_entered`` flags are set from the worker immediately before
+    the blocking wait, ``*_finished`` only on a clean return, and
+    ``*_raised`` whenever the worker gives up on its own budget — so a
+    loop-side observer can tell "still blocked" from "block ended".
+    """
+
+    _THREAD_BUDGET_S = 2.0
+
+    def __init__(
+        self,
+        *,
+        block: str | None = None,
+        fail_start_with: BaseException | None = None,
+    ) -> None:
+        if block not in (None, "start", "stop"):
+            raise ValueError(f"block must be None, 'start' or 'stop': {block!r}")
+        self.block = block
+        self.fail_start_with = fail_start_with
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self._containers: dict[ContainerHandle, bool] = {}
+        self._release = threading.Event()
+        self.start_entered = threading.Event()
+        self.stop_entered = threading.Event()
+        self.start_finished = threading.Event()
+        self.stop_finished = threading.Event()
+        self.start_raised = threading.Event()
+        self.stop_raised = threading.Event()
+
+    def release(self) -> None:
+        """Unblock a parked start or stop; idempotent."""
+        self._release.set()
+
+    def _record(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        self.calls.append((name, args, kwargs))
+
+    def _wait_or_fail(self, what: str) -> None:
+        # The double's own bound: if a test forgets release(), the worker
+        # raises on its budget instead of holding the loop's teardown.
+        if not self._release.wait(timeout=self._THREAD_BUDGET_S):
+            raise TimeoutError(
+                f"test forgot to release the blocking backend before its "
+                f"{self._THREAD_BUDGET_S}s budget let the {what} worker out"
+            )
+
+    def start(self, spec: ContainerSpec) -> ContainerHandle:
+        self._record("start", (spec,), {})
+        if self.fail_start_with is not None:
+            raise self.fail_start_with
+        self.start_entered.set()
+        try:
+            if self.block == "start":
+                self._wait_or_fail("start")
+        except Exception:
+            self.start_raised.set()
+            raise
+        handle = ContainerHandle(
+            id=uuid.uuid4().hex,
+            name=spec.name,
+            tool=spec.tool,
+            image=spec.image,
+        )
+        self._containers[handle] = True
+        self.start_finished.set()
+        return handle
+
+    def stop(self, handle: ContainerHandle, *, timeout_s: float) -> None:
+        self._record("stop", (handle,), {"timeout_s": timeout_s})
+        self.stop_entered.set()
+        try:
+            if self.block == "stop":
+                self._wait_or_fail("stop")
+        except Exception:
+            self.stop_raised.set()
+            raise
+        self._containers.pop(handle, None)
+        self.stop_finished.set()
+
+    def is_running(self, handle: ContainerHandle) -> bool:
+        self._record("is_running", (handle,), {})
+        return self._containers.get(handle, False)
+
+    def inspect(self, handle: ContainerHandle) -> Any:
+        self._record("inspect", (handle,), {})
+        raise NotImplementedError
+
+    def list_managed(self) -> list[ContainerHandle]:
+        self._record("list_managed", (), {})
+        return [h for h, running in self._containers.items() if running]
+
+    def logs(self, handle: ContainerHandle, *, follow: bool, tail: int) -> Any:
+        self._record("logs", (handle,), {"follow": follow, "tail": tail})
+        raise NotImplementedError
+
+
+async def _wait_until(
+    predicate: Callable[[], bool], what: str, *, deadline_s: float = 10.0
+) -> bool:
+    """Poll on the loop's real clock until predicate() holds.
+
+    The bound is on the loop's real clock, never on the ManualClock,
+    whose time does not advance while a worker thread blocks. A deadline
+    that trips raises with the waited-on thing named — a failure, not a
+    hang.
+
+    Returns:
+        True once the predicate holds.
+
+    Raises:
+        AssertionError: the predicate did not hold within *deadline_s*.
+    """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    while not predicate():
+        if loop.time() - started >= deadline_s:
+            raise AssertionError(
+                f"waited {deadline_s}s for {what} and it never happened — "
+                "if the loop was free the backend call never ran, and if "
+                "a blocking call held the loop, nothing else could make "
+                "it happen"
+            )
+        await asyncio.sleep(0.01)
+    return True
+
+
+def _observer_task(
+    *flags: threading.Event,
+) -> tuple[asyncio.Task[Any], list[bool]]:
+    """A task that does real work on the loop, then records which of
+    *flags* had already been set at the moment its work ended.
+
+    The returned list is filled when the task completes: one entry per
+    flag, True meaning the backend call behind the flag had already
+    ended. A progress observation is only meaningful while the call is
+    still in flight, so the test asserts every entry is False.
+
+    Returns:
+        The running task and the list it fills at completion.
+    """
+    finished: list[bool] = []
+
+    async def run() -> None:
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        finished.extend(flag.is_set() for flag in flags)
+
+    return asyncio.create_task(run()), finished
+
+
+def _build_blocking_manager(
+    backend: BlockingStartBackend,
+    probe: FakeProbe,
+    clock: ManualClock,
+    backend_config: BackendConfig,
+) -> Any:
+    """A manager wired to the blocking double, timeouts at their built-ins."""
+    return _manager_class()(
+        backend,
+        probe=probe,
+        clock=clock,
+        backend_config=backend_config,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_start_does_not_stall_the_event_loop() -> None:
+    """A start parked on a threading.Event leaves the loop free: a
+    concurrently spawned task does its work while the start is blocked,
+    and a released start then completes the cold start to READY."""
+    # Arrange: start blocks until released
+    backend = BlockingStartBackend(block="start")
+    probe = FakeProbe()
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_blocking_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    caller = asyncio.create_task(_ensure_ready(manager)(TOOL))
+    # The entered flag is set from inside the worker immediately before
+    # the block, so everything observed afterwards is observed while the
+    # start is genuinely blocked.
+    await _wait_until(backend.start_entered.is_set, "start to reach its block")
+    # Act: an observer does real work on the loop while start is parked
+    observer, ended_by_completion = _observer_task(
+        backend.start_finished, backend.start_raised
+    )
+    await _wait_until(
+        lambda: len(ended_by_completion) == 2, "the observer's work to finish"
+    )
+    await observer
+    # Assert: the observer finished while the block was still open
+    assert not ended_by_completion[0], (
+        "start had finished by the time the observer's work was done — "
+        "loop progress was observed after the block, not while the "
+        "backend was blocked"
+    )
+    assert not ended_by_completion[1], (
+        "start had already ended on its own worker budget by the time the "
+        "observer ran — the loop stayed frozen for the block's whole "
+        "duration, so the call ran on the loop itself, not in an "
+        "executor"
+    )
+    # Release and let the cold start complete
+    backend.release()
+    handle = await caller
+    # Assert: the released start completed the cold start normally
+    state = await _state_of(manager)
+    assert state.state is ToolState.READY, (
+        f"the tool is {state.state!r} after its blocked start was released "
+        "— a released start must complete the cold start to READY"
+    )
+    assert state.handle is handle, (
+        "the state holds a different handle than ensure_ready returned — "
+        "the released start must end with the started container recorded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_tool_progresses_while_first_start_is_blocked() -> None:
+    """A second tool's cold start is attempted while the first tool's
+    start is still blocked: plan/06 §8.7's group isolation in the only
+    form M2b can test — a global lock held across a start would fail it."""
+    # Arrange: every start blocks until released
+    backend = BlockingStartBackend(block="start")
+    probe = FakeProbe()
+    clock = ManualClock(start=CLOCK_START)
+    resolved_one = resolve_tool(TOOL, inline={})
+    resolved_two = resolve_tool(TOOL_TWO, inline={})
+    backend_config = BackendConfig()
+    manager = _build_blocking_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved_one)
+    _register_tool(manager)(TOOL_TWO, resolved_two, image=IMAGE)
+    ensure_ready = _ensure_ready(manager)
+    first = asyncio.create_task(ensure_ready(TOOL))
+    await _wait_until(
+        backend.start_entered.is_set, "the first start to reach its block"
+    )
+    # Act: the second tool asks for its own cold start while the first is
+    # parked in the block
+    second = asyncio.create_task(ensure_ready(TOOL_TWO))
+
+    def second_attempted() -> bool:
+        return any(
+            name == "start" and args[0].tool == TOOL_TWO
+            for name, args, _ in backend.calls
+        )
+
+    await _wait_until(second_attempted, "the second tool's start")
+    # Assert: the second attempt landed while the first block was open
+    assert not backend.start_finished.is_set(), (
+        "the first start had finished before the second tool's start was "
+        "attempted — the isolation was observed after the first block, "
+        "not during it"
+    )
+    assert not backend.start_raised.is_set(), (
+        "the first start had already ended on its own budget before the "
+        "second tool's start was attempted — the loop stayed frozen for "
+        "the block's whole duration, so the call ran on the loop itself, "
+        "not in an executor"
+    )
+    # Release; both parked starts run to completion
+    backend.release()
+    handle_one = await first
+    handle_two = await second
+    # Assert: both tools ended READY on the containers their own starts
+    # produced
+    state_one = await _state_of(manager)
+    assert state_one.state is ToolState.READY, (
+        f"the first tool is {state_one.state!r} — the released start must end READY"
+    )
+    assert state_one.handle is handle_one, (
+        "the first tool holds a different handle than its caller got — "
+        "each tool must end on the container its own start produced"
+    )
+    state_two = _state_of_method(manager)(TOOL_TWO)
+    assert state_two.state is ToolState.READY, (
+        f"the second tool is {state_two.state!r} — its cold start, "
+        "attempted while the first was blocked, must end READY"
+    )
+    assert state_two.handle is handle_two, (
+        "the second tool holds a different handle than its caller got — "
+        "each tool must end on the container its own start produced"
+    )
+    starts = [c for c in backend.calls if c[0] == "start"]
+    assert len(starts) == 2, (
+        f"the journal shows {len(starts)} starts — two tools "
+        "cold-starting isolate into one start each, not one shared start"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_stop_does_not_stall_the_event_loop() -> None:
+    """A stop parked on a threading.Event leaves the loop free too: while
+    the readiness-timeout path's stop is blocked, an observer task still
+    does its work, and the timeout's own contract holds behind it."""
+    # Arrange: start succeeds, ready never answers, stop blocks
+    backend = BlockingStartBackend(block="stop")
+    probe = FakeProbe(script=READY_NEVER_TRUE)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_blocking_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    caller = asyncio.create_task(_ensure_ready(manager)(TOOL))
+    # The timeout path burns ready_timeout of simulated time (behaviour
+    # 16's territory) before it stops the container; here it only exists
+    # to reach the stop call.
+    await _wait_until(backend.stop_entered.is_set, "stop to reach its blocking wait")
+    # Act: an observer does real work on the loop while stop is parked
+    observer, ended_by_completion = _observer_task(
+        backend.stop_finished, backend.stop_raised
+    )
+    await _wait_until(
+        lambda: len(ended_by_completion) == 2, "the observer's work to finish"
+    )
+    await observer
+    # Assert: the observer finished while the stop block was still open
+    assert not ended_by_completion[0], (
+        "stop had finished by the time the observer's work was done — "
+        "loop progress was observed after the block, not while the "
+        "backend was blocked"
+    )
+    assert not ended_by_completion[1], (
+        "stop had already ended on its own worker budget by the time the "
+        "observer ran — the loop stayed frozen for the block's whole "
+        "duration, so the call ran on the loop itself, not in an "
+        "executor"
+    )
+    # Release; the timeout failure completes
+    backend.release()
+    with pytest.raises(ReadyTimeoutError):
+        await caller
+    # Assert: the timeout's own contract, with the blocked stop behind it
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool is {state.state!r} after its readiness timeout — the "
+        "timed-out cold start must end FAILED"
+    )
+    assert state.last_error == READY_TIMEOUT_TEXT, (
+        f"last_error is {state.last_error!r}, the ready timeout's own "
+        f"rendering is {READY_TIMEOUT_TEXT!r} — a stop that is off the "
+        "loop must not change what the timeout records"
+    )
+    assert state.handle is None, (
+        "the timed-out tool still holds a handle — the stopped container "
+        "must not be claimed"
+    )
+    stops = [c for c in backend.calls if c[0] == "stop"]
+    assert len(stops) == 1, (
+        f"the journal shows {len(stops)} stops — the readiness timeout "
+        "stops the started container once"
+    )
+    assert stops[0][2] == {"timeout_s": STOP_TIMEOUT}, (
+        f"stop was called with {stops[0][2]} — the manager must hand the "
+        f"backend its configured stop timeout of {STOP_TIMEOUT}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_exception_in_the_backend_surfaces_at_await_with_type_intact() -> None:
+    """A start exception raised in the backend's thread reaches the await
+    as the very same object: behaviour 15's FAILED mapping and the
+    verbatim last_error hold across the executor hop."""
+    # Arrange: the backend's start raises a refusal from its own thread
+    refusal = ContainerStartError("the daemon refused the start from a worker thread")
+    backend = BlockingStartBackend(fail_start_with=refusal)
+    probe = FakeProbe()
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_blocking_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    # Assert: the await surfaced the backend's exception itself
+    assert isinstance(outcome, BaseException), (
+        f"ensure_ready returned {type(outcome).__name__} — a refused "
+        "start must be re-raised to the caller, not swallowed"
+    )
+    assert outcome is refusal, (
+        f"ensure_ready raised {type(outcome).__name__}, not the very "
+        "exception the backend raised — the hop must surface the raised "
+        "instance at the await, not a copy or a wrapper"
+    )
+    assert type(outcome) is ContainerStartError, (
+        f"the raised type is {type(outcome).__name__} — the taxonomy "
+        "member must survive the hop with its type intact"
+    )
+    # Assert: behaviour 15's mapping holds across the hop
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool is {state.state!r} after the refused start — a refusal "
+        "raised in the backend's thread must still end the tool FAILED"
+    )
+    assert state.last_error == refusal.message, (
+        f"last_error is {state.last_error!r}, the refusal's message is "
+        f"{refusal.message!r} — the reason must carry the message "
+        "verbatim across the hop"
+    )
+    assert state.handle is None, (
+        "the tool holds a handle after a refusal that created no container"
     )
