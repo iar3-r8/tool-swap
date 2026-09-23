@@ -133,7 +133,7 @@ the squash-merge trap this section already warns about.
 | 12 | Construction, injection, sixth contract | `ba37128`, re-pinned by `8757805` | `92ae112` | 1757 passed, 2 skipped |
 | 13 | `ensure_ready` cold-start happy path | `8628aa2` | `7f9c036` | 1765 passed, 2 skipped |
 | 14 | Ten concurrent `ensure_ready`, one start | `d32eeaa` | `bc290be` | 1770 passed, 2 skipped |
-| 15 | Start failure yields `FAILED` with reason | — | — | — |
+| 15 | Start failure yields `FAILED` with reason | `965e8dd` | `533dd8e` | 1775 passed, 2 skipped |
 | 16 | Readiness timeout yields `FAILED` | — | — | — |
 | 17 | Cancellation neither kills nor orphans | — | — | — |
 | 18 | Backend calls run in an executor | — | — | — |

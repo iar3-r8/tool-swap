@@ -1,5 +1,5 @@
 """Pins the cold start of ``LifecycleManager.ensure_ready`` (m2b plan
-§3 behaviours 13, 14 and 15, §1.3, §1.4): a ``STOPPED`` tool whose
+§3 behaviours 13, 14, 15 and 16, §1.3, §1.4): a ``STOPPED`` tool whose
 probe answers true immediately walks ``STOPPED -> STARTING -> LOADING
 -> READY`` through the transition table, the backend is started
 exactly once, the returned handle is the one ``backend.start``
@@ -17,7 +17,15 @@ the tool ends ``FAILED`` with the taxonomy member's ``message`` in
 reason, the refusal re-raised to every caller, the name-conflict
 member's message reaching ``last_error`` unaltered too, and
 ``ensure_ready`` on a ``FAILED`` tool retrying through the
-``FAILED -> STARTING`` edge with the refusal repeating.
+``FAILED -> STARTING`` edge with the refusal repeating. Behaviour 16
+pins the readiness-timeout path: a probe whose ``ready`` never answers
+ends the tool ``FAILED`` naming ``ready_timeout`` and the elapsed
+simulated seconds, the mirror case with a ``health`` that never
+answers naming ``start_timeout``, the started container stopped on the
+way to ``FAILED``, the simulated elapsed time equal to the one
+deadline that ran (not the two deadlines chained), the handle cleared,
+and the timeout re-raised as a member of the readiness timeout family
+rather than the backend taxonomy.
 
 The manager receives each tool's ``ResolvedTool`` and image through
 ``register_tool(tool, resolved, image=...)`` and exposes the per-tool
@@ -42,7 +50,7 @@ from typing import Any
 import pytest
 
 import tool_swap.lifecycle.states as states_module
-from tool_swap.backend.base import ContainerSpec
+from tool_swap.backend.base import ContainerSpec, ContainerState
 from tool_swap.backend.errors import (
     BackendError,
     ContainerNameConflictError,
@@ -50,8 +58,10 @@ from tool_swap.backend.errors import (
 )
 from tool_swap.backend.fake_backend import FailureMode, FakeBackend
 from tool_swap.backend.labels import container_name
+from tool_swap.config.defaults import BUILT_IN_DEFAULTS
 from tool_swap.config.resolver import ResolvedTool, resolve_tool
 from tool_swap.config.schema import BackendConfig
+from tool_swap.lifecycle.manager import ReadyTimeoutError, StartTimeoutError
 from tool_swap.lifecycle.states import ToolState, apply_transition
 from tool_swap.proxy.probes import FakeProbe, ProbeTarget
 from tool_swap.utils.clock import ManualClock
@@ -1083,4 +1093,352 @@ async def test_a_caller_arriving_after_a_failed_start_receives_the_refusal() -> 
     assert (await _state_of(manager)).state is ToolState.FAILED, (
         f"the tool sits in {(await _state_of(manager)).state!r} after the "
         "late caller's failed attempt — the refusal ends it FAILED again"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 16 — a readiness timeout yields FAILED naming the deadline
+# ---------------------------------------------------------------------------
+
+# The built-in deadline values, read from defaults.py so the timeout
+# arithmetic below cannot drift from the source of truth.
+START_TIMEOUT: float = float(BUILT_IN_DEFAULTS["start_timeout"])
+READY_TIMEOUT: float = float(BUILT_IN_DEFAULTS["ready_timeout"])
+
+# The readiness timeout's own rendering, which names the deadline that
+# ran and the simulated seconds it ran: unlike behaviour 15's
+# backend-authored message, this text is the manager's own, and it must
+# carry both facts so an operator tells a hung ready from a hung start.
+START_TIMEOUT_TEXT = f"readiness start_timeout elapsed after {START_TIMEOUT}s"
+READY_TIMEOUT_TEXT = f"readiness ready_timeout elapsed after {READY_TIMEOUT}s"
+
+# Never-true probe scripts, one per phase.
+READY_NEVER_TRUE = {TOOL: {"ready": None}}
+HEALTH_NEVER_TRUE = {TOOL: {"health": None}}
+
+
+def _stops(backend: FakeBackend) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
+    """The journal's stop entries, mirroring ``_starts``."""
+    return [call for call in backend.calls if call[0] == "stop"]
+
+
+@pytest.mark.asyncio
+async def test_ready_timeout_ends_the_tool_failed_naming_the_deadline_and_elapsed() -> (
+    None
+):
+    """A ready probe that never answers ends the tool FAILED with
+    last_error naming ready_timeout and its elapsed seconds, the timeout
+    re-raised rather than mapped onto the backend taxonomy."""
+    # Arrange: health answers immediately, ready never does
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=READY_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    # Assert: the raised error is the ready timeout itself
+    assert type(outcome) is ReadyTimeoutError, (
+        f"ensure_ready raised {type(outcome).__name__} — a ready timeout "
+        "must be re-raised as the timeout itself, since 'never became "
+        "ready' and 'refused to start' have different remedies"
+    )
+    assert not isinstance(outcome, BackendError), (
+        f"ensure_ready raised {type(outcome).__name__}, a BackendError — "
+        "a readiness timeout is not a backend refusal and must stay "
+        "distinguishable from one"
+    )
+    assert outcome.deadline == "ready_timeout", (
+        f"the raised timeout names deadline {outcome.deadline!r} — the "
+        "ready window is the one that ran out"
+    )
+    assert outcome.elapsed == READY_TIMEOUT, (
+        f"the raised timeout ran {outcome.elapsed!r}s — the ready window "
+        f"runs the built-in {READY_TIMEOUT!r}s"
+    )
+    # Assert: the tool is FAILED, not left in the phase it hung in
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after the ready timeout — it "
+        "must end FAILED, not be left LOADING where the probe hung"
+    )
+    # Assert: the reason names the deadline and the elapsed seconds, exactly
+    assert state.last_error == READY_TIMEOUT_TEXT, (
+        f"last_error is {state.last_error!r}, the ready timeout's own "
+        f"rendering is {READY_TIMEOUT_TEXT!r} — the text must name the "
+        "deadline that ran and the simulated seconds it ran"
+    )
+    assert state.last_error == str(outcome), (
+        f"last_error is {state.last_error!r}, the raised error renders "
+        f"{str(outcome)!r} — the recorded reason and the raised error "
+        "must agree on the wording"
+    )
+    assert state.became_ready_at is None, (
+        "became_ready_at is stamped although the tool never became ready"
+    )
+    # Assert: the cost is the ready window alone, not both windows chained
+    assert clock.now() == CLOCK_START + READY_TIMEOUT, (
+        f"simulated time is {clock.now()} — health answered at "
+        f"{CLOCK_START} and the ready window runs {READY_TIMEOUT}s, so "
+        "the cold start costs the ready window alone"
+    )
+    assert clock.now() != CLOCK_START + START_TIMEOUT + READY_TIMEOUT, (
+        f"simulated time is {clock.now()} — the two deadlines are "
+        "independent, and chaining them would cost their sum"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_ends_the_tool_failed_naming_the_deadline_and_elapsed() -> (
+    None
+):
+    """A health probe that never answers ends the tool FAILED naming
+    start_timeout and its elapsed seconds, the timeout re-raised rather
+    than mapped onto the backend taxonomy."""
+    # Arrange: health never answers, so the start window runs out
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=HEALTH_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    # Assert: the raised error is the start timeout itself
+    assert type(outcome) is StartTimeoutError, (
+        f"ensure_ready raised {type(outcome).__name__} — a start timeout "
+        "must be re-raised as the timeout itself, since 'never became "
+        "ready' and 'refused to start' have different remedies"
+    )
+    assert not isinstance(outcome, BackendError), (
+        f"ensure_ready raised {type(outcome).__name__}, a BackendError — "
+        "a readiness timeout is not a backend refusal and must stay "
+        "distinguishable from one"
+    )
+    assert outcome.deadline == "start_timeout", (
+        f"the raised timeout names deadline {outcome.deadline!r} — the "
+        "start window is the one that ran out"
+    )
+    assert outcome.elapsed == START_TIMEOUT, (
+        f"the raised timeout ran {outcome.elapsed!r}s — the start window "
+        f"runs the built-in {START_TIMEOUT!r}s"
+    )
+    # Assert: the tool is FAILED, not left in the phase it hung in
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after the start timeout — it "
+        "must end FAILED, not be left STARTING where the probe hung"
+    )
+    # Assert: the reason names the deadline and the elapsed seconds, exactly
+    assert state.last_error == START_TIMEOUT_TEXT, (
+        f"last_error is {state.last_error!r}, the start timeout's own "
+        f"rendering is {START_TIMEOUT_TEXT!r} — the text must name the "
+        "deadline that ran and the simulated seconds it ran"
+    )
+    assert state.last_error == str(outcome), (
+        f"last_error is {state.last_error!r}, the raised error renders "
+        f"{str(outcome)!r} — the recorded reason and the raised error "
+        "must agree on the wording"
+    )
+    assert state.became_ready_at is None, (
+        "became_ready_at is stamped although the tool never became ready"
+    )
+    # Assert: the cost is the start window alone, not both windows chained
+    assert clock.now() == CLOCK_START + START_TIMEOUT, (
+        f"simulated time is {clock.now()} — the start window runs "
+        f"{START_TIMEOUT}s from {CLOCK_START}, and it is the only window "
+        "that ran"
+    )
+    assert clock.now() != CLOCK_START + START_TIMEOUT + READY_TIMEOUT, (
+        f"simulated time is {clock.now()} — the two deadlines are "
+        "independent, and chaining them would cost their sum"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ready_timeout_stops_the_started_container_and_clears_the_handle() -> (
+    None
+):
+    """The container a ready timeout hung in is stopped on the way to
+    FAILED and its handle cleared — a failed cold start must not leave a
+    container resident, or it leaks a slot."""
+    # Arrange
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=READY_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    assert isinstance(outcome, ReadyTimeoutError), (
+        f"ensure_ready raised {type(outcome).__name__} — the scripted "
+        "probe must run the ready window to its timeout"
+    )
+    # Assert: the journal shows one start and one stop, of the same handle
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start calls — the cold start "
+        "started the container before it hung"
+    )
+    stops = _stops(backend)
+    assert len(stops) == 1, (
+        f"the journal shows {len(stops)} stop calls — the hung container "
+        "must be stopped on the way to FAILED, or the failed cold start "
+        "leaks a slot"
+    )
+    stopped = stops[0][1][0]
+    managed = backend.list_managed()
+    assert stopped is managed[0], (
+        f"the stop names handle {stopped!r}, start produced "
+        f"{managed[0]!r} — the container being stopped is the one that "
+        "was started"
+    )
+    assert backend.inspect(managed[0]).state is ContainerState.EXITED, (
+        f"the container is {backend.inspect(managed[0]).state!r} after "
+        "the timeout — a tool that never became ready leaves no running "
+        "container"
+    )
+    # Assert: the holder no longer claims the stopped container
+    state = await _state_of(manager)
+    assert state.handle is None, (
+        f"the tool still holds handle {state.handle!r} — the container "
+        "it refers to has been stopped, so the holder must not claim it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_stops_the_started_container_and_clears_the_handle() -> (
+    None
+):
+    """The mirror case: the container a start timeout hung in is stopped
+    on the way to FAILED and its handle cleared, even though the tool
+    never left STARTING."""
+    # Arrange
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=HEALTH_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    assert isinstance(outcome, StartTimeoutError), (
+        f"ensure_ready raised {type(outcome).__name__} — the scripted "
+        "probe must run the start window to its timeout"
+    )
+    # Assert: the journal shows one start and one stop, of the same handle
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start calls — the cold start "
+        "started the container before it hung"
+    )
+    stops = _stops(backend)
+    assert len(stops) == 1, (
+        f"the journal shows {len(stops)} stop calls — the hung container "
+        "must be stopped on the way to FAILED, or the failed cold start "
+        "leaks a slot"
+    )
+    stopped = stops[0][1][0]
+    managed = backend.list_managed()
+    assert stopped is managed[0], (
+        f"the stop names handle {stopped!r}, start produced "
+        f"{managed[0]!r} — the container being stopped is the one that "
+        "was started"
+    )
+    assert backend.inspect(managed[0]).state is ContainerState.EXITED, (
+        f"the container is {backend.inspect(managed[0]).state!r} after "
+        "the timeout — a tool that never became ready leaves no running "
+        "container"
+    )
+    # Assert: the holder no longer claims the stopped container
+    state = await _state_of(manager)
+    assert state.handle is None, (
+        f"the tool still holds handle {state.handle!r} — the container "
+        "it refers to has been stopped, so the holder must not claim it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ready_timeout_records_the_loading_to_failed_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The holder passes through LOADING before failing: the observed
+    moves are STARTING, LOADING, FAILED, and the move into FAILED is
+    logged from LOADING with the timeout's own text as the reason."""
+    # Arrange
+    observed = _track_transitions(monkeypatch)
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=READY_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    with caplog.at_level(logging.INFO):
+        outcome = await _drive(manager)
+    assert isinstance(outcome, ReadyTimeoutError), (
+        f"ensure_ready raised {type(outcome).__name__} — the scripted "
+        "probe must run the ready window to its timeout"
+    )
+    # Assert: every move goes through the table, ending FAILED from LOADING
+    assert observed == [ToolState.STARTING, ToolState.LOADING, ToolState.FAILED], (
+        f"observed {observed} — the holder moves STOPPED -> STARTING -> "
+        "LOADING -> FAILED; a timeout in the ready phase fails the tool "
+        "from LOADING, not from STARTING"
+    )
+    # Assert: the move into FAILED logged once, from LOADING, with the text
+    records = _failed_transition_records(caplog)
+    assert len(records) == 1, (
+        f"the move into FAILED logged {len(records)} record(s) — the "
+        "transition must log exactly one INFO record"
+    )
+    record = records[0]
+    assert getattr(record, "from_state", None) is ToolState.LOADING, (
+        f"the FAILED record carries "
+        f"from_state={getattr(record, 'from_state', None)!r} — the ready "
+        "timeout fails the tool out of LOADING"
+    )
+    assert getattr(record, "reason", None) == READY_TIMEOUT_TEXT, (
+        f"the FAILED record carries "
+        f"reason={getattr(record, 'reason', None)!r} — the move into "
+        "FAILED is logged with the timeout's own text as the reason"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_records_the_starting_to_failed_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The mirror case: the holder never reaches LOADING, so the observed
+    moves are STARTING and FAILED, and the move into FAILED is logged
+    from STARTING with the timeout's own text as the reason."""
+    # Arrange
+    observed = _track_transitions(monkeypatch)
+    backend, _, clock, resolved, backend_config = _fixtures()
+    probe = FakeProbe(script=HEALTH_NEVER_TRUE)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    with caplog.at_level(logging.INFO):
+        outcome = await _drive(manager)
+    assert isinstance(outcome, StartTimeoutError), (
+        f"ensure_ready raised {type(outcome).__name__} — the scripted "
+        "probe must run the start window to its timeout"
+    )
+    # Assert: every move goes through the table, ending FAILED from STARTING
+    assert observed == [ToolState.STARTING, ToolState.FAILED], (
+        f"observed {observed} — the holder moves STOPPED -> STARTING -> "
+        "FAILED; a timeout in the start phase fails the tool from "
+        "STARTING, having never answered health"
+    )
+    # Assert: the move into FAILED logged once, from STARTING, with the text
+    records = _failed_transition_records(caplog)
+    assert len(records) == 1, (
+        f"the move into FAILED logged {len(records)} record(s) — the "
+        "transition must log exactly one INFO record"
+    )
+    record = records[0]
+    assert getattr(record, "from_state", None) is ToolState.STARTING, (
+        f"the FAILED record carries "
+        f"from_state={getattr(record, 'from_state', None)!r} — the start "
+        "timeout fails the tool out of STARTING"
+    )
+    assert getattr(record, "reason", None) == START_TIMEOUT_TEXT, (
+        f"the FAILED record carries "
+        f"reason={getattr(record, 'reason', None)!r} — the move into "
+        "FAILED is logged with the timeout's own text as the reason"
     )
