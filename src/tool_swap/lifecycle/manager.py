@@ -26,6 +26,7 @@ environment where the docker SDK is not importable.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Final, cast
 
@@ -50,6 +51,11 @@ _READY_TIMEOUT: Final[float] = float(cast("float", BUILT_IN_DEFAULTS["ready_time
 _PROBE_INTERVAL: Final[float] = float(
     cast("float", BUILT_IN_DEFAULTS["probe_interval"])
 )
+_STOP_TIMEOUT: Final[float] = float(cast("float", BUILT_IN_DEFAULTS["stop_timeout"]))
+
+# Module-level logger; used only for cleanup failures a handler must
+# not let mask the error it is handling.
+logger = logging.getLogger(__name__)
 
 
 class ReadinessTimeoutError(TimeoutError):
@@ -147,9 +153,9 @@ async def drive_readiness(
 class LifecycleManager:
     """Owns the injected backend, probe, clock and backend configuration.
 
-    Holds each injected object by identity and the three timeout
-    scalars by value, so the manager uses exactly what it was given —
-    a ``FakeBackend`` keeps it usable where the docker SDK is not
+    Holds each injected object by identity and the timeout scalars by
+    value, so the manager uses exactly what it was given — a
+    ``FakeBackend`` keeps it usable where the docker SDK is not
     importable, and a caller that does not use the config layer can
     still construct it. Construction performs no backend work and no
     clock movement; any readiness progression it later runs must
@@ -171,6 +177,7 @@ class LifecycleManager:
         start_timeout: float = _START_TIMEOUT,
         ready_timeout: float = _READY_TIMEOUT,
         probe_interval: float = _PROBE_INTERVAL,
+        stop_timeout: float = _STOP_TIMEOUT,
     ) -> None:
         """Store the injections by identity and the scalars by value.
 
@@ -182,6 +189,8 @@ class LifecycleManager:
             start_timeout: Seconds allowed for container-up-to-health.
             ready_timeout: Seconds allowed for health-to-ready.
             probe_interval: Simulated seconds between polls.
+            stop_timeout: Seconds a stop of the hung container is
+                allowed before the runtime kills it.
         """
         if backend is None:
             raise TypeError("backend must not be None")
@@ -194,6 +203,7 @@ class LifecycleManager:
         self.start_timeout = start_timeout
         self.ready_timeout = ready_timeout
         self.probe_interval = probe_interval
+        self.stop_timeout = stop_timeout
         self._tools: dict[str, _ToolRegistration] = {}
 
     def register_tool(self, tool: str, resolved: ResolvedTool, *, image: str) -> None:
@@ -272,9 +282,11 @@ class LifecycleManager:
                 serve yet (anything but ``STOPPED``, ``READY`` and
                 ``FAILED``).
             StartTimeoutError: ``health`` never answered true within
-                ``start_timeout``; the holder is left ``STARTING``.
+                ``start_timeout``; the container is stopped and the
+                holder ends ``FAILED``.
             ReadyTimeoutError: ``ready`` never answered true within
-                ``ready_timeout``; the holder is left ``LOADING``.
+                ``ready_timeout``; the container is stopped and the
+                holder ends ``FAILED``.
             IllegalTransitionError: from ``apply_transition`` on an
                 illegal pair, leaving the holder untouched.
         """
@@ -323,8 +335,11 @@ class LifecycleManager:
         once here rather than per waiter, because the transition table
         has no ``FAILED -> FAILED`` self-edge and ten waiters each
         applying it would raise nine ``IllegalTransitionError``s on top
-        of the real failure. Any exception is re-raised into every
-        waiter, so one failed start is one shared failure.
+        of the real failure. A readiness timeout stops the hung
+        container before ending the holder ``FAILED``, so a failed cold
+        start never leaves a container resident. Any exception is
+        re-raised into every waiter, so one failed start is one shared
+        failure.
         """
         state = registration.state
         try:
@@ -350,15 +365,25 @@ class LifecycleManager:
                 apply_transition(state, ToolState.FAILED, reason=err.message)
                 raise
             state.handle = handle
-            await drive_readiness(
-                state,
-                self.probe,
-                self.clock,
-                target,
-                start_timeout=self.start_timeout,
-                ready_timeout=self.ready_timeout,
-                probe_interval=self.probe_interval,
-            )
+            try:
+                await drive_readiness(
+                    state,
+                    self.probe,
+                    self.clock,
+                    target,
+                    start_timeout=self.start_timeout,
+                    ready_timeout=self.ready_timeout,
+                    probe_interval=self.probe_interval,
+                )
+            except ReadinessTimeoutError as err:
+                # Unlike a start refusal, a container exists and is
+                # still running, so stopping it is part of failing the
+                # tool: leaving it resident would leak a slot on every
+                # failed cold start. The holder is already where the
+                # phase hung — STARTING or LOADING — and both edges into
+                # FAILED are legal, so no from-state is passed.
+                self._fail_on_timeout(state, err)
+                raise
         except BaseException:
             # Release the slot so a later caller does not await a dead
             # task; a failure the handler above does not map to FAILED
@@ -367,6 +392,44 @@ class LifecycleManager:
             raise
         state.became_ready_at = self.clock.now()
         return state.handle
+
+    def _fail_on_timeout(
+        self, state: ModelRuntimeState, err: ReadinessTimeoutError
+    ) -> None:
+        """End a timed-out cold start: stop the container, fail the tool,
+        clear the handle.
+
+        The holder sits where its phase hung — ``STARTING`` when
+        ``start_timeout`` ran, ``LOADING`` when ``ready_timeout`` did —
+        so the move into ``FAILED`` reads the from-state from the
+        holder. ``err``'s own rendering is recorded as the reason: it
+        names which deadline ran and for how long, which is what an
+        operator needs to tell a hung ready from a hung start. A stop
+        that itself raises is logged and not allowed to replace
+        ``err`` — the caller is owed the timeout — but the holder still
+        ends ``FAILED`` and the handle is still cleared, since either
+        way the tool no longer claims a running container.
+
+        Args:
+            state: The holder, at ``STARTING`` or ``LOADING``; mutated
+                in place.
+            err: The timeout that ended the cold start; re-raised by
+                the caller.
+        """
+        handle = state.handle
+        if handle is not None:
+            try:
+                self.backend.stop(handle, timeout_s=self.stop_timeout)
+            except Exception:
+                logger.warning(
+                    "stop of %s failed while handling the readiness timeout for %s",
+                    handle.name,
+                    state.tool,
+                    exc_info=True,
+                )
+        state.last_error = str(err)
+        apply_transition(state, ToolState.FAILED, reason=str(err))
+        state.handle = None
 
     def _registration(self, tool: str) -> _ToolRegistration:
         """The registration for a tool, or a named KeyError.
