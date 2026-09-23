@@ -1,0 +1,518 @@
+"""Pins the cold-start happy path of ``LifecycleManager.ensure_ready``
+(m2b plan §3 behaviour 13, §1.3, §1.4): a ``STOPPED`` tool whose probe
+answers true immediately walks ``STOPPED -> STARTING -> LOADING -> READY``
+through the transition table, the backend is started exactly once, the
+returned handle is the one ``backend.start`` produced,
+``became_ready_at`` is stamped from the injected clock, and a second
+``ensure_ready`` on an already-``READY`` tool starts nothing, re-stamps
+nothing and returns the same handle.
+
+The manager receives each tool's ``ResolvedTool`` and image through
+``register_tool(tool, resolved, image=...)`` and exposes the per-tool
+runtime state through ``state_of(tool)`` — the seam the plan leaves open
+and this file pins, because ``build_container_spec`` needs both and
+``BackendConfig`` carries no per-tool data.
+
+The three members do not exist yet, so every test fails at the per-test
+deferred gate that names the missing member rather than aborting
+collection.
+"""
+
+from __future__ import annotations
+
+import importlib
+import inspect
+from types import ModuleType
+from typing import Any
+
+import pytest
+
+import tool_swap.lifecycle.states as states_module
+from tool_swap.backend.base import ContainerSpec
+from tool_swap.backend.fake_backend import FakeBackend
+from tool_swap.backend.labels import container_name
+from tool_swap.config.resolver import ResolvedTool, resolve_tool
+from tool_swap.config.schema import BackendConfig
+from tool_swap.lifecycle.states import ToolState, apply_transition
+from tool_swap.proxy.probes import FakeProbe, ProbeTarget
+from tool_swap.utils.clock import ManualClock
+
+TOOL = "t1"
+IMAGE = "registry.example.com/acme/model:1.0"
+
+# A distinctive origin: a became_ready_at stamped 0.0 would pass for an
+# implementation that never reads the injected clock.
+CLOCK_START = 100.0
+
+
+# ---------------------------------------------------------------------------
+# Deferred gates: the named failures, not a collection error
+# ---------------------------------------------------------------------------
+
+
+def _manager_module() -> ModuleType:
+    """Import ``tool_swap.lifecycle.manager`` at call time.
+
+    Raises:
+        AssertionError: the module is missing; the message names the
+            file to create.
+    """
+    try:
+        return importlib.import_module("tool_swap.lifecycle.manager")
+    except ModuleNotFoundError as exc:
+        raise AssertionError(
+            "tool_swap.lifecycle.manager is missing — create "
+            "src/tool_swap/lifecycle/manager.py"
+        ) from exc
+
+
+def _manager_class() -> type[Any]:
+    """Return the ``LifecycleManager`` class.
+
+    Raises:
+        AssertionError: the class is missing from manager.py.
+    """
+    module = _manager_module()
+    try:
+        manager_class = module.LifecycleManager
+    except AttributeError as exc:
+        raise AssertionError(
+            "LifecycleManager is missing from src/tool_swap/lifecycle/manager.py"
+        ) from exc
+    assert isinstance(manager_class, type), (
+        f"LifecycleManager is not a class: {type(manager_class)!r}"
+    )
+    return manager_class
+
+
+def _bound_method(manager: Any, name: str, purpose: str) -> Any:
+    """Return one member of the manager.
+
+    Raises:
+        AssertionError: the member is missing; the message names it and
+            what it is for, so a red run says what to build next.
+    """
+    try:
+        return getattr(manager, name)
+    except AttributeError as exc:
+        raise AssertionError(
+            f"{name} is missing from src/tool_swap/lifecycle/manager.py — {purpose}"
+        ) from exc
+
+
+def _ensure_ready(manager: Any) -> Any:
+    """Return the ``ensure_ready`` coroutine function.
+
+    Raises:
+        AssertionError: the member is missing, or it is not a coroutine —
+            the plan makes it one, because backend calls go through
+            ``run_in_executor`` and every wait goes through the injected
+            clock.
+    """
+    ensure_ready = _bound_method(
+        manager, "ensure_ready", "the cold-start entry point this behaviour pins"
+    )
+    if not inspect.iscoroutinefunction(ensure_ready):
+        raise AssertionError(
+            "ensure_ready must be a coroutine: backend calls go through "
+            "run_in_executor and every wait goes through the injected clock"
+        )
+    return ensure_ready
+
+
+def _register_tool(manager: Any) -> Any:
+    """Return the ``register_tool`` member.
+
+    Raises:
+        AssertionError: the member is missing.
+    """
+    return _bound_method(
+        manager,
+        "register_tool",
+        "the seam that hands a tool its ResolvedTool and image so a start "
+        "can build its ContainerSpec",
+    )
+
+
+def _state_of_method(manager: Any) -> Any:
+    """Return the ``state_of`` member.
+
+    Raises:
+        AssertionError: the member is missing.
+    """
+    return _bound_method(
+        manager, "state_of", "the read-back for the tool's per-tool runtime state"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _fixtures() -> tuple[
+    FakeBackend, FakeProbe, ManualClock, ResolvedTool, BackendConfig
+]:
+    """One of each injection, wired for a warm cold start.
+
+    The probe is unscripted, so both phases answer true immediately and
+    the happy path costs no simulated time; the clock starts at a
+    distinctive origin; the config is the plain built-in backend block.
+    """
+    backend = FakeBackend()
+    probe = FakeProbe()
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    return backend, probe, clock, resolved, backend_config
+
+
+def _build_manager(
+    backend: FakeBackend,
+    probe: FakeProbe,
+    clock: ManualClock,
+    backend_config: BackendConfig,
+) -> Any:
+    """A manager holding exactly the injected objects; the timeout scalars
+    are omitted so the constructor's built-in defaults apply."""
+    return _manager_class()(
+        backend,
+        probe=probe,
+        clock=clock,
+        backend_config=backend_config,
+    )
+
+
+async def _register(manager: Any, resolved: ResolvedTool) -> None:
+    """Register TOOL with its resolved config and image.
+
+    Raises:
+        AssertionError: ``register_tool`` does not accept the decided
+            ``(tool, resolved, image=...)`` shape.
+    """
+    register_tool = _register_tool(manager)
+    try:
+        result = register_tool(TOOL, resolved, image=IMAGE)
+    except TypeError as exc:
+        raise AssertionError(
+            f"register_tool must accept (tool, resolved, image=...): {exc}"
+        ) from exc
+    if inspect.iscoroutine(result):
+        await result
+
+
+def _call_ensure_ready(manager: Any) -> Any:
+    """Invoke ``ensure_ready(TOOL)`` and return its coroutine.
+
+    Raises:
+        AssertionError: the call signature does not accept the tool name.
+    """
+    ensure_ready = _ensure_ready(manager)
+    try:
+        return ensure_ready(TOOL)
+    except TypeError as exc:
+        raise AssertionError(f"ensure_ready must accept the tool name: {exc}") from exc
+
+
+async def _state_of(manager: Any) -> Any:
+    """The tool's stored runtime state, read back through ``state_of``.
+
+    Raises:
+        AssertionError: the call signature does not accept the tool name.
+    """
+    state_of = _state_of_method(manager)
+    try:
+        state = state_of(TOOL)
+    except TypeError as exc:
+        raise AssertionError(f"state_of must accept the tool name: {exc}") from exc
+    if inspect.iscoroutine(state):
+        state = await state
+    return state
+
+
+def _starts(backend: FakeBackend) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
+    """The journal's start entries.
+
+    The journal records on entry, so it counts attempts rather than
+    inferring them from ``list_managed``.
+    """
+    return [call for call in backend.calls if call[0] == "start"]
+
+
+def _track_transitions(monkeypatch: pytest.MonkeyPatch) -> list[ToolState]:
+    """Route the manager's ``apply_transition`` calls through a tracker.
+
+    The tracker appends each to-state and then delegates to the real
+    function, so the table and its logging still run. Both the manager
+    module's and the states module's names are patched, since the
+    implementation may bind the function either way.
+    """
+    observed: list[ToolState] = []
+
+    def tracking(state: Any, to_state: ToolState, *, reason: str) -> ToolState:
+        observed.append(to_state)
+        return apply_transition(state, to_state, reason=reason)
+
+    monkeypatch.setattr(states_module, "apply_transition", tracking)
+    monkeypatch.setattr(_manager_module(), "apply_transition", tracking, raising=False)
+    return observed
+
+
+# ---------------------------------------------------------------------------
+# The cold start
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_brings_a_stopped_tool_to_ready() -> None:
+    """A STOPPED tool whose probe answers true immediately ends READY; a
+    manager that never starts the container cannot reach it."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    assert (await _state_of(manager)).state is ToolState.STOPPED, (
+        f"the registered tool starts out {(await _state_of(manager)).state!r} — "
+        "a fresh tool has no container and is STOPPED"
+    )
+    # Act
+    await _call_ensure_ready(manager)
+    # Assert
+    state = await _state_of(manager)
+    assert state.state is ToolState.READY, (
+        f"the tool is {state.state!r} after ensure_ready — the cold "
+        "start must end READY"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_returns_the_handle_the_backend_produced() -> None:
+    """The returned handle is the one backend.start produced, and the spec
+    that start received carries the tool, image and prefixed name."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    handle = await _call_ensure_ready(manager)
+    # Assert
+    starts = _starts(backend)
+    assert starts, (
+        "ensure_ready reached READY without a single backend start call — "
+        "there is no handle to return"
+    )
+    managed = backend.list_managed()
+    assert len(managed) == 1, (
+        f"the backend manages {len(managed)} containers — one cold start "
+        "creates exactly one"
+    )
+    assert handle is managed[0], (
+        "the returned handle is not the container the backend started — "
+        "it must be backend.start's return value, identity-wise"
+    )
+    spec = starts[0][1][0]
+    assert isinstance(spec, ContainerSpec), (
+        f"backend.start received {type(spec)!r}, not a ContainerSpec — the "
+        "start needs the spec built from the registered config"
+    )
+    assert spec.tool == TOOL, (
+        f"the spec names tool {spec.tool!r} — the registered tool is {TOOL!r}"
+    )
+    assert spec.image == IMAGE, (
+        f"the spec carries image {spec.image!r} — the registered image is {IMAGE!r}"
+    )
+    assert spec.name == container_name(backend_config.container_prefix, TOOL), (
+        f"the spec is named {spec.name!r} — the name is the backend "
+        "prefix applied to the tool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_stamps_became_ready_at_from_the_injected_clock() -> None:
+    """became_ready_at is the injected clock's reading when the tool became
+    ready; a fixed timestamp would not match the distinctive origin this
+    test starts the clock at."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _call_ensure_ready(manager)
+    # Assert
+    state = await _state_of(manager)
+    assert state.became_ready_at is not None, (
+        "became_ready_at is still None — the tool became ready and the "
+        "stamp must be written"
+    )
+    assert state.became_ready_at == clock.now(), (
+        f"became_ready_at is {state.became_ready_at!r}, the clock reads "
+        f"{clock.now()!r} — the stamp must come from the injected clock"
+    )
+    assert clock.now() == CLOCK_START, (
+        f"simulated time is {clock.now()} — a probe answering true "
+        "immediately costs no simulated time"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_starts_exactly_one_container_and_stops_nothing() -> None:
+    """The journal shows exactly one start and no stop: the journal counts
+    attempts on entry, and a happy path leaves nothing to stop."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _call_ensure_ready(manager)
+    # Assert
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start calls — one cold start "
+        "makes exactly one"
+    )
+    assert all(call[0] != "stop" for call in backend.calls), (
+        f"the journal is {[call[0] for call in backend.calls]} — the happy "
+        "path starts one container and nothing asks to stop it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_walks_the_full_sequence_without_skipping_a_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every move goes through apply_transition in the table's order: an
+    implementation that assigns READY directly or skips LOADING leaves a
+    hole in the observed sequence."""
+    # Arrange
+    observed = _track_transitions(monkeypatch)
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _call_ensure_ready(manager)
+    # Assert
+    assert observed == [ToolState.STARTING, ToolState.LOADING, ToolState.READY], (
+        f"observed {observed} — the holder must move STOPPED -> STARTING -> "
+        "LOADING -> READY through apply_transition; a jump straight to "
+        "READY or a skipped state shows up here"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The progression is delegated, not re-implemented
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_delegates_the_progression_to_drive_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The STARTING -> READY half is drive_readiness's: the manager passes
+    it the stored holder, the injected probe and clock, and a target for
+    the tool — and re-implementing the polling itself fails this."""
+    # Arrange
+    manager_module = _manager_module()
+    try:
+        real = manager_module.drive_readiness
+    except AttributeError as exc:
+        raise AssertionError(
+            "drive_readiness is missing from src/tool_swap/lifecycle/"
+            "manager.py — the progression it must delegate to"
+        ) from exc
+    seen: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def wrapping(*args: Any, **kwargs: Any) -> Any:
+        seen.append((args, kwargs))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "drive_readiness", wrapping)
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    await _call_ensure_ready(manager)
+    # Assert
+    assert len(seen) == 1, (
+        f"drive_readiness was called {len(seen)} times — the manager must "
+        "delegate the STARTING -> LOADING -> READY progression rather than "
+        "re-implement it"
+    )
+    call = list(seen[0][0]) + list(seen[0][1].values())
+    state = await _state_of(manager)
+    assert any(item is state for item in call), (
+        "drive_readiness did not receive the tool's stored state — it "
+        "mutates the holder in place, so the delegation must pass it"
+    )
+    assert any(item is probe for item in call), (
+        "drive_readiness did not receive the injected probe — it polls "
+        "whatever it is given, so the injection must reach it"
+    )
+    assert any(item is clock for item in call), (
+        "drive_readiness did not receive the injected clock — every wait "
+        "and deadline must read it, so the injection must reach it"
+    )
+    assert any(isinstance(item, ProbeTarget) and item.tool == TOOL for item in call), (
+        f"drive_readiness did not receive a ProbeTarget addressed to the tool {TOOL!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Idempotence — the common case in production
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_on_ready_tool_starts_nothing_and_returns_same_handle() -> (
+    None
+):
+    """A second ensure_ready on a READY tool returns the same handle,
+    starts nothing and re-stamps nothing: the common case, not an edge."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    first = await _call_ensure_ready(manager)
+    clock.advance(50.0)
+    # Act
+    second = await _call_ensure_ready(manager)
+    # Assert
+    assert second is first, (
+        "the second ensure_ready returned a different handle — a READY "
+        "tool must return the one it already holds"
+    )
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} starts — a READY tool starts nothing"
+    )
+    state = await _state_of(manager)
+    assert state.state is ToolState.READY
+    assert state.became_ready_at == CLOCK_START, (
+        f"became_ready_at moved to {state.became_ready_at!r} — a second "
+        "ensure_ready must not re-record when the tool became ready"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_leaves_last_used_untouched() -> None:
+    """last_used is written on request completion, not arrival — a stamp
+    here would run a tool's TTL against a request that never ran."""
+    # Arrange
+    backend, probe, clock, resolved, backend_config = _fixtures()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    before = (await _state_of(manager)).last_used
+    # Act: the cold start
+    await _call_ensure_ready(manager)
+    # Assert
+    assert (await _state_of(manager)).last_used == before, (
+        "the cold start rewrote last_used — it is set on request "
+        "completion, not on arrival"
+    )
+    # Act: the ready shortcut, after the clock has moved
+    clock.advance(75.0)
+    await _call_ensure_ready(manager)
+    # Assert
+    assert (await _state_of(manager)).last_used == before, (
+        "the READY shortcut rewrote last_used — a second ensure_ready "
+        "touches nothing about it"
+    )

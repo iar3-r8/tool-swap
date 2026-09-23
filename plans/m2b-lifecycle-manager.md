@@ -131,31 +131,35 @@ the squash-merge trap this section already warns about.
 | # | Behaviour | Red | Green | Suite at green |
 |---|---|---|---|---|
 | 12 | Construction, injection, sixth contract | `ba37128`, re-pinned by `8757805` | `92ae112` | 1757 passed, 2 skipped |
-| 13 | `ensure_ready` cold-start happy path | drafted, uncommitted | blocked | — |
+| 13 | `ensure_ready` cold-start happy path | committed below | — | — |
 | 14 | Ten concurrent `ensure_ready`, one start | — | — | — |
 | 15 | Start failure yields `FAILED` with reason | — | — | — |
 | 16 | Readiness timeout yields `FAILED` | — | — | — |
 | 17 | Cancellation neither kills nor orphans | — | — | — |
 | 18 | Backend calls run in an executor | — | — | — |
 
-**The loop is paused at behaviour 13**, on a second gap escalated to issue #3
-([comment](https://github.com/iar3-r8/tool-swap/issues/3#issuecomment-5795640148)).
-
-`ensure_ready` must call `backend.start(spec)`, and
+**The spec-ownership gap — resolved.** `ensure_ready` must call `backend.start(spec)`, and
 [`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19) needs a
 `ResolvedTool`, the `BackendConfig` and an **image string**. The manager can produce none of
 them: `BackendConfig` carries no per-tool data and no image field,
 [`registry/`](../src/tool_swap/registry/__init__.py) is an empty stub, and **nothing in
 `src/` calls `build_container_spec` at all**. §1.4's method list contains nothing that feeds
 tools in, and no ledger behaviour owns the handoff. This is the **eighth plan error** found
-by reading the plan against the source.
+by reading the plan against the source, and it was escalated to issue #3
+([comment](https://github.com/iar3-r8/tool-swap/issues/3#issuecomment-5795640148)) rather
+than settled by the subtask that found it, because it invents public API that M3's proxy
+will be written against.
 
-The red is drafted in `tests/unit/lifecycle/test_ensure_ready.py` — 8 failures, all
-assertion failures, baseline 1757 intact — but it is **uncommitted**, because it pins a
-`register_tool` public method the plan never specified. Inventing API surface that M3's
-proxy will be written against is not a subtask's decision, nor one to ratify silently. Four
-options are on the issue: explicit `register_tool`, an injected `tool_source` callable,
-`ensure_ready(tool, spec)` with the spec passed in, or giving `registry/` its real content.
+**Decision (user, on issue #3, 2026-09-23): option 1 —
+`register_tool(tool, resolved, image=...)`, called before `ensure_ready`.** The reasoning,
+recorded because it shapes M3's caller: tools have their own options, so they genuinely need
+registering and configuring, and the manager must hold a tool's configuration before it can
+ready it. Registering and then ensuring readiness is the natural order.
+
+**§1.4's method list is therefore incomplete**, not merely mis-typed: `register_tool` joins
+`ensure_ready`, `stop`, `sweep_liveness`, `state_of`, `begin_request` and `end_request`.
+`ProbeTarget.host` needs no separate decision — `plan/01` §7 and **D21** address tools by
+container name, so it is derivable once the spec exists.
 
 **§1.4's `Timeouts` type does not exist — resolved, see below.** The constructor sketch
 names `timeouts: Timeouts`, but **no such type exists anywhere in `src/`**; the five values
@@ -873,7 +877,10 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 13. `ensure_ready` — the cold-start happy path
 
 - **Inputs:** a `FakeBackend`, a `FakeProbe` answering true immediately, a `ManualClock`,
-  and a tool in `STOPPED`.
+  and a tool in `STOPPED`. The tool is first handed to
+  `register_tool(tool, resolved, image=...)`, the seam §1.4's method list omitted: the
+  manager needs a `ResolvedTool` and an image before it can build a `ContainerSpec`, and
+  nothing else supplies them (§0.2, plan error 8).
 - **Outputs:** the tool ends `READY`; the returned `ContainerHandle` is the one
   `FakeBackend.start` produced; `became_ready_at == clock.now()`; the journal shows
   exactly one `start`; the state sequence is `STOPPED → STARTING → LOADING → READY` with
