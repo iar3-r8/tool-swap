@@ -25,7 +25,8 @@ environment where the docker SDK is not importable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import Final, cast
 
 from tool_swap.backend.base import ContainerBackend, ContainerHandle
@@ -274,38 +275,75 @@ class LifecycleManager:
                 illegal pair, leaving the holder untouched.
         """
         registration = self._registration(tool)
+        # The lock is held only while deciding who starts: holding it
+        # across the cold start would serialise every caller behind the
+        # start instead of letting them share it.
+        async with registration.lock:
+            state = registration.state
+            if state.state is ToolState.READY:
+                return cast("ContainerHandle", state.handle)
+            if state.state is ToolState.STOPPED and registration.pending is None:
+                # The decision and the holder move happen under the same
+                # lock: a STARTING mutation made before any await would
+                # let a caller arriving in between miss the pending task
+                # and race a second start.
+                apply_transition(
+                    state, ToolState.STARTING, reason="ensure_ready cold start"
+                )
+                start_task = asyncio.create_task(self._cold_start(registration))
+                registration.pending = start_task
+            elif registration.pending is not None:
+                start_task = registration.pending
+            else:
+                raise ValueError(
+                    f"ensure_ready on tool {tool!r} in state {state.state!r} "
+                    "is not supported yet; only STOPPED and READY are"
+                )
+        # A caller cancelled while awaiting must not cancel the start
+        # its peers are awaiting: shield raises the cancellation here
+        # while the cold-start task runs on for everyone else.
+        return await asyncio.shield(start_task)
+
+    async def _cold_start(self, registration: _ToolRegistration) -> ContainerHandle:
+        """Run one tool's cold start: start its container and drive the
+        holder to ``READY``.
+
+        Runs as the single task every concurrent ``ensure_ready`` caller
+        for this tool awaits, so it is the only caller that polls the
+        probe or sleeps on the clock. Any exception is re-raised into
+        every waiter, so one failed start is one shared failure.
+        """
         state = registration.state
-        if state.state is ToolState.READY:
-            return cast("ContainerHandle", state.handle)
-        if state.state is not ToolState.STOPPED:
-            raise ValueError(
-                f"ensure_ready on tool {tool!r} in state {state.state!r} is "
-                "not supported yet; only STOPPED and READY are"
+        try:
+            spec = build_container_spec(
+                registration.resolved, self.backend_config, registration.image
             )
-        apply_transition(state, ToolState.STARTING, reason="ensure_ready cold start")
-        spec = build_container_spec(
-            registration.resolved, self.backend_config, registration.image
-        )
-        target = ProbeTarget(
-            tool=tool,
-            host=spec.name,
-            port=spec.container_port,
-            health_path=str(registration.resolved.values["health_path"]),
-            ready_path=str(registration.resolved.values["ready_path"]),
-        )
-        handle = self.backend.start(spec)
-        state.handle = handle
-        await drive_readiness(
-            state,
-            self.probe,
-            self.clock,
-            target,
-            start_timeout=self.start_timeout,
-            ready_timeout=self.ready_timeout,
-            probe_interval=self.probe_interval,
-        )
+            target = ProbeTarget(
+                tool=state.tool,
+                host=spec.name,
+                port=spec.container_port,
+                health_path=str(registration.resolved.values["health_path"]),
+                ready_path=str(registration.resolved.values["ready_path"]),
+            )
+            handle = self.backend.start(spec)
+            state.handle = handle
+            await drive_readiness(
+                state,
+                self.probe,
+                self.clock,
+                target,
+                start_timeout=self.start_timeout,
+                ready_timeout=self.ready_timeout,
+                probe_interval=self.probe_interval,
+            )
+        except BaseException:
+            # Release the slot so a later caller does not await a dead
+            # task; the holder is left where the start died, and the
+            # failure mapping that state to is the caller's.
+            registration.pending = None
+            raise
         state.became_ready_at = self.clock.now()
-        return handle
+        return state.handle
 
     def _registration(self, tool: str) -> _ToolRegistration:
         """The registration for a tool, or a named KeyError.
@@ -326,8 +364,15 @@ class _ToolRegistration:
     The holder is shared by identity with ``state_of`` and
     ``ensure_ready``: ``drive_readiness`` mutates it in place, so a
     copy would let the read-back lie about the live state.
+
+    ``lock`` serialises only the decision of who starts the tool, and
+    ``pending`` is the in-flight cold-start task every concurrent
+    ``ensure_ready`` caller awaits, or ``None`` when no start is in
+    flight.
     """
 
     resolved: ResolvedTool
     image: str
     state: ModelRuntimeState
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending: asyncio.Task[ContainerHandle] | None = None
