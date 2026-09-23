@@ -1,8 +1,9 @@
-"""The config -> ContainerSpec builder (m2b plan §3).
+"""The config -> ContainerSpec builder.
 
-Core assembly (behaviour 1), the ParsedMount -> MountSpec conversion
-(behaviour 2) and the resource, environment and port fields
-(behaviour 3).
+``build_container_spec`` assembles a tool's complete start
+instructions from its resolved configuration and the ``backend:``
+block; the private helpers convert the mounts, environment,
+resource limits and published port.
 """
 
 from __future__ import annotations
@@ -26,10 +27,11 @@ def build_container_spec(
     """Assemble the core ContainerSpec from both config blocks.
 
     Raises ValueError for an empty image, an unparseable mount entry, a
-    mount mode outside ro/rw (D-D), mounts without a config_dir, or an
+    mount mode outside ro/rw, mounts without a config_dir, or an
     expose_host_port of true (no allocator exists); a name container_name
     rejects propagates unchanged. The backend-named values come from cfg,
-    never resolved.values (plan §6.3).
+    never resolved.values: the backend: block is not a resolver layer,
+    so the values dict always carries the built-in there.
     """
     tool = resolved.name
     if not image:
@@ -63,10 +65,10 @@ def build_container_spec(
 def _mount_specs(
     resolved: ResolvedTool, config_dir: Path | None
 ) -> tuple[MountSpec, ...]:
-    """One MountSpec per authored entry, in declaration order (plan §3.2).
+    """One MountSpec per authored entry, in declaration order.
 
     Raises:
-        ValueError: an unparseable entry, a mode outside ro/rw (D-D), or
+        ValueError: an unparseable entry, a mode outside ro/rw, or
             any entry while ``config_dir`` is None.
         TypeError: ``mounts`` is not a list of strings.
     """
@@ -115,7 +117,7 @@ def _mount_specs(
 
 
 def _env_map(resolved: ResolvedTool) -> dict[str, str]:
-    """The authored env as str -> str (plan §3.3).
+    """The authored env as str -> str.
 
     Values are coerced with str(): the config types the dict as
     dict[str, Any], and a container cannot read a non-string value.
@@ -133,7 +135,7 @@ def _env_map(resolved: ResolvedTool) -> dict[str, str]:
 
 
 def _devices(resolved: ResolvedTool) -> tuple[int, ...]:
-    """The authored GPU indices as a tuple, in authored order (plan §3.3):
+    """The authored GPU indices as a tuple, in authored order:
     the order is not sorted away, because it is a real allocation.
 
     Raises:
@@ -155,8 +157,7 @@ def _devices(resolved: ResolvedTool) -> tuple[int, ...]:
 
 
 def _cpus(resolved: ResolvedTool) -> float | None:
-    """The authored CPU limit, verbatim (plan §3.3); null leaves it
-    unlimited.
+    """The authored CPU limit, verbatim; null leaves it unlimited.
 
     Raises:
         TypeError: cpus is neither a number nor null.
@@ -173,7 +174,7 @@ def _cpus(resolved: ResolvedTool) -> float | None:
 
 
 def _memory(resolved: ResolvedTool) -> str | None:
-    """The authored memory limit, verbatim (plan §3.3): the size string
+    """The authored memory limit, verbatim: the size string
     is parsed by the backend SDK, not here; null leaves it unlimited.
 
     Raises:
@@ -191,7 +192,7 @@ def _memory(resolved: ResolvedTool) -> str | None:
 
 
 def _shm_size(resolved: ResolvedTool) -> str:
-    """The shared-memory size, always set (plan §3.3): the config field
+    """The shared-memory size, always set: the config field
     is non-optional with a built-in default, so a None reaching the spec
     would read as a legitimate "unset".
 
@@ -208,7 +209,7 @@ def _shm_size(resolved: ResolvedTool) -> str:
 
 
 def _published_port(resolved: ResolvedTool) -> int | None:
-    """The host port from expose_host_port (plan §3.3): false and null
+    """The host port from expose_host_port: false and null
     publish nothing (an authored null takes the benign default), an int
     publishes exactly that port, never the container port.
 

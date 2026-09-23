@@ -1,14 +1,15 @@
-"""The readiness probe seam (m2b plan §3 behaviour 9, §1.5).
+"""The readiness probe seam.
 
 Declares ``Probe`` — the two async methods the manager calls while a
 tool walks ``STARTING`` to ``LOADING`` to ``READY`` — and
 ``ProbeTarget``, the immutable address a probe receives. Also holds
-``FakeProbe``, the scripted double manager tests inject in place of a
-real probe (behaviour 10). The module imports no HTTP library (D-B);
+``FakeProbe``, the scripted double tests inject in place of a real
+probe. The module imports no HTTP library;
 ``tests/unit/proxy/probe_guard.py`` walks this file's written imports
-to keep it that way. A renamed, re-ordered or re-annotated member here
-would make M3's real probe a different interface than the manager's,
-so the tests pin both methods and the target's field set exactly.
+to keep it that way. A renamed, re-ordered or re-annotated member
+here would make a real probe a different interface than the
+manager's, so the tests pin both methods and the target's field set
+exactly.
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ class Probe(Protocol):
     ``health`` answers whether the process is up (``STARTING``),
     ``ready`` whether it serves (``LOADING``). Merging them into one
     method would collapse the distinction the state machine exists to
-    express; a sync method would force an executor hop or a later
-    signature change in M3.
+    express; a sync method would force an executor hop on every poll
+    or a signature change when a real probe arrives.
     """
 
     async def health(self, target: ProbeTarget) -> bool: ...
@@ -39,8 +40,9 @@ class ProbeTarget:
     probe paths — and nothing else: no URL, because the probe
     composes the URL and this type owns no client. ``host`` is the
     container name because tools are addressed by name on the shared
-    network (D21, plan/01 §7). Dropping frozen or slots would let a
-    probe or manager rewrite, or grow, the address mid-flight.
+    network, so the probe needs neither config access nor container
+    knowledge. Dropping frozen or slots would let a probe or manager
+    rewrite, or grow, the address mid-flight.
     """
 
     tool: str
@@ -51,7 +53,7 @@ class ProbeTarget:
 
 
 class FakeProbe:
-    """The scripted probe double (m2b plan §3 behaviour 10, §1.5).
+    """The scripted probe double.
 
     Answers ``health`` and ``ready`` from a per-tool, per-phase
     script — ``0`` true immediately, ``N > 0`` false for the first N
@@ -60,9 +62,9 @@ class FakeProbe:
     so a test indifferent to probing scripts nothing. The double
     counts calls, not wall time: no clock, no socket, no container,
     and it never raises, so a manager deadline loop may poll it for
-    as long as the simulated deadline lasts. A probe that raises is
-    M3's real probe's concern (§6.11); that shape is deliberately not
-    modelled here.
+    as long as the simulated deadline lasts. A probe that raises on
+    transport failure is the real probe's concern; that shape is
+    deliberately not modelled here.
 
     ``calls`` is the call journal, following ``FakeBackend.calls`` in
     name and purpose: ``(method, tool)`` pairs in call order,

@@ -114,11 +114,107 @@ what proves the work landed. M2a set the identical trap and it cost time to unpi
 Baseline re-measured at `b3fafef` before branching: **1698 passed, 2 skipped**, `make lint`
 clean with mypy strict over 40 source files, `lint-imports` 5 kept, 0 broken.
 
-**Slice C is complete and shipped as
-[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, open against `main`. Head `90d51d4`,
-ten commits, documentation commit `90d51d4` preceding the pull request. At the tip: 1744
-passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5 kept, 0 broken.
-Because it branched from `main`, CI runs without retargeting.
+**Slice C is complete and merged as
+[#17](https://github.com/iar3-r8/tool-swap/pull/17)**, squashed onto `main` as `605c4b0`.
+Head was `90d51d4`, ten commits, documentation commit `90d51d4` preceding the pull request.
+At the tip: 1744 passed, 2 skipped, mypy strict over 42 source files, `lint-imports` 5
+kept, 0 broken. Because it branched from `main`, CI ran without retargeting.
+
+**Slice D** — `feature/m2b-ensure-ready`, branched from `main` at `605c4b0`:
+
+Baseline re-measured at `605c4b0` before branching rather than trusted: **1744 passed, 2
+skipped**, `make lint` clean with mypy strict over 42 source files, `lint-imports` 5 kept,
+0 broken. Slice C's merge was confirmed **by tree** — `git diff origin/main
+feature/m2b-probe-seam` is empty while `git merge-base --is-ancestor` still answers *no*,
+the squash-merge trap this section already warns about.
+
+| # | Behaviour | Red | Green | Suite at green |
+|---|---|---|---|---|
+| 12 | Construction, injection, sixth contract | `ba37128`, re-pinned by `8757805` | `92ae112` | 1757 passed, 2 skipped |
+| 13 | `ensure_ready` cold-start happy path | `8628aa2` | `7f9c036` | 1765 passed, 2 skipped |
+| 14 | Ten concurrent `ensure_ready`, one start | `d32eeaa` | `bc290be` | 1770 passed, 2 skipped |
+| 15 | Start failure yields `FAILED` with reason | `965e8dd` | `533dd8e` | 1775 passed, 2 skipped |
+| 16 | Readiness timeout yields `FAILED` | `ee50494` | `a91a7b9` | 1781 passed, 2 skipped |
+| 17 | Cancellation neither kills nor orphans | passed on arrival | `175d3ec` | 1784 passed, 2 skipped |
+| 18 | Backend calls run in an executor | `9c04911` | `dcb986f` | 1788 passed, 2 skipped |
+
+**Slice D's seven behaviours are complete.** At the tip: 1788 passed, 2 skipped (from 1744
+at the branch point), `make lint` clean with mypy strict over 42 source files,
+`lint-imports` 6 kept / 0 broken — the sixth contract being behaviour 12's.
+
+**Behaviour 17 needed no production change**, and that is recorded rather than disguised:
+behaviour 14's coalescing already put every awaiter behind `asyncio.shield`, and the
+`BaseException` handler already left `CancelledError` unmapped, so 17's contract was
+satisfied by the mechanism 14 installed. Its three tests passed on arrival and were proved
+able to fail by removing the shield, which reddens all three.
+
+**Open defect for slice E — the pending slot is not cleared after a *successful* start.**
+`registration.pending` is released only in `_cold_start`'s failure handler, so a completed
+task stays in the slot, contradicting `_ToolRegistration`'s own docstring ("`None` when no
+start is in flight"). Confirmed by direct inspection, not merely by reading. Today the
+`READY` short-circuit hides it, which is why no test catches it. Once `stop` lets a tool
+leave `READY`, a `STOPPED` tool whose slot still points at a finished task would take the
+`pending is not None` branch and shield the dead task, **returning a stale handle without
+starting a container**. Slice E owns the fix, because `stop` is what makes it reachable by
+a test.
+
+**The spec-ownership gap — resolved.** `ensure_ready` must call `backend.start(spec)`, and
+[`build_container_spec`](../src/tool_swap/lifecycle/spec_builder.py:19) needs a
+`ResolvedTool`, the `BackendConfig` and an **image string**. The manager can produce none of
+them: `BackendConfig` carries no per-tool data and no image field,
+[`registry/`](../src/tool_swap/registry/__init__.py) is an empty stub, and **nothing in
+`src/` calls `build_container_spec` at all**. §1.4's method list contains nothing that feeds
+tools in, and no ledger behaviour owns the handoff. This is the **eighth plan error** found
+by reading the plan against the source, and it was escalated to issue #3
+([comment](https://github.com/iar3-r8/tool-swap/issues/3#issuecomment-5795640148)) rather
+than settled by the subtask that found it, because it invents public API that M3's proxy
+will be written against.
+
+**Decision (user, on issue #3, 2026-09-23): option 1 —
+`register_tool(tool, resolved, image=...)`, called before `ensure_ready`.** The reasoning,
+recorded because it shapes M3's caller: tools have their own options, so they genuinely need
+registering and configuring, and the manager must hold a tool's configuration before it can
+ready it. Registering and then ensuring readiness is the natural order.
+
+**§1.4's method list is therefore incomplete**, not merely mis-typed: `register_tool` joins
+`ensure_ready`, `stop`, `sweep_liveness`, `state_of`, `begin_request` and `end_request`.
+`ProbeTarget.host` needs no separate decision — `plan/01` §7 and **D21** address tools by
+container name, so it is derivable once the spec exists.
+
+**§1.4's `Timeouts` type does not exist — resolved, see below.** The constructor sketch
+names `timeouts: Timeouts`, but **no such type exists anywhere in `src/`**; the five values
+are plain `int`/`float` fields on `DefaultsConfig`
+([`schema.py`](../src/tool_swap/config/schema.py:236): `start_timeout` 236,
+`ready_timeout` 242, `drain_timeout` 257, `stop_timeout` 263, `probe_interval` 282), with
+no aggregate wrapping them. This is the **seventh plan error** found by reading the plan
+against the source.
+
+It was escalated rather than absorbed because the tests cannot catch it: behaviour 12 pins
+`timeouts` **by identity**, so a bare `object()` satisfies them and all three candidate
+shapes pass equally.
+
+**Decision (user, on issue #3, 2026-09-23): option 3 — individual `int`/`float` keyword
+arguments.** No `Timeouts` class is built, and no config object carries the values. The
+reasoning, recorded because it governs slices E and F too: a class is not worth building
+when a plain scalar satisfies the need, and **passing a config object is too specific — a
+caller that does not use the config layer should still be able to construct a manager**.
+Passing `DefaultsConfig` would put config-layer coupling in the constructor for no gain.
+
+So the constructor takes `start_timeout`, `ready_timeout` and `probe_interval` as scalars,
+mirroring [`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), which the manager
+delegates to. **Slices E and F add `drain_timeout` and `stop_timeout` the same way** rather
+than introducing an aggregate later. `backend_config: BackendConfig` is unaffected: that
+type does exist, the spec builder already needs it, and the decision above was about the
+timeout values.
+
+§1.4's signature is therefore superseded on this point; the rest of it — the per-tool lock,
+the pending future, `asyncio.shield`, `run_in_executor` — stands.
+
+Behaviour 12's red is committed at `ba37128`: **12 failed, 1744 passed, 2 skipped**, every
+failure an assertion failure on the absent class or the absent sixth contract. M2a's three
+anti-drift pins were moved from five to six and **kept exact** — set equality preserved,
+the summary line still a literal match on `6 kept, 0 broken` — per §6.9, which records that
+those pins are meant to fail so someone looks.
 
 The push used the `.roo/mcp.json` token, as §0.2 of the M2a plan records — but **the
 one-shot `http.extraheader` did not work here** and the method note should be corrected
@@ -769,9 +865,15 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 12. Construction and injection; the manager never imports `docker_backend`
 
 - **Inputs:** `LifecycleManager(backend, probe=..., clock=..., backend_config=...,
-  timeouts=...)`.
-- **Outputs:** a manager holding exactly the injected objects — identity-wise, the way
-  M2a's behaviour 20 pinned `DockerBackend`'s client. No object is constructed internally.
+  start_timeout=..., ready_timeout=..., probe_interval=...)`. The three timeouts are
+  **plain scalars with built-in defaults**, mirroring `drive_readiness`; the `Timeouts`
+  type this line once named was never built, and the user decided against building one
+  (§0.2). Slices E and F add `drain_timeout` and `stop_timeout` the same way.
+- **Outputs:** a manager holding exactly the injected objects — identity-wise for the
+  backend, probe, clock and `backend_config`, the way M2a's behaviour 20 pinned
+  `DockerBackend`'s client; by value for the three scalars, since numbers have no useful
+  identity. No object is constructed internally. Omitted timeouts carry the
+  `BUILT_IN_DEFAULTS` values, read from that named source rather than restated.
 - **Edge cases:** the named guard — **the manager must be fully usable with the docker SDK
   blocked from the import system**, driven by `FakeBackend`. M2a §6 item 1 states the rule
   ("it must never import `docker_backend` directly — only `base`") and behaviour 27's
@@ -795,7 +897,10 @@ single place a `ParsedMount` becomes a `MountSpec`, so it is the only place the
 #### 13. `ensure_ready` — the cold-start happy path
 
 - **Inputs:** a `FakeBackend`, a `FakeProbe` answering true immediately, a `ManualClock`,
-  and a tool in `STOPPED`.
+  and a tool in `STOPPED`. The tool is first handed to
+  `register_tool(tool, resolved, image=...)`, the seam §1.4's method list omitted: the
+  manager needs a `ResolvedTool` and an image before it can build a `ContainerSpec`, and
+  nothing else supplies them (§0.2, plan error 8).
 - **Outputs:** the tool ends `READY`; the returned `ContainerHandle` is the one
   `FakeBackend.start` produced; `became_ready_at == clock.now()`; the journal shows
   exactly one `start`; the state sequence is `STOPPED → STARTING → LOADING → READY` with

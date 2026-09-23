@@ -42,3 +42,11 @@ type = forbidden
 source_modules = tool_swap
 forbidden_modules = docker
 ignore_imports = tool_swap.backend.docker_backend -> docker
+
+[importlinter:contract:6]
+name = The lifecycle and proxy layers never import the docker backend
+type = forbidden
+source_modules =
+    tool_swap.lifecycle
+    tool_swap.proxy
+forbidden_modules = tool_swap.backend.docker_backend

@@ -7,10 +7,10 @@ that whole ramp-up, the router needs to ask the tool two separate
 questions: *is your process running yet?* and *are you ready to take
 traffic yet?* This page documents the seam that makes those two
 questions possible: the
-[`Probe`](../src/tool_swap/proxy/probes.py:22) protocol, the
+[`Probe`](../src/tool_swap/proxy/probes.py:23) protocol, the
 [`ProbeTarget`](../src/tool_swap/proxy/probes.py:37) address a probe
 receives, and
-[`FakeProbe`](../src/tool_swap/proxy/probes.py:53), the scripted
+[`FakeProbe`](../src/tool_swap/proxy/probes.py:55), the scripted
 stand-in the tests drive instead of a real probe — all in
 [`probes.py`](../src/tool_swap/proxy/probes.py).
 
@@ -32,21 +32,26 @@ page](backend-seam.md) documents the layer that *starts* the
 container; [the tool state machine page](tool-state-machine.md)
 documents the six states the probe answers exist to move between. The
 probe sits between the two: it is consumed by
-[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), which
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:93), which
 polls it and applies the `STARTING → LOADING → READY` transitions on
-its answers. The probe itself knows nothing about containers, backends
-or states — it takes an address and returns a `bool`.
+its answers, and the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+injected with it drives that polling during a cold start ([the
+lifecycle manager page](lifecycle-manager.md)). The probe itself
+knows nothing about containers, backends or states — it takes an
+address and returns a `bool`.
 
 ## Where this page stops
 
 The seam, its address type and `FakeProbe` are in the tree, and
 `drive_readiness` — the code that polls the seam and moves states — is
-in the tree and fully tested. What is not: a probe that opens sockets
-(depends on an HTTP client the project has not chosen yet), the
-`LifecycleManager` class that will own the seam in production, and any
-model of a probe that *raises* on transport failure, because the shape
-of that failure depends on whichever client is declared. The design
-and its reasoning are in
+in the tree and fully tested, driven in the tree by the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154).
+What is not: a probe that opens sockets (depends on an HTTP client
+the project has not chosen yet), and any model of a probe that
+*raises* on transport failure, because the shape of that failure
+depends on whichever client is declared. The design and its
+reasoning are in
 [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
 — [§1.5](../plans/m2b-lifecycle-manager.md:367) for the seam,
 [D-B](../plans/m2b-lifecycle-manager.md:1167) for the no-client
@@ -82,9 +87,10 @@ The other two shape decisions are `async` and `bool`:
   deadlines. A probe that returned a state would be a second state
   machine; a `false` answer plus a deadline is the whole contract.
 
-`@runtime_checkable` matters beyond the pin: without it, the manager's
-`isinstance` call raises `TypeError` far from the declaration site,
-so the tests check the flag itself as well as the signatures.
+`@runtime_checkable` matters beyond the pin: without it, an
+`isinstance` conformance check against the protocol raises
+`TypeError` far from the declaration site, so the tests check the
+flag itself as well as the signatures.
 
 ## The address: `ProbeTarget`
 
@@ -148,7 +154,7 @@ and the file is byte-identical after revert.
 
 ## The scripted double: `FakeProbe`
 
-[`FakeProbe`](../src/tool_swap/proxy/probes.py:53) is what the manager
+[`FakeProbe`](../src/tool_swap/proxy/probes.py:55) is what the manager
 tests inject in place of a real probe. It answers each question from
 a per-tool, per-phase script:
 
@@ -209,6 +215,9 @@ as long as the simulated deadline lasts.
 - [`docs/tool-state-machine.md`](tool-state-machine.md) — the states
   these answers move between, and `drive_readiness`, the driver that
   polls this seam.
+- [`docs/lifecycle-manager.md`](lifecycle-manager.md) — the
+  `LifecycleManager` that injects the probe and drives
+  `drive_readiness` during a cold start.
 - [`docs/backend-seam.md`](backend-seam.md) — the `ContainerState`
   that asks a different question, and why `FakeBackend` deliberately
   has no "never ready" failure mode.

@@ -25,9 +25,9 @@ requests into a process that is still loading weights, and be
 refused by it or made to hang until the load finishes. The machine
 is also the single place in the tree that records which states a
 tool may occupy and which moves are legal, so its drivers —
-[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75) today,
-and the `LifecycleManager` class that will own it in production —
-never re-derive that knowledge by hand.
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:93) and
+the [`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+that wraps it — never re-derive that knowledge by hand.
 
 **Where it sits:** the [spec builder
 page](spec-builder.md) documents the layer that decides *what* a
@@ -41,31 +41,35 @@ the states themselves and the rules that govern the moves between
 them. The other pages are each about one layer; this page is about
 one tool's journey through a sequence of containers.
 
-One honest caveat before the detail: **no production code drives
+One honest caveat before the detail: **no router endpoint drives
 this machine yet.** The machine — the states, the table, the holder,
 the transition function — is in the tree and fully tested, and it
-has one driver,
-[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75), which
-walks a tool `STARTING → LOADING → READY` on probe answers. But
-nothing in the router calls `drive_readiness` yet either — the
-`LifecycleManager` class that will own it is not built, and no
-container has been started through this path. The rest of the page
-documents the machine in full, and says where the driver gets there
-and where it stops.
+has two drivers, both in the tree:
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:93), which
+walks a tool `STARTING → LOADING → READY` on probe answers, and the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154),
+which starts the container and delegates to it. But nothing above
+the lifecycle layer calls the manager, the real probe does not exist
+yet, and no container has been started through this path. The rest
+of the page documents the machine in full, and says where the
+drivers get there and where they stop.
 
 ## Where this page stops
 
-The machine and its driver `drive_readiness` are in the tree and
-fully tested; [`states.py`](../src/tool_swap/lifecycle/states.py) is
-pure — no daemon, no event loop, no I/O. What is not: the
-`LifecycleManager` *class* that will own the machine in production,
-a real probe (the [probe seam](readiness-probe.md) exists, the
-socket-opening probe does not), and any router code that calls
-`drive_readiness` — nothing in the router has started a container
-through this path. `drive_readiness` is the only caller of
-`apply_transition` in the tree, and the trigger column of the
-transition table below records what the table *accepts*, not what
-currently fires.
+The machine and its drivers are in the tree and fully tested;
+[`states.py`](../src/tool_swap/lifecycle/states.py) is pure — no
+daemon, no event loop, no I/O. What is not: a real probe (the
+[probe seam](readiness-probe.md) exists, the socket-opening probe
+does not), and any router code that calls the
+[`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154) —
+nothing above the lifecycle layer has started a container through
+this path, and the manager cannot yet stop a running tool, drain,
+notice a died container or reconcile containers at boot ([its
+page](lifecycle-manager.md#what-this-page-stops-at) states the
+limits precisely). The only callers of `apply_transition` in the
+tree are `drive_readiness` and the manager's cold-start and timeout
+paths, and the trigger column of the transition table below records
+what the table *accepts*, not what currently fires.
 
 The design is in
 [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md):
@@ -199,10 +203,10 @@ Two absences are decisions, not oversights:
   not built at all rather than half-built.
 
 **No edge reaches `READY` without a probe answer.** The single edge
-into `READY` is `LOADING → READY`, triggered by the ready probe.
-Reconciliation of a container left running by a previous router
-therefore adopts it by walking `STOPPED → STARTING → LOADING → READY`
-rather than assigning `READY` directly: an adoption path that could
+into `READY` is `LOADING → READY`, triggered by the ready probe. A
+container left running by a previous router must therefore be
+adopted by walking `STOPPED → STARTING → LOADING → READY` rather
+than being assigned `READY` directly: an adoption path that could
 write `READY` without a probe answer would be a second, untested way
 to reach the only state that serves traffic.
 
@@ -249,10 +253,11 @@ Two properties depart from convention and are pinned for that reason:
 
 - **It is mutable**, where every backend-seam data type is frozen
   (`MountSpec`, `ContainerSpec`, `ContainerHandle`, `ContainerStatus`
-  are all `frozen=True, slots=True`). The `LifecycleManager` updates
-  the state **in place** on every request completion; freezing it
-  would mean reallocating on each completion. A named test mutates a
-  field and would fail under a frozen refactor.
+  are all `frozen=True, slots=True`). The
+  [`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+  updates the state **in place** as a tool walks the machine;
+  freezing it would mean reallocating on every transition. A named
+  test mutates a field and would fail under a frozen refactor.
 - **`last_error` holds the taxonomy member's `message`, not
   `str(err)`** — [`BackendError.__str__`](../src/tool_swap/backend/errors.py:61)
   appends the remedy, and the remedy belongs to `/status`, not to the
@@ -315,7 +320,7 @@ step can refuse.
 ## The first driver: `drive_readiness`
 
 The table above is driven by exactly one piece of code in the tree,
-[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:75). It
+[`drive_readiness`](../src/tool_swap/lifecycle/manager.py:93). It
 takes a holder sitting at `STARTING`, a
 probe, a clock and the tool's address, and walks the holder to
 `READY`:
@@ -356,17 +361,19 @@ timeout after a two-poll start reads `clock.now() == 602.0` with
 `elapsed == 600.0`.
 
 When a deadline elapses, the phase's error is raised:
-[`StartTimeoutError`](../src/tool_swap/lifecycle/manager.py:59)
+[`StartTimeoutError`](../src/tool_swap/lifecycle/manager.py:77)
 leaves the holder `STARTING`,
-[`ReadyTimeoutError`](../src/tool_swap/lifecycle/manager.py:67)
+[`ReadyTimeoutError`](../src/tool_swap/lifecycle/manager.py:85)
 leaves it `LOADING`. Both subclass the built-in `TimeoutError`
 (through a shared `ReadinessTimeoutError` base that holds the
 pinned attributes once) and both carry `deadline` — which of the two
 ran out — and `elapsed`, the simulated seconds it ran, so an
 operator can tell a hung start from a hung ready. **A timeout
-raises; it does not mark the tool `FAILED`.** No code in the tree
-performs that transition yet, so the holder is left in the phase it
-hung in for the caller to classify.
+raises; it does not itself mark the tool `FAILED`.** The holder is
+left in the phase it hung in for the caller to classify: the
+manager's cold start marks it `FAILED` and stops the hung container
+([the lifecycle manager
+page](lifecycle-manager.md#a-readiness-timeout-the-container-is-stopped-before-the-tool-fails)).
 
 ### Waiting goes through the clock, never `asyncio.wait_for`
 
@@ -381,10 +388,11 @@ tool costs zero simulated time.
 ### A module-level coroutine, not a method
 
 `drive_readiness` lives in
-[`manager.py`](../src/tool_swap/lifecycle/manager.py) but is a free
-coroutine, not a `LifecycleManager` method, because that class is
-not built yet: a free coroutine needs no owning class to exist, and
-the class will delegate to it when it lands. The three deadline
+[`manager.py`](../src/tool_swap/lifecycle/manager.py) as a free
+coroutine rather than a `LifecycleManager` method: the manager
+delegates to it, passing its injected probe, clock and deadline
+scalars, so the polling logic has one home and the manager holds no
+second copy of the deadline arithmetic. The three deadline
 parameters default to values read from
 [`BUILT_IN_DEFAULTS`](../src/tool_swap/config/defaults.py:42)
 rather than retyped, so the signature cannot drift from the config
@@ -392,15 +400,19 @@ layer.
 
 ## What this page does not claim
 
-- **There is no `LifecycleManager` class.** The driver above is a
-  free coroutine; the class that will own coalescing, the liveness
-  sweep and the `FAILED` transitions is not built, and nothing in
-  the router calls `drive_readiness` yet.
+- **No router endpoint drives the machine yet.** The
+  [`LifecycleManager`](../src/tool_swap/lifecycle/manager.py:154)
+  is in the tree and drives the cold-start and `FAILED`
+  transitions; nothing above the lifecycle layer calls it, and it
+  cannot yet stop a running tool, drain, notice a died container or
+  reconcile containers at boot ([its
+  page](lifecycle-manager.md#what-this-page-stops-at)).
 - **No *real* probe exists.** The seam and its scripted double are
   in the tree; no probe that opens sockets exists yet. And
   `drive_readiness` raises on a timeout rather than marking the
-  holder `FAILED` — no code in the tree performs that transition
-  yet.
+  holder `FAILED` — the marking happens in the manager's cold
+  start ([the lifecycle manager
+  page](lifecycle-manager.md#a-readiness-timeout-the-container-is-stopped-before-the-tool-fails)).
 - **No container has been started.** Every test here is
   pure: no daemon, no event loop; time is a `ManualClock` value,
   not a running clock.
@@ -412,14 +424,19 @@ layer.
 ## Where to go deeper
 
 - [`docs/backend-seam.md`](backend-seam.md) — the `ContainerHandle`
-  this machine holds, the `ContainerState` that answers a different
-  question, and the error taxonomy whose `message` feeds
-  `last_error`.
+   this machine holds, the `ContainerState` that answers a different
+   question, and the error taxonomy whose `message` feeds
+   `last_error`.
 - [`docs/readiness-probe.md`](readiness-probe.md) — the `Probe`
-  seam `drive_readiness` polls: the two-method protocol, the
-  no-URL address, the no-HTTP-client guard and the scripted double.
+   seam `drive_readiness` polls: the two-method protocol, the
+   no-URL address, the no-HTTP-client guard and the scripted double.
+- [`docs/lifecycle-manager.md`](lifecycle-manager.md) — the
+   `LifecycleManager`: how `ensure_ready` coalesces concurrent
+   callers onto one cold start, how a refused start or a readiness
+   timeout ends the tool `FAILED`, and the limits of what the
+   manager does today.
 - [`docs/spec-builder.md`](spec-builder.md) — how the
-  `ContainerSpec` the machine will eventually start is built.
+   `ContainerSpec` the manager starts is built.
 - [`plans/m2b-lifecycle-manager.md`](../plans/m2b-lifecycle-manager.md)
   — [§1.1](../plans/m2b-lifecycle-manager.md:206) and
   [§1.2](../plans/m2b-lifecycle-manager.md:260) for the design,
