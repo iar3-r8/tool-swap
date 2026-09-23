@@ -136,7 +136,11 @@ the squash-merge trap this section already warns about.
 | 15 | Start failure yields `FAILED` with reason | `965e8dd` | `533dd8e` | 1775 passed, 2 skipped |
 | 16 | Readiness timeout yields `FAILED` | `ee50494` | `a91a7b9` | 1781 passed, 2 skipped |
 | 17 | Cancellation neither kills nor orphans | passed on arrival | `175d3ec` | 1784 passed, 2 skipped |
-| 18 | Backend calls run in an executor | — | — | — |
+| 18 | Backend calls run in an executor | `9c04911` | `dcb986f` | 1788 passed, 2 skipped |
+
+**Slice D's seven behaviours are complete.** At the tip: 1788 passed, 2 skipped (from 1744
+at the branch point), `make lint` clean with mypy strict over 42 source files,
+`lint-imports` 6 kept / 0 broken — the sixth contract being behaviour 12's.
 
 **Behaviour 17 needed no production change**, and that is recorded rather than disguised:
 behaviour 14's coalescing already put every awaiter behind `asyncio.shield`, and the
