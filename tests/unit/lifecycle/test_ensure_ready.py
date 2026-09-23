@@ -1,17 +1,23 @@
 """Pins the cold start of ``LifecycleManager.ensure_ready`` (m2b plan
-§3 behaviours 13 and 14, §1.3, §1.4): a ``STOPPED`` tool whose probe
-answers true immediately walks ``STOPPED -> STARTING -> LOADING ->
-READY`` through the transition table, the backend is started exactly
-once, the returned handle is the one ``backend.start`` produced,
-``became_ready_at`` is stamped from the injected clock, and a second
-``ensure_ready`` on an already-``READY`` tool starts nothing, re-stamps
-nothing and returns the same handle. Behaviour 14 adds the coalesced
-cold start: ten concurrent callers start the backend exactly once, all
-ten receive the same handle, the simulated elapsed time is what one
-cold start costs (the proof that the other callers await the in-flight
-start rather than poll or sleep), a failed single start reaches all ten
-callers as one shared failure, and a round after ``READY`` starts
-nothing.
+§3 behaviours 13, 14 and 15, §1.3, §1.4): a ``STOPPED`` tool whose
+probe answers true immediately walks ``STOPPED -> STARTING -> LOADING
+-> READY`` through the transition table, the backend is started
+exactly once, the returned handle is the one ``backend.start``
+produced, ``became_ready_at`` is stamped from the injected clock, and a
+second ``ensure_ready`` on an already-``READY`` tool starts nothing,
+re-stamps nothing and returns the same handle. Behaviour 14 adds the
+coalesced cold start: ten concurrent callers start the backend exactly
+once, all ten receive the same handle, the simulated elapsed time is
+what one cold start costs (the proof that the other callers await the
+in-flight start rather than poll or sleep), a failed single start
+reaches all ten callers as one shared failure, and a round after
+``READY`` starts nothing. Behaviour 15 pins the start-failure path:
+the tool ends ``FAILED`` with the taxonomy member's ``message`` in
+``last_error`` verbatim, no handle, the transition logged with the
+reason, the refusal re-raised to every caller, the name-conflict
+member's message reaching ``last_error`` unaltered too, and
+``ensure_ready`` on a ``FAILED`` tool retrying through the
+``FAILED -> STARTING`` edge with the refusal repeating.
 
 The manager receives each tool's ``ResolvedTool`` and image through
 ``register_tool(tool, resolved, image=...)`` and exposes the per-tool
@@ -29,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import logging
 from types import ModuleType
 from typing import Any
 
@@ -36,6 +43,11 @@ import pytest
 
 import tool_swap.lifecycle.states as states_module
 from tool_swap.backend.base import ContainerSpec
+from tool_swap.backend.errors import (
+    BackendError,
+    ContainerNameConflictError,
+    ContainerStartError,
+)
 from tool_swap.backend.fake_backend import FailureMode, FakeBackend
 from tool_swap.backend.labels import container_name
 from tool_swap.config.resolver import ResolvedTool, resolve_tool
@@ -740,4 +752,319 @@ async def test_failed_single_start_reaches_all_callers_once() -> None:
     assert len(starts) == 1, (
         f"the journal shows {len(starts)} start attempts — the ten "
         "callers must coalesce into a single start, even a failing one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 15 — a start failure yields FAILED with the taxonomy reason
+# ---------------------------------------------------------------------------
+
+
+async def _drive(manager: Any) -> Any:
+    """One ``ensure_ready(TOOL)``: the handle returned, or the exception
+    raised, so a failure test holds the backend's own error instance
+    for the verbatim comparisons.
+
+    Raises:
+        AssertionError: ``ensure_ready`` is missing or does not accept
+            the tool name.
+    """
+    try:
+        return await _call_ensure_ready(manager)
+    except BaseException as exc:
+        return exc
+
+
+def _failed_transition_records(
+    caplog: pytest.LogCaptureFixture,
+) -> list[logging.LogRecord]:
+    """The state machine's records whose to-state is FAILED."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "tool_swap.lifecycle.states"
+        and getattr(record, "to_state", None) is ToolState.FAILED
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_start_marks_the_tool_failed_with_the_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused start ends the tool FAILED with the ContainerStartError's
+    message in last_error verbatim, no handle, no container, the
+    transition logged with the reason, and the refusal re-raised: FAILED
+    without the reason would leave an operator guessing why it is down."""
+    # Arrange: this tool's starts are refused, repeatedly
+    _, probe, clock, resolved, backend_config = _fixtures()
+    backend = FakeBackend(script={TOOL: FailureMode.FAIL_TO_START})
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    with caplog.at_level(logging.INFO):
+        outcome = await _drive(manager)
+    # Assert: the refusal reached the caller, re-raised
+    assert isinstance(outcome, ContainerStartError), (
+        f"ensure_ready returned {type(outcome).__name__} for a refused "
+        "start — the backend's refusal must be re-raised to the caller, "
+        "not swallowed or replaced by a sentinel"
+    )
+    # Assert: the tool is FAILED, not left where the start died
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after a refused start — a start "
+        "failure must end it FAILED, not leave it in the phase it died in"
+    )
+    # Assert: the reason is the taxonomy member's message verbatim
+    assert state.last_error == outcome.message, (
+        f"last_error is {state.last_error!r}, the refusal's message is "
+        f"{outcome.message!r} — the reason must be the taxonomy member's "
+        "message verbatim, with no prefix, wrapping or reformatting"
+    )
+    assert state.last_error != str(outcome), (
+        "last_error equals str(error), which appends the remedy — the "
+        "message field alone must be recorded"
+    )
+    # Assert: no container exists, so no handle can
+    assert state.handle is None, (
+        f"the tool holds handle {state.handle!r} after a start that "
+        "created nothing — no container, no handle"
+    )
+    assert backend.list_managed() == [], (
+        f"the backend manages {len(backend.list_managed())} container(s) "
+        "after a refused start — the refusal creates nothing"
+    )
+    # Assert: the move into FAILED was logged once, with the reason
+    records = _failed_transition_records(caplog)
+    assert len(records) == 1, (
+        f"the move into FAILED logged {len(records)} record(s) — the "
+        "transition must log exactly one INFO record"
+    )
+    record = records[0]
+    assert record.levelno == logging.INFO, (
+        f"the FAILED transition was logged at {record.levelname} — the "
+        "transition log is INFO"
+    )
+    assert getattr(record, "tool", None) == TOOL, (
+        f"the FAILED record carries tool={getattr(record, 'tool', None)!r} — "
+        "the structured fields must name the tool"
+    )
+    assert getattr(record, "from_state", None) is ToolState.STARTING, (
+        f"the FAILED record carries "
+        f"from_state={getattr(record, 'from_state', None)!r} — a start "
+        "failure moves the tool from STARTING"
+    )
+    assert getattr(record, "reason", None) == outcome.message, (
+        f"the FAILED record carries "
+        f"reason={getattr(record, 'reason', None)!r}, the message is "
+        f"{outcome.message!r} — the transition into FAILED is logged with "
+        "the taxonomy message verbatim"
+    )
+    assert getattr(record, "reason", None) != str(outcome), (
+        "the logged reason equals str(error), which appends the remedy — "
+        "the transition is logged with the message field, not the exception"
+    )
+
+
+@pytest.mark.asyncio
+async def test_name_conflict_reaches_last_error_unaltered() -> None:
+    """A taken container name is a different taxonomy member: its message
+    reaches last_error unaltered and the member is re-raised, so covering
+    only the scripted start error would leave this path unpinned."""
+    # Arrange: a record already holds the tool's container name, so the
+    # manager's start takes the backend's native name-conflict refusal
+    _, probe, clock, resolved, backend_config = _fixtures()
+    backend = FakeBackend()
+    seed = ContainerSpec(
+        tool=TOOL,
+        name=container_name(backend_config.container_prefix, TOOL),
+        image=IMAGE,
+        gpu_runtime="cpu",
+        container_port=8000,
+    )
+    backend.start(seed)
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcome = await _drive(manager)
+    # Assert: the conflict member reached the caller
+    assert isinstance(outcome, ContainerNameConflictError), (
+        f"ensure_ready returned {type(outcome).__name__} for a taken "
+        "container name — the backend's name-conflict refusal must be "
+        "re-raised"
+    )
+    # Assert: FAILED with the conflict's message verbatim
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after a name-conflict refusal — "
+        "a start failure must end it FAILED"
+    )
+    assert state.last_error == outcome.message, (
+        f"last_error is {state.last_error!r}, the conflict's message is "
+        f"{outcome.message!r} — the name-conflict member's message must "
+        "reach last_error unaltered"
+    )
+    assert state.last_error != str(outcome), (
+        "last_error equals str(error), which appends the remedy — the "
+        "message field alone must be recorded"
+    )
+    assert state.handle is None, (
+        f"the tool holds handle {state.handle!r} — the refused start created nothing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_ready_on_a_failed_tool_retries_via_the_failed_to_starting_edge(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ensure_ready on a FAILED tool attempts a fresh start through the
+    FAILED -> STARTING edge and re-raises the same refusal: a guard that
+    serves only STOPPED and READY blocks the retry and leaves a failed
+    tool unretryable until a manual reset."""
+    # Arrange
+    _, probe, clock, resolved, backend_config = _fixtures()
+    backend = FakeBackend(script={TOOL: FailureMode.FAIL_TO_START})
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act: the first attempt is refused
+    with caplog.at_level(logging.INFO):
+        first = await _drive(manager)
+    assert isinstance(first, ContainerStartError), (
+        f"the first attempt raised {type(first).__name__} — the scripted "
+        "tool must refuse to start"
+    )
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after the refused start — the "
+        "retry needs it FAILED, which records the failure"
+    )
+    # Act: the retry
+    with caplog.at_level(logging.INFO):
+        second = await _drive(manager)
+    # Assert: the retry was a fresh attempt refused again
+    assert isinstance(second, ContainerStartError), (
+        f"the retry raised {type(second).__name__} — a FAILED tool must "
+        "retry through the FAILED -> STARTING edge and re-raise the "
+        "refusal; a STOPPED/READY-only guard blocks it"
+    )
+    assert second.message == first.message, (
+        f"the retry's refusal carries {second.message!r}, the first "
+        f"carried {first.message!r} — the refusal is not one-shot, so a "
+        "retry loop cannot silently succeed"
+    )
+    starts = _starts(backend)
+    assert len(starts) == 2, (
+        f"the journal shows {len(starts)} start attempts — the retry must "
+        "attempt a fresh start, and the refusal must repeat on it"
+    )
+    # Assert: the retry logged the legal edge out of FAILED
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "tool_swap.lifecycle.states"
+    ]
+    assert len(records) == 3, (
+        f"the transition log shows {len(records)} record(s) — the failure "
+        "and its retry move the tool STARTING, into FAILED, back to "
+        "STARTING"
+    )
+    assert records[1].to_state is ToolState.FAILED, (
+        f"the second record moves to {records[1].to_state!r} — the "
+        "refusal must be recorded as the move into FAILED"
+    )
+    assert getattr(records[2], "from_state", None) is ToolState.FAILED, (
+        f"the retry logged "
+        f"from_state={getattr(records[2], 'from_state', None)!r} — the "
+        "legal retry edge starts from FAILED"
+    )
+    assert records[2].to_state is ToolState.STARTING, (
+        f"the retry logged to_state={records[2].to_state!r} — the retry "
+        "moves the tool back to STARTING"
+    )
+
+
+@pytest.mark.asyncio
+async def test_coalesced_start_failure_marks_the_tool_failed_once() -> None:
+    """Ten concurrent callers on a refused start all receive the
+    backend's own error — no sentinel, no guard error — the single start
+    is journaled once, and the tool is FAILED with the refusal recorded:
+    behaviour 14's coalescing must survive the failure path intact."""
+    # Arrange: the backend refuses this tool's start, repeatedly
+    backend = FakeBackend(script={TOOL: FailureMode.FAIL_TO_START})
+    probe = FakeProbe(script=COALESCED_PROBE_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act
+    outcomes = await asyncio.gather(
+        *(_call_ensure_ready(manager) for _ in range(WAITERS)),
+        return_exceptions=True,
+    )
+    # Assert: every caller received the backend's own error
+    assert all(isinstance(o, BackendError) for o in outcomes), (
+        f"the callers received {sorted({type(o).__name__ for o in outcomes})} "
+        "— every caller must receive the backend's refusal re-raised, "
+        "not a sentinel or a guard error"
+    )
+    assert all(o.message == outcomes[0].message for o in outcomes), (
+        "the callers received different failure messages — ten callers "
+        "awaiting one failed start must all receive that start's failure"
+    )
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} start attempts — the failed "
+        "coalesced start must be attempted once"
+    )
+    # Assert: FAILED once, with the reason
+    state = await _state_of(manager)
+    assert state.state is ToolState.FAILED, (
+        f"the tool sits in {state.state!r} after the coalesced start "
+        "failed — the failure must end it FAILED, once, not per caller"
+    )
+    assert state.last_error == outcomes[0].message, (
+        f"last_error is {state.last_error!r}, the shared failure carries "
+        f"{outcomes[0].message!r} — the refusal must be recorded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_caller_arriving_after_a_failed_start_receives_the_refusal() -> None:
+    """A caller arriving after the coalesced start has already failed is
+    served a fresh attempt refused again with the same message — not a
+    stale handle, not a sentinel, and not a hang on the dead pending
+    slot the failure cleared."""
+    # Arrange
+    _, probe, clock, resolved, backend_config = _fixtures()
+    backend = FakeBackend(script={TOOL: FailureMode.FAIL_TO_START})
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act: the first attempt fails, then a late caller arrives
+    first = await _drive(manager)
+    assert isinstance(first, ContainerStartError), (
+        f"the first attempt raised {type(first).__name__} — the scripted "
+        "tool must refuse to start"
+    )
+    second = await _drive(manager)
+    # Assert: the late caller received the refusal again
+    assert isinstance(second, ContainerStartError), (
+        f"the late caller received {type(second).__name__} — a FAILED "
+        "tool must be served a fresh attempt that re-raises the refusal; "
+        "a sentinel return or a STOPPED/READY-only guard blocks it"
+    )
+    assert second.message == first.message, (
+        f"the late caller's refusal carries {second.message!r}, the first "
+        f"carried {first.message!r} — the refusal must repeat, not "
+        "resolve itself"
+    )
+    starts = _starts(backend)
+    assert len(starts) == 2, (
+        f"the journal shows {len(starts)} start attempts — the late "
+        "caller's fresh attempt must be journaled; serving the caller "
+        "from a dead pending task would journal no start"
+    )
+    assert (await _state_of(manager)).state is ToolState.FAILED, (
+        f"the tool sits in {(await _state_of(manager)).state!r} after the "
+        "late caller's failed attempt — the refusal ends it FAILED again"
     )
