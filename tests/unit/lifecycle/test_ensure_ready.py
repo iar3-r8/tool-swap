@@ -25,7 +25,12 @@ answers naming ``start_timeout``, the started container stopped on the
 way to ``FAILED``, the simulated elapsed time equal to the one
 deadline that ran (not the two deadlines chained), the handle cleared,
 and the timeout re-raised as a member of the readiness timeout family
-rather than the backend taxonomy.
+rather than the backend taxonomy. Behaviour 17 pins the cancellation
+contract of the coalesced cold start: a caller cancelled mid-start
+raises ``CancelledError`` and no one else does, the start keeps running
+for the remaining callers, and when every caller walks away the cold
+start still runs to completion and records its outcome, so a started
+container is never left without a recorded handle.
 
 The manager receives each tool's ``ResolvedTool`` and image through
 ``register_tool(tool, resolved, image=...)`` and exposes the per-tool
@@ -1441,4 +1446,246 @@ async def test_start_timeout_records_the_starting_to_failed_transition(
         f"the FAILED record carries "
         f"reason={getattr(record, 'reason', None)!r} — the move into "
         "FAILED is logged with the timeout's own text as the reason"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behaviour 17 — a cancelled caller neither kills the start nor orphans
+# the container
+# ---------------------------------------------------------------------------
+
+# The start phase needs two scripted false health answers before it
+# answers true; ready is unscripted and answers true immediately. The
+# cold start therefore sleeps probe_interval twice — it crosses at
+# least one interval between the cancellation below and completion, so
+# the test cannot pass by cancelling before the start really began.
+CANCELLED_START_SCRIPT = {TOOL: {"health": 2}}
+CANCELLED_START_COST = 2.0
+
+
+async def _drain_to_terminal(manager: Any, clock: Any, *, max_steps: int = 1000) -> Any:
+    """Yield loop steps until the tool reaches a terminal state.
+
+    Each step is one ``clock.sleep(0.0)`` — it advances no simulated
+    time and yields once via ``asyncio.sleep(0)`` — so the orphaned
+    cold-start task, which makes progress only on loop steps, keeps
+    running while the test waits. That is the whole pin: with no
+    caller left, only the loop running the task can record its
+    outcome, and no real-time sleep stands in for it.
+
+    Returns:
+        The tool's state holder once it is terminal.
+
+    Raises:
+        AssertionError: the tool is not terminal after ``max_steps``
+            loop steps — the orphaned start never finished.
+    """
+    for _ in range(max_steps):
+        state = await _state_of(manager)
+        if state.state in (
+            ToolState.READY,
+            ToolState.FAILED,
+            ToolState.STOPPED,
+        ):
+            return state
+        await clock.sleep(0.0)
+    raise AssertionError(
+        "the tool is still in "
+        f"{(await _state_of(manager)).state!r} after {max_steps} loop steps — "
+        "the orphaned cold start never finished recording its outcome"
+    )
+
+
+async def _cancelled_caller(manager: Any, clock: Any) -> BaseException:
+    """One caller cancelled mid-cold-start; the exception it raises.
+
+    The wait steps the loop with ``clock.sleep(0.0)`` — one yield, no
+    simulated time — until the first health poll is journaled. The
+    caller's leader path (lock, STARTING move, start call) runs before
+    its first yield, so that journal entry proves the start is in
+    flight and the cold task is parked in its first poll sleep — the
+    cancellation lands mid-start, not before it. Awaiting the caller
+    directly would miss the window: the start completes a few loop
+    steps later and the cancel would hit a finished task.
+
+    Returns:
+        The exception the cancelled caller raised.
+
+    Raises:
+        AssertionError: the cancelled caller returned normally.
+    """
+    ensure_ready = _ensure_ready(manager)
+    caller = asyncio.create_task(ensure_ready(TOOL))
+    while sum(1 for method, _ in manager.probe.calls if method == "health") < 1:
+        await clock.sleep(0.0)
+    caller.cancel()
+    try:
+        await caller
+    except BaseException as raised:
+        return raised
+    raise AssertionError(
+        "the cancelled caller returned normally — a Task.cancel must surface "
+        "as an exception to the caller"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_raises_cancelled_error_start_continues() -> None:
+    """A caller cancelled mid-cold-start raises CancelledError while the
+    start keeps running for the remaining caller: the start must not die
+    with a single waiter."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=CANCELLED_START_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act: caller one is cancelled inside the start window
+    raised = await _cancelled_caller(manager, clock)
+    # Assert: the caller raised CancelledError, and only it could have
+    assert isinstance(raised, asyncio.CancelledError), (
+        f"the cancelled caller raised {type(raised).__name__} — the "
+        "cancellation must surface as CancelledError, not be mapped to "
+        "a fault that never happened"
+    )
+    # Assert: the surviving caller still gets a READY tool
+    caller_two = asyncio.create_task(_call_ensure_ready(manager))
+    handle = await caller_two
+    # Assert: the tool is READY holding the started container
+    state = await _state_of(manager)
+    assert state.state is ToolState.READY, (
+        f"the tool is {state.state!r} after its only waiting caller was "
+        "cancelled — the start must run to completion for the caller "
+        "that stayed"
+    )
+    managed = backend.list_managed()
+    assert len(managed) == 1, (
+        f"the backend manages {len(managed)} containers — one start creates exactly one"
+    )
+    assert handle is managed[0], (
+        f"the caller got {handle!r}, not the started container "
+        f"{managed[0]!r} — the surviving caller must receive the "
+        "coalesced start's handle"
+    )
+    # Assert: the journal shows the start ran to completion
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} starts — a cancelled caller "
+        "must neither add a start nor kill the one in flight"
+    )
+    assert len(probe.calls) >= 3, (
+        f"the probe was asked {len(probe.calls)} time(s) — after the "
+        "cancellation the start must still poll to completion, which "
+        "needs the scripted false answers plus the true one"
+    )
+    # Assert: simulated time costs one cold start's worth, not two
+    assert clock.now() == CLOCK_START + CANCELLED_START_COST, (
+        f"the clock reads {clock.now()!r} — one cold start costs "
+        f"{CANCELLED_START_COST}s from {CLOCK_START}, so the start ran "
+        "exactly once to completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_caller_cancelled_start_still_records_its_outcome() -> None:
+    """With no waiters left, the cold start still runs to completion:
+    the tool reaches a terminal state and the started container's handle
+    is recorded — a started container nobody recorded is an orphan."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=CANCELLED_START_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act: the only caller is cancelled inside the start window
+    raised = await _cancelled_caller(manager, clock)
+    assert isinstance(raised, asyncio.CancelledError), (
+        f"the cancelled caller raised {type(raised).__name__} — the "
+        "cancellation must surface as CancelledError"
+    )
+    # With no caller left, only the loop running the orphaned start can
+    # record its outcome — drain loop steps until the tool is terminal.
+    state = await _drain_to_terminal(manager, clock)
+    # Assert: the tool is READY — the container started and the probe
+    # genuinely answered, so the only honest terminal state with a
+    # recorded handle is READY; FAILED would assert a fault that never
+    # happened and STOPPED would deny a container that is running
+    assert state.state is ToolState.READY, (
+        f"the tool is {state.state!r} after every caller was cancelled — "
+        "the start's outcome must be recorded even with no waiters left, "
+        "and a start that succeeded is not a fault to record as FAILED"
+    )
+    assert not any(call[0] == "stop" for call in backend.calls), (
+        f"the journal is {[call[0] for call in backend.calls]} — a "
+        "successfully started container must not be stopped because "
+        "its callers walked away"
+    )
+    # Assert: the handle is recorded — the container is not an orphan
+    assert state.handle is not None, (
+        "the tool holds no handle after its only caller was cancelled — "
+        "the started container's handle must be recorded, or only "
+        "reconciliation could ever find the container"
+    )
+    managed = backend.list_managed()
+    assert len(managed) == 1 and state.handle is managed[0], (
+        f"the backend manages {len(managed)} container(s) — the started "
+        "container must exist and be the recorded handle"
+    )
+    # Assert: the start ran to completion — the probe kept being polled
+    assert len(probe.calls) >= 3, (
+        f"the probe was asked {len(probe.calls)} time(s) — with no "
+        "waiters left the start must still poll to its answer"
+    )
+    # Assert: it cost exactly one cold start, so it ran once
+    assert clock.now() == CLOCK_START + CANCELLED_START_COST, (
+        f"the clock reads {clock.now()!r} — one cold start costs "
+        f"{CANCELLED_START_COST}s from {CLOCK_START}"
+    )
+    # Assert: CancelledError reached the cancelled caller and nobody else
+    assert isinstance(raised, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_a_caller_arriving_after_a_cancelled_start_gets_ready() -> None:
+    """A caller arriving after the cancelled start finished finds the
+    tool READY and must not re-start or await a dead task: the start
+    already ran to completion and recorded its outcome."""
+    # Arrange
+    backend = FakeBackend()
+    probe = FakeProbe(script=CANCELLED_START_SCRIPT)
+    clock = ManualClock(start=CLOCK_START)
+    resolved = resolve_tool(TOOL, inline={})
+    backend_config = BackendConfig()
+    manager = _build_manager(backend, probe, clock, backend_config)
+    await _register(manager, resolved)
+    # Act: the only early caller is cancelled inside the start window
+    raised = await _cancelled_caller(manager, clock)
+    assert isinstance(raised, asyncio.CancelledError), (
+        f"the cancelled caller raised {type(raised).__name__} — the "
+        "cancellation must surface as CancelledError"
+    )
+    # The orphaned start keeps running once the caller is gone — drain
+    # loop steps until the tool is terminal, then the late caller arrives
+    await _drain_to_terminal(manager, clock)
+    # Act: a late caller arrives after the tool is READY
+    handle = await _call_ensure_ready(manager)
+    # Assert: the late caller got the handle without starting anything
+    state = await _state_of(manager)
+    assert state.state is ToolState.READY, (
+        f"the tool is {state.state!r} before the late caller — the "
+        "cancelled start must have completed and been recorded"
+    )
+    managed = backend.list_managed()
+    assert handle is managed[0], (
+        f"the late caller got {handle!r}, not the started container "
+        f"{managed[0]!r} — a READY tool returns the handle it holds"
+    )
+    starts = _starts(backend)
+    assert len(starts) == 1, (
+        f"the journal shows {len(starts)} starts — a late caller on a "
+        "READY tool must not start a second container"
     )
