@@ -26,6 +26,7 @@ environment where the docker SDK is not importable.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from dataclasses import dataclass, field
 from typing import Final, cast
@@ -354,7 +355,13 @@ class LifecycleManager:
                 ready_path=str(registration.resolved.values["ready_path"]),
             )
             try:
-                handle = self.backend.start(spec)
+                # The seam is synchronous and a backend round-trip can
+                # block, so the call runs on the loop's default executor:
+                # on the loop itself it would stall every other task
+                # until the backend answers.
+                handle = await asyncio.get_running_loop().run_in_executor(
+                    None, self.backend.start, spec
+                )
             except BackendError as err:
                 # The refusal's message, verbatim: str(err) appends the
                 # remedy, and the recorded reason must carry the message
@@ -382,7 +389,7 @@ class LifecycleManager:
                 # failed cold start. The holder is already where the
                 # phase hung — STARTING or LOADING — and both edges into
                 # FAILED are legal, so no from-state is passed.
-                self._fail_on_timeout(state, err)
+                await self._fail_on_timeout(state, err)
                 raise
         except BaseException:
             # Release the slot so a later caller does not await a dead
@@ -393,7 +400,7 @@ class LifecycleManager:
         state.became_ready_at = self.clock.now()
         return state.handle
 
-    def _fail_on_timeout(
+    async def _fail_on_timeout(
         self, state: ModelRuntimeState, err: ReadinessTimeoutError
     ) -> None:
         """End a timed-out cold start: stop the container, fail the tool,
@@ -404,11 +411,13 @@ class LifecycleManager:
         so the move into ``FAILED`` reads the from-state from the
         holder. ``err``'s own rendering is recorded as the reason: it
         names which deadline ran and for how long, which is what an
-        operator needs to tell a hung ready from a hung start. A stop
-        that itself raises is logged and not allowed to replace
-        ``err`` — the caller is owed the timeout — but the holder still
-        ends ``FAILED`` and the handle is still cleared, since either
-        way the tool no longer claims a running container.
+        operator needs to tell a hung ready from a hung start. The stop
+        runs on the loop's default executor, so a backend that blocks
+        inside ``stop`` cannot stall the loop. A stop that itself
+        raises is logged and not allowed to replace ``err`` — the
+        caller is owed the timeout — but the holder still ends
+        ``FAILED`` and the handle is still cleared, since either way
+        the tool no longer claims a running container.
 
         Args:
             state: The holder, at ``STARTING`` or ``LOADING``; mutated
@@ -418,8 +427,11 @@ class LifecycleManager:
         """
         handle = state.handle
         if handle is not None:
+            stop = functools.partial(
+                self.backend.stop, handle, timeout_s=self.stop_timeout
+            )
             try:
-                self.backend.stop(handle, timeout_s=self.stop_timeout)
+                await asyncio.get_running_loop().run_in_executor(None, stop)
             except Exception:
                 logger.warning(
                     "stop of %s failed while handling the readiness timeout for %s",
